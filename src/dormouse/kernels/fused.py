@@ -253,7 +253,9 @@ class _Glu(torch.autograd.Function):
     """`silu(gate) * up` in one kernel; the backward is the two chain rules."""
 
     @staticmethod
-    def forward(ctx: Any, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:  # pragma: no cover - device only
+    def forward(
+        ctx: Any, gate: torch.Tensor, up: torch.Tensor
+    ) -> torch.Tensor:  # pragma: no cover - device only
         """Return `silu(gate) * up`, elementwise."""
         built = _require("glu")
         width = gate.shape[-1]
