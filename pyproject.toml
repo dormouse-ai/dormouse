@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
   "dormouse-core @ git+https://github.com/dormouse-ai/dormouse-core@master",
   "numpy>=1.26",
-  "torch>=2.5",
+  "torch>=2.15.0",
 ]
 
 [project.scripts]
@@ -15,7 +15,7 @@ dorm = "dormouse.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6", "mypy>=1.11", "ruff>=0.6"]
-model = ["torch>=2.13"]
+model = ["torch>=2.15.0"]
 
 [build-system]
 requires = ["setuptools>=69"]
