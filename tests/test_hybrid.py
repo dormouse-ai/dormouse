@@ -144,3 +144,79 @@ def test_a_stack_with_no_layers_is_refused() -> None:
 
 def test_the_repr_prints_the_pattern() -> None:
     assert "pattern=['KDA', 'KDA', 'KDA', 'CSA']" in repr(_stack(HYBRID_3_TO_1))
+
+
+def _mixed(mix: str) -> HybridStack:
+    """A small stack built from `attn_mix`, not from an explicit pattern."""
+    return HybridStack(
+        D_MODEL,
+        N_HEADS,
+        HEAD_DIM,
+        n_layers=4,
+        attn_mix=mix,
+        chunk=8,
+        csa_chunk=8,
+        dsa_k=8,
+        dsa_window=4,
+    )
+
+
+def test_the_default_mix_is_three_kda_per_dsa() -> None:
+    """DSA is the exact-attention partner: `kda:dsa` is what a config gets unasked."""
+    stack = _mixed("kda:dsa")
+    assert stack.layer_types() == ("KDA", "KDA", "KDA", "DSA")
+    assert (
+        HybridStack(
+            D_MODEL, N_HEADS, HEAD_DIM, n_layers=4, chunk=8, csa_chunk=8, dsa_k=8, dsa_window=4
+        ).layer_types()
+        == stack.layer_types()
+    )
+
+
+def test_the_csa_mix_is_still_built() -> None:
+    """Every number measured before DSA existed was measured on this arm."""
+    stack = _mixed("kda:csa")
+    assert stack.layer_types() == HYBRID_3_TO_1
+    assert stack.param_report()["csa"] > 0
+
+
+def test_the_default_stack_really_contains_a_dsa_layer() -> None:
+    """The DSA layer changes the output: a pattern that silently built four KDA
+    layers would pass every shape test."""
+    torch.manual_seed(23)
+    x = torch.randn(1, SEQ, D_MODEL)
+    dsa = _mixed("kda:dsa")(x)
+    all_kda = _stack(("KDA",) * 4)(x)
+    assert dsa.shape == all_kda.shape
+    assert not torch.allclose(dsa, all_kda, atol=1e-6)
+
+
+def test_the_dsa_bill_is_counted_per_layer_type() -> None:
+    report = _mixed("kda:dsa").param_report()
+    assert report["per_dsa"] > 0
+    assert report["dsa"] == report["per_dsa"]
+    assert report["total"] == report["kda"] + report["dsa"]
+
+
+def test_an_unknown_mix_is_refused_with_the_alternatives() -> None:
+    with pytest.raises(LoudError) as caught:
+        _mixed("kda:mla")
+    message = str(caught.value)
+    assert "attn_mix='kda:mla'" in message and "kda:dsa" in message and "kda:csa" in message
+
+
+def test_kda_and_dsa_conflict_on_one_layer_by_name() -> None:
+    with pytest.raises(LoudError) as caught:
+        check_compatible(
+            ["KDA", "DSA"],
+            {"attn.pos": "none", "attn.rule": "delta", "attn.selector": "true"},
+        )
+    assert "KDA and DSA" in str(caught.value)
+    assert "attn.state" in str(caught.value)
+
+
+def test_the_dsa_layer_reports_its_own_counter_through_the_stack() -> None:
+    counters = Counters()
+    _mixed("kda:dsa")(torch.zeros(1, SEQ, D_MODEL), counters)
+    assert counters.counts["hybrid_dsa_layer_fwd"] == 1
+    assert counters.counts["dsa_fwd"] == SEQ

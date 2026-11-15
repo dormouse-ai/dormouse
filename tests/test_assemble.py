@@ -160,3 +160,34 @@ def test_plan_needs_no_allocation_so_a_billion_parameter_stack_is_cheap() -> Non
     measured = assemble(spec, device="meta").report()
     assert measured["stored"] > 1e9
     assert all(isinstance(value, int) for value in measured.values())
+
+
+def test_the_default_hybrid_stack_is_three_kda_per_dsa() -> None:
+    """`attn=hybrid` with no pattern is the DSA arm, and its counter is declared."""
+    spec = StackSpec(
+        attn="hybrid", n_layers=4, d_model=64, n_heads=4, head_dim=16, d_ffn=128, seq_len=1024
+    )
+    assembled = assemble(spec, device="meta")
+    assert spec.pattern == ("kda", "kda", "kda", "dsa")
+    assert assembled.mechanisms()["dsa"] == "dsa_fwd"
+    assert {piece.name for piece in assembled.pieces if piece.slot.startswith("attn")} == {
+        "kda",
+        "dsa",
+    }
+    assert any(type(m).__name__ == "DSA" for m in assembled.model.modules())
+
+
+def test_the_csa_pattern_stays_buildable_and_declares_its_own_counter() -> None:
+    spec = StackSpec(
+        attn="hybrid",
+        attn_pattern="3:1:csa",
+        n_layers=4,
+        d_model=64,
+        n_heads=4,
+        head_dim=16,
+        d_ffn=128,
+        seq_len=1024,
+    )
+    assembled = assemble(spec, device="meta")
+    assert spec.pattern == ("kda", "kda", "kda", "csa")
+    assert assembled.mechanisms()["csa"] == "csa_fwd"

@@ -38,6 +38,7 @@ from ..train.step import StepResult, train_step
 from . import quant, registry
 from .attn import PROJ_STD, Attention
 from .attn_variants.csa import CSA
+from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
 from .blocks import Block
 from .ffn_spec import FFNSpec
@@ -184,6 +185,8 @@ def _attention(
         )
     if kind == "kda":
         return KDA(spec.d_model, spec.n_heads, spec.head_dim, write_std=write_std, device=device)
+    if kind == "dsa":
+        return DSA(spec.d_model, spec.n_heads, spec.head_dim, write_std=write_std, device=device)
     return CSA(spec.d_model, spec.n_heads, spec.head_dim, write_std=write_std, device=device)
 
 

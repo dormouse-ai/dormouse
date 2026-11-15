@@ -12,8 +12,9 @@ The slots, and what each one decides:
 * `unit` — the sequence unit. `byte` is the vocab-256 recipe every module in this
   repo was written against; `bpe` is the vocab-32768 column the token table is
   priced at, and the tokenizer for it is data-layer work that does not live here.
-* `attn` — `full` (dense causal + RoPE, the control), `kda`, `csa`, or `hybrid`,
-  which mixes them by `attn_pattern` (`"3:1"` = three KDA layers per CSA layer).
+* `attn` — `full` (dense causal + RoPE, the control), `kda`, `csa`, `dsa`, or
+  `hybrid`, which mixes them by `attn_pattern` (`"3:1"` = three KDA layers per DSA
+  layer; `"3:1:csa"` is the same ratio over the block selector).
 * `attn_pos` — the positional scheme the attention slot is told it has. Empty means
   "whatever the arm needs"; a value that contradicts the arm is refused by the
   arm's own `Coeffects` in `assemble`, not here, so the refusal comes from the
@@ -55,7 +56,7 @@ from dormouse_core.errors import LoudError
 
 #: Every slot's literals, in the order the plan prints them.
 UNITS: tuple[str, ...] = ("byte", "bpe")
-ATTN: tuple[str, ...] = ("full", "kda", "csa", "hybrid")
+ATTN: tuple[str, ...] = ("full", "kda", "csa", "dsa", "hybrid")
 ATTN_POS: tuple[str, ...] = ("rope", "none")
 FFNS: tuple[str, ...] = ("gated", "la", "moa", "moe")
 ACTIVATIONS: tuple[str, ...] = ("none", "silu", "situ", "la", "moa")
@@ -68,10 +69,19 @@ ACT_QUANT: tuple[str, ...] = ("none", "int4")
 VOCAB: dict[str, int] = {"byte": 256, "bpe": 32768}
 
 #: One period of the hybrid recipe, as `attn_pattern` spells it.
-DEFAULT_PATTERN = "3:1"
+DEFAULT_PATTERN = "3:1:dsa"
 
 #: The arms that carry a positional table of their own.
-POSITIONAL: dict[str, str] = {"full": "rope", "kda": "none", "csa": "none", "hybrid": "none"}
+POSITIONAL: dict[str, str] = {
+    "full": "rope",
+    "kda": "none",
+    "csa": "none",
+    "dsa": "none",
+    "hybrid": "none",
+}
+
+#: The sparse arms a pattern's third field may name.
+SPARSE: tuple[str, ...] = ("dsa", "csa")
 
 #: Objectives this repo can compute. The others are named in the refusal.
 COMPUTABLE = frozenset({"ntp"})
@@ -247,24 +257,35 @@ class StackSpec(Config):
 
 
 def _pattern(spelling: str, n_layers: int) -> tuple[str, ...]:
-    """Turn `"3:1"` into `[KDA, KDA, KDA, CSA]`, refusing one that does not tile."""
+    """Turn `"3:1"` into `[KDA, KDA, KDA, DSA]`, refusing one that does not tile.
+
+    A third field names the sparse arm: `"3:1:csa"` is the block selector this
+    project measured before DSA existed, `"3:1"` is the DSA default.
+    """
     parts = spelling.split(":")
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+    if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts[:2]):
         raise LoudError(
             f"attn_pattern={spelling!r} is not a ratio",
-            "spell one period as `kda:csa`, e.g. 3:1 (three KDA layers per CSA layer)",
+            "spell one period as `kda:sparse`, e.g. 3:1 (three KDA layers per DSA "
+            "layer), or 3:1:csa to keep the block selector",
         )
-    kda, csa = (int(p) for p in parts)
-    if kda + csa < 1:
+    kda, sparse = (int(p) for p in parts[:2])
+    arm = parts[2] if len(parts) == 3 else "dsa"
+    if arm not in SPARSE:
+        raise LoudError(
+            f"attn_pattern={spelling!r} names {arm!r} as the sparse layer",
+            f"the third field is one of: {', '.join(SPARSE)}; drop it for the dsa default",
+        )
+    if kda + sparse < 1:
         raise LoudError(
             f"attn_pattern={spelling!r} names no layer",
             "at least one of the two counts must be positive, e.g. 3:1 or 1:1",
         )
-    if n_layers % (kda + csa):
+    if n_layers % (kda + sparse):
         raise LoudError(
-            f"n_layers={n_layers} is not a multiple of the {kda + csa}-layer pattern "
-            f"{spelling}: {n_layers % (kda + csa)} layers are left over",
+            f"n_layers={n_layers} is not a multiple of the {kda + sparse}-layer pattern "
+            f"{spelling}: {n_layers % (kda + sparse)} layers are left over",
             "the pattern is one period of the stack; change n_layers or shorten the "
             "period so it tiles exactly",
         )
-    return ("kda",) * kda + ("csa",) * csa
+    return ("kda",) * kda + (arm,) * sparse

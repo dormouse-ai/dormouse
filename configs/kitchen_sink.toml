@@ -1,7 +1,9 @@
 # kitchen_sink: every slot at its best-by-research setting.
 #
 # The stack, and the one line that argues each slot:
-#   attn=hybrid 3:1     three KDA layers per CSA layer (Kimi Linear 2510.26692 §5.2)
+#   attn=hybrid 3:1:csa three KDA layers per CSA layer (Kimi Linear 2510.26692 §5.2)
+#                       the pinned 1.01B numbers were measured on the block selector;
+#                       "3:1" alone is DSA, the default (model/attn_variants/dsa.py)
 #   attn_pos=none       KDA's decay and CSA's blocks are their own positional signal
 #   ffn=moe             one bank of 64 routed experts + one shared, dropless
 #   activation=moa      the mixture-of-activations arm inside each expert
@@ -20,7 +22,7 @@
 
 unit = "byte"
 attn = "hybrid"
-attn_pattern = "3:1"
+attn_pattern = "3:1:csa"
 attn_pos = "none"
 ffn = "moe"
 activation = "moa"

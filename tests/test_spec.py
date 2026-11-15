@@ -140,7 +140,7 @@ def test_full_attention_with_pos_none_is_refused_by_the_same_check() -> None:
 
 def test_the_pattern_is_what_makes_a_hybrid_hybrid() -> None:
     spec = StackSpec(attn="hybrid", n_layers=8)
-    assert spec.pattern == ("kda", "kda", "kda", "csa") * 2
+    assert spec.pattern == ("kda", "kda", "kda", "dsa") * 2
     assert spec.pos == "none"
 
 
@@ -156,7 +156,7 @@ def test_the_two_configs_differ_in_exactly_the_stack() -> None:
     assert (control.objective, control.weight_qat, control.act_quant) == ("ntp", "none", "none")
     assert (sink.attn, sink.attn_pattern, sink.ffn, sink.activation) == (
         "hybrid",
-        "3:1",
+        "3:1:csa",
         "moe",
         "moa",
     )

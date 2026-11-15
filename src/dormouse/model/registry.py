@@ -25,6 +25,7 @@ from dormouse_core.coeffects import Coeffects
 from dormouse_core.errors import LoudError
 
 from .attn_variants.csa import CSA
+from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
 from .spec import StackSpec
 
@@ -74,6 +75,14 @@ ATTN: dict[str, Piece] = {
     "full": Piece("attn", "full", "attention", "attn_fwd", FULL, "dense causal + RoPE"),
     "kda": Piece("attn", "kda", "kda", "kda_fwd", KDA.COEFFECTS, "delta rule, no RoPE"),
     "csa": Piece("attn", "csa", "csa", "csa_fwd", CSA.COEFFECTS, "sparse block selector, no RoPE"),
+    "dsa": Piece(
+        "attn",
+        "dsa",
+        "dsa",
+        "dsa_fwd",
+        DSA.COEFFECTS,
+        "exact over k selected tokens + window, no RoPE",
+    ),
 }
 
 FFN: dict[str, Piece] = {
