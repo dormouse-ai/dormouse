@@ -59,7 +59,7 @@ python_version = "3.12"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["torch", "torch.*"]
+module = ["torch", "torch.*", "triton", "triton.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

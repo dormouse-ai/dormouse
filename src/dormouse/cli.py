@@ -20,8 +20,9 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from .model.spec import StackSpec
@@ -185,6 +186,54 @@ def _status(pattern: str) -> int:
     for path in found:
         print(f"{path}: {Journal.open(path).summary()}")
     return 0
+
+
+def _now() -> float:
+    """Return the clock `status` measures age against; a function so a test can freeze it."""
+    return time.time()
+
+
+def journal_row(path: Path, now: float) -> dict[str, Any]:
+    """One `status` row, read from the journal and nothing else."""
+    journal = Journal.open(path)
+    start = journal.last("start") or {}
+    step = journal.last("step") or {}
+    ended = journal.last("end") is not None
+    phase = "ended" if ended else ("running" if step else "not started")
+    stamp = journal.records[-1].get("t") if journal.records else None
+    age = max(now - stamp, 0.0) if isinstance(stamp, (int, float)) else None
+    return {
+        "id": _run_id(path),
+        "config": start.get("config"),
+        "phase": phase,
+        "step": step.get("step", 0),
+        "metric": _metric(journal),
+        "segments": len(journal.segments()),
+        "age_seconds": age,
+    }
+
+
+def _run_id(path: Path) -> str:
+    """`runs/<id>/run.jsonl` names the run after its directory; any other file names itself."""
+    return path.parent.name if path.name == "run.jsonl" else path.stem
+
+
+def _metric(journal: Journal) -> str | None:
+    """Return the last number a run reported: the step's loss, else the first eval metric."""
+    for kind in ("step", "eval"):
+        record = journal.last(kind) or {}
+        for name, value in sorted(record.items()):
+            if name in {"kind", "t", "step", "config"}:
+                continue
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return f"{name}={value:.4g}"
+        metrics = record.get("metrics")
+        if isinstance(metrics, dict):
+            for name in sorted(metrics):
+                value = metrics[name]
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return f"{name}={value:.4g}"
+    return None
 
 
 if __name__ == "__main__":
