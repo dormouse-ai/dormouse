@@ -2,9 +2,10 @@
 
 `muon` owns the spectral rule and its chain, `adamw` owns the entry-wise one, `sf`
 wraps both in the schedule-free iterate average, `optim` routes a model across them,
-`schedule` owns the learning rate as two closed forms, `step` owns the order a step
-happens in and the refusals that keep a bad batch out of the weights. Import the
-public names; nothing else in this package is API.
+`lowbit` holds an optimizer moment at 8 bits per value, `schedule` owns the learning
+rate as two closed forms, `step` owns the order a step happens in and the refusals that
+keep a bad batch out of the weights. Import the public names; nothing else in this
+package is API.
 """
 
 from .optim import AdamW, MixOptimizer, Muon

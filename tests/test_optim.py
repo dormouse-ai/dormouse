@@ -169,7 +169,8 @@ def test_muon_momentum_is_the_documented_ema() -> None:
     param.grad = torch.ones(8, 8)
     opt = Muon([param], lr=0.01, momentum=0.95)
     opt.step()
-    assert torch.allclose(opt.state[param]["momentum"], torch.full((8, 8), 0.05))
+    #: Through the container: the state is a `LowBitState` at either width (`lowbit.py`).
+    assert torch.allclose(opt.state[param]["momentum"].dense(), torch.full((8, 8), 0.05))
 
 
 def test_muon_skips_a_parameter_without_a_gradient() -> None:

@@ -54,6 +54,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from .lowbit import LowBitState
 from .optim import MixOptimizer
 from .step import chunked_cross_entropy
 
@@ -121,9 +122,21 @@ def state_bytes(model: nn.Module, optimizer: MixOptimizer) -> int:
         for group in arm.param_groups:
             for param in group["params"]:
                 for value in arm.state.get(param, {}).values():
-                    if torch.is_tensor(value):
-                        total += value.numel() * value.element_size()
+                    total += sum(t.numel() * t.element_size() for t in _moment_tensors(value))
     return total
+
+
+def _moment_tensors(value: Any) -> list[torch.Tensor]:
+    """Return the tensors one optimizer-state entry holds, whichever width it is.
+
+    A moment is one dense tensor at 32 bits and a `LowBitState`'s codes and scales at 8
+    (`lowbit.py` §5). All three walks below go through here: a preflight that skipped the
+    container would price the largest buffer of a step at zero, and a restore that
+    skipped it would replay a graph over a warmup's momentum.
+    """
+    if isinstance(value, LowBitState):
+        return list(value.data.values())
+    return [value] if torch.is_tensor(value) else []
 
 
 def preflight(
@@ -300,8 +313,10 @@ class StepGraph:
             for group in arm.param_groups:
                 for param in group["params"]:
                     for value in arm.state.get(param, {}).values():
-                        if torch.is_tensor(value):
-                            found.append((value, value.detach().to("cpu", copy=True)))
+                        found.extend(
+                            (tensor, tensor.detach().to("cpu", copy=True))
+                            for tensor in _moment_tensors(value)
+                        )
         return found
 
     def _state_keys(self) -> set[tuple[int, str]]:
@@ -332,7 +347,7 @@ class StepGraph:
                         for key, value in state.items():
                             if (id(param), key) in keys:
                                 continue
-                            if torch.is_tensor(value):
+                            if isinstance(value, LowBitState) or torch.is_tensor(value):
                                 value.zero_()
                             elif isinstance(value, float):
                                 state[key] = 0.0

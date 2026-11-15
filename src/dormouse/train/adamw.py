@@ -118,7 +118,7 @@ class AdamW(torch.optim.AdamW):
         return self._step_lowbit(closure)
 
     def state_dict(self) -> dict[str, Any]:
-        """The moments as plain tensors, so `weights_only=True` can read them back."""
+        """Write the moments as plain tensors, so `weights_only=True` can read them back."""
         return plain_state_dict(super().state_dict())
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -151,7 +151,10 @@ class AdamW(torch.optim.AdamW):
                     state["exp_avg"] = LowBitState(param, bits=first, block=block)
                     state["exp_avg_sq"] = LowBitState(param, bits=bits, block=block)
                 state["step"] += 1
-                step = state["step"]
+                #: An int, always: a resumed checkpoint can hold the step as a tensor, and
+                #: `1 - β**tensor` is fp32 where `1 - β**int` is the double every other
+                #: bias correction here is computed in.
+                step = int(state["step"])
                 exp_avg: LowBitState = state["exp_avg"]
                 exp_avg_sq: LowBitState = state["exp_avg_sq"]
                 exp_avg.apply(partial(_first_moment, weight=1.0 - beta1), grad)

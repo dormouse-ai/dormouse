@@ -51,6 +51,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .adamw import ADAMW_LR, AdamW
+from .lowbit import BLOCK, check
 from .muon import (
     COLROW_EPS,
     MUON_LR,
@@ -64,7 +65,6 @@ from .muon import (
     polar,
     spectral_bound,
 )
-from .lowbit import BLOCK, check
 from .mup import Parametrisation
 from .sf import SF_LR, SF_WEIGHT_DECAY, SFAdamW, SFNorMuon
 
@@ -433,7 +433,7 @@ class MixOptimizer:
 
 
 def _is_table(name: str) -> bool:
-    """True for the token table: the one parameter whose state stays 32-bit (§9)."""
+    """Return True for the token table: the one parameter whose state stays 32-bit (§9)."""
     return name.endswith("embed.weight")
 
 
