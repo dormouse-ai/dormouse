@@ -168,15 +168,23 @@ def test_the_assemble_side_refuses_a_context_the_mechanisms_cannot_take() -> Non
     assert "attn.pos" in str(caught.value) and "kda" in str(caught.value)
 
 
-def test_dorm_plan_is_wired_and_train_is_still_refused(capsys: pytest.CaptureFixture[str]) -> None:
+def test_dorm_plan_is_wired_and_train_refuses_a_config_with_no_data(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """`plan` prices the 1B config; `train` on it refuses by name: the corpus is not here.
+
+    The refusal is the point. A command that is wired must still refuse what it cannot do,
+    and the 1B config carries no `[[source]]` table because the 25 GB corpus is not in this
+    repository.
+    """
     from dormouse.cli import main
 
     assert main(["plan", str(CONFIGS / "dormouse_1b.toml")]) == 0
     printed = capsys.readouterr().out
     assert "params: stored=" in printed
     assert "mechanisms:" in printed
-    assert main(["train", "configs/dormouse_1b.toml"]) == 2
-    assert "not wired yet" in capsys.readouterr().err
+    assert main(["train", str(CONFIGS / "dormouse_1b.toml"), "--runs", str(tmp_path)]) == 2
+    assert "no [[source]] table" in capsys.readouterr().err
 
 
 def test_plan_needs_no_allocation_so_a_billion_parameter_stack_is_cheap() -> None:

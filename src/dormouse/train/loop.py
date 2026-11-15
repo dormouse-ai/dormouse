@@ -177,12 +177,6 @@ class Trainer:
             self.stage = stage.name
         counters = Counters()
         self.counters = counters
-        if cfg.clip:
-            counters.enable(
-                "adaptive_clip",
-                counter="clip_tensors",
-                why="per-tensor clipping is the default (recipe item 2)",
-            )
         started = time.perf_counter()
         batch = self.stream.batch(step, cfg.tokens_per_step)
         fetched = time.perf_counter()
@@ -196,6 +190,7 @@ class Trainer:
             optimizer=self.optim,
             accum=cfg.accum,
             clip=math.inf,
+            counters=counters,
             pre_step=lambda loss: self._pre_step(loss, counters),
         )
         finished = time.perf_counter()
@@ -256,6 +251,14 @@ class Trainer:
         is a rollback, and a rollback leaves the moments poisoned.
         """
         if self.cfg.clip:
+            # Enabled here, not before the forward: the stack's own `Counters.check()` runs
+            # inside its forward, so a counter this step produces must not be declared
+            # until the step is ready to produce it (the same rule `step.py` follows).
+            counters.enable(
+                "adaptive_clip",
+                counter="clip_tensors",
+                why="per-tensor clipping is the default (recipe item 2)",
+            )
             examined, scaled = guards.adaptive_clip(self.model, self.clip_norms, self.cfg.clip_z)
             counters.count("clip_tensors", examined)
             self.clip_events += scaled

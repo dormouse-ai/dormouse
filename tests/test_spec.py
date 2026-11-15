@@ -164,8 +164,16 @@ def test_the_one_config_is_the_architecture() -> None:
 
 
 def test_the_other_config_files_are_gone() -> None:
-    """One model: a second config is a second architecture wearing a filename."""
-    assert sorted(p.name for p in CONFIGS.glob("*.toml")) == ["dormouse_1b.toml"]
+    """One model: a second architecture would wear a filename, and there is none.
+
+    `smoke.toml` is not a second architecture — it is the CI seam test's stack, at the
+    smallest widths the arms accept, and `train/entry.py` prices its step from the bill
+    because it sits below the expert floor `dorm plan` refuses to price.
+    """
+    assert sorted(p.name for p in CONFIGS.glob("*.toml")) == [
+        "dormouse_1b.toml",
+        "smoke.toml",
+    ]
 
 
 def test_a_config_is_a_value_and_a_copy_can_be_scaled() -> None:
