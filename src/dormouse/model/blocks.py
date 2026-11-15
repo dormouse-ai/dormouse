@@ -92,7 +92,8 @@ class Block(nn.Module):
         rope: bool = True,
         max_seq_len: int = 1024,
         eps: float = EPS,
-        ffn: FFNSpec | None = None,
+        ffn: FFNSpec | nn.Module | None = None,
+        attn: nn.Module | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         """Build both pre-norms and both sublayers.
@@ -113,6 +114,36 @@ class Block(nn.Module):
                 "pass the depth of the stack this block belongs to",
             )
         write_std = PROJ_STD / (2.0 * n_layers) ** 0.5
+        self.norm1 = RMSNorm(d_model, eps, device=device)
+        #: Either arm comes prebuilt, so the assembler can put a KDA/CSA layer or a
+        #: routed bank here; `None` means the dense default this block was written for.
+        self.attn = (
+            attn
+            if attn is not None
+            else Attention(
+                d_model,
+                n_heads,
+                head_dim,
+                rope=rope,
+                max_seq_len=max_seq_len,
+                write_std=write_std,
+                device=device,
+            )
+        )
+        self.norm2 = RMSNorm(d_model, eps, device=device)
+        self.ffn = self._build_ffn(d_model, d_ffn, ffn, write_std, device)
+
+    @staticmethod
+    def _build_ffn(
+        d_model: int,
+        d_ffn: int,
+        ffn: FFNSpec | nn.Module | None,
+        write_std: float,
+        device: torch.device | str | None,
+    ) -> nn.Module:
+        """Build the arm the spec names, or take the module the caller built."""
+        if isinstance(ffn, nn.Module):
+            return ffn
         spec = ffn or FFNSpec(d_model, d_ffn)
         if spec.d_model != d_model or spec.d_ffn != d_ffn:
             raise LoudError(
@@ -120,18 +151,7 @@ class Block(nn.Module):
                 f"but the block is d_model={d_model}, d_ffn={d_ffn}",
                 "build the spec from the block's own widths; a spec is not a default",
             )
-        self.norm1 = RMSNorm(d_model, eps, device=device)
-        self.attn = Attention(
-            d_model,
-            n_heads,
-            head_dim,
-            rope=rope,
-            max_seq_len=max_seq_len,
-            write_std=write_std,
-            device=device,
-        )
-        self.norm2 = RMSNorm(d_model, eps, device=device)
-        self.ffn = spec.build(write_std=write_std, device=device)
+        return spec.build(write_std=write_std, device=device)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` in, the residual stream out, same shape."""

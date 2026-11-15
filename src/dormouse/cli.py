@@ -1,8 +1,9 @@
 """The `dorm` command: one entry point, no silent exits.
 
-Two commands are real today — `doctor`, which says what this machine can do, and
-`status`, which reads a run journal. The rest refuse with a named escape instead
-of pretending: a command that is not wired must not look like one that ran.
+Three commands are real today — `doctor`, which says what this machine can do, `plan`,
+which prices a config on the `meta` device without allocating it, and `status`, which
+reads a run journal. The rest refuse with a named escape instead of pretending: a
+command that is not wired must not look like one that ran.
 
 The CLI's contract, in three lines:
 
@@ -20,12 +21,16 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from .model.spec import StackSpec
 
 from dormouse_core.errors import LoudError
 from dormouse_core.journal import Journal
 
 #: Commands that exist and do something. Everything else refuses.
-READY = frozenset({"doctor", "status"})
+READY = frozenset({"doctor", "status", "plan"})
 
 #: Commands that are planned; the escape tells the reader what to use instead.
 PLANNED = {
@@ -65,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="read a run journal")
     status.add_argument("journal", nargs="?", default="runs/*/run.jsonl")
 
+    plan = sub.add_parser("plan", help="what a config will run, and what it will cost")
+    plan.add_argument("config", help="path to a stack .toml, e.g. configs/kitchen_sink.toml")
+
     for name in sorted(PLANNED):
         cmd = sub.add_parser(name, help=f"not wired yet: {PLANNED[name]}")
         cmd.add_argument("target", nargs="?", default="")
@@ -77,6 +85,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "status":
         return _status(args.journal)
+    if args.command == "plan":
+        return _plan(args.config)
     raise LoudError(
         f"{args.command} is not wired yet",
         PLANNED.get(args.command, "see PLAN.md for the order of work"),
@@ -117,6 +127,27 @@ def _smi() -> str | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout.strip() or None
+
+
+def _plan(config: str) -> int:
+    """Print the plan for a config: the stack, its bill, its step, its mechanisms.
+
+    Imported here rather than at module scope: `plan` is the only command that needs
+    the model layer, and `dorm doctor` has to work on a machine where torch is not
+    installed (it reports that instead of failing).
+    """
+    from .model.assemble import plan_lines
+
+    for line in plan_lines(_spec(config)):
+        print(line)
+    return 0
+
+
+def _spec(config: str) -> StackSpec:
+    """Read a stack config, annotated as what it is: `from_toml` returns the base."""
+    from .model.spec import StackSpec
+
+    return cast(StackSpec, StackSpec.from_toml(config))
 
 
 def _status(pattern: str) -> int:

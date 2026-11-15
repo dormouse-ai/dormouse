@@ -372,6 +372,12 @@ def route(name: str, param: torch.Tensor) -> str:
         return "adamw"
     if param.ndim == 2:
         return "muon"
+    if param.ndim == 3 and param.shape[1] == 1:
+        #: A depthwise convolution: `[channels, 1, taps]`. KDA's short conv is this
+        #: shape, and Muon has no chain to orthogonalise across taps — the update is
+        #: a per-channel filter, which is AdamW's arm. A grouped conv of real width
+        #: (axis 1 > 1) is still refused below rather than guessed.
+        return "adamw"
     if param.ndim <= 1:
         return "adamw"
     raise LoudError(

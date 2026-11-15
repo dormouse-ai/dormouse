@@ -1,0 +1,47 @@
+# kitchen_sink: every slot at its best-by-research setting.
+#
+# The stack, and the one line that argues each slot:
+#   attn=hybrid 3:1     three KDA layers per CSA layer (Kimi Linear 2510.26692 §5.2)
+#   attn_pos=none       KDA's decay and CSA's blocks are their own positional signal
+#   ffn=moe             one bank of 64 routed experts + one shared, dropless
+#   activation=moa      the mixture-of-activations arm inside each expert
+#   optimizer=muon      matrices under Muon with the qkv head split, vectors under AdamW
+#   weight_qat=ternary  BitNet b1.58 straight-through, applied in the forward
+#   act_quant=int4      per-token symmetric int4 on the activations entering a block
+#
+# objective stays ntp: "ntp+tst" and "ntp+jepa" are refused by model/spec.py because no
+# branch ships a second loss, and a plan that claims one would be a silent no-op.
+#
+# Widths. d_ffn is the EXPERT width here (3·832·6144 = 15.34M per expert), not a dense
+# FFN's. n_layers=4 is not a typo: the bank is shared by every layer, so the stack is
+# 1.01B stored and 44.5M active per token — the "one card" contract. Twelve layers of
+# attention would put active at 82M and stored at 1.05B, which breaks the 60M ceiling
+# `tests/test_assemble.py` enforces.
+
+unit = "byte"
+attn = "hybrid"
+attn_pattern = "3:1"
+attn_pos = "none"
+ffn = "moe"
+activation = "moa"
+expert_tsct_rank = 0
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary"
+act_quant = "int4"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 4
+n_heads = 13
+head_dim = 64
+d_ffn = 6144
+n_experts = 64
+topk = 1
+n_shared = 1
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

@@ -47,6 +47,34 @@ from .blocks import EPS, Block, RMSNorm
 from .ffn_spec import FFNSpec
 
 
+def _default_declarations(ffn_act: str, rope: bool) -> tuple[tuple[str, str, str], ...]:
+    """Return the mechanisms the dense default stack runs, as `(mechanism, counter, why)`.
+
+    This is what `_enable` declared inline before the stack became assemblable; it
+    stays a value so a caller that builds its own blocks can hand over its own list
+    instead of a boolean the stack has to guess from.
+    """
+    declared = [
+        ("attention", "attn_fwd", "every block attends"),
+        ("ffn", "ffn_fwd", "every block has a gated FFN"),
+    ]
+    if ffn_act == "la":
+        declared.append(("ffn_la", "ffn_la", "la mixes the dictionary"))
+    elif ffn_act == "moa":
+        declared.append(("ffn_moa", "ffn_moa", "moa gates the dictionary"))
+    if ffn_act in ("la", "moa"):
+        declared.append(
+            (
+                "ffn_dictionary",
+                "ffn_dict_entries_used",
+                "an enabled dictionary entry must contribute",
+            )
+        )
+    if rope:
+        declared.append(("rope", "rope_fwd", "byte-level 1024 window, no prior"))
+    return tuple(declared)
+
+
 class Transformer(nn.Module):
     """A decoder-only transformer with the live recipe's defaults."""
 
@@ -67,6 +95,8 @@ class Transformer(nn.Module):
         rope: bool = True,
         eps: float = EPS,
         device: torch.device | str | None = None,
+        blocks: Sequence[nn.Module] | None = None,
+        declarations: Sequence[tuple[str, str, str]] | None = None,
     ) -> None:
         """Build the table, the stack, the final norm and the (tied) head."""
         super().__init__()
@@ -86,6 +116,8 @@ class Transformer(nn.Module):
                 f"n_layers={n_layers} builds no blocks",
                 "a stack needs at least one layer",
             )
+        if blocks is not None and len(blocks) != n_layers:
+            n_layers = len(blocks)
         self.vocab = vocab
         self.d_model = d_model
         self.n_layers = n_layers
@@ -103,8 +135,19 @@ class Transformer(nn.Module):
         self.ffn_act = ffn_spec.act
         self.embed = nn.Embedding(vocab, d_model, device=device)
         nn.init.normal_(self.embed.weight, std=1.0)
+        #: Prebuilt blocks win, so a caller can hand over a mixed stack (KDA/CSA
+        #: layers, a routed bank); `declarations` is then the list of mechanisms
+        #: whose counters prove that stack ran, and `_enable` declares nothing on
+        #: its own beyond the parts every stack shares.
+        self.declarations = (
+            tuple(declarations)
+            if declarations is not None
+            else _default_declarations(ffn_spec.act, rope)
+        )
         self.blocks = nn.ModuleList(
-            [
+            blocks
+            if blocks is not None
+            else [
                 Block(
                     d_model,
                     n_heads,
@@ -165,27 +208,16 @@ class Transformer(nn.Module):
         Idempotent, and called at the top of every `forward`: `Counters.check()` at
         the end of the same call is then a statement about THIS forward — a mechanism
         that was enabled and never counted raises `MissingReport` before the step's
-        loss is ever returned.
+        loss is ever returned. Only the parts every stack shares are declared here;
+        the ones that depend on which arm a block holds come from `declarations`.
         """
         counters.enable("embedding", counter="embed_fwd", why="the token table is read")
         counters.enable("blocks", counter="block_fwd", why="the residual stack runs")
-        counters.enable("attention", counter="attn_fwd", why="every block attends")
-        counters.enable("ffn", counter="ffn_fwd", why="every block has a gated FFN")
-        if self.ffn_act == "la":
-            counters.enable("ffn_la", counter="ffn_la", why="la mixes the dictionary")
-        elif self.ffn_act == "moa":
-            counters.enable("ffn_moa", counter="ffn_moa", why="moa gates the dictionary")
-        if self.ffn_act in ("la", "moa"):
-            counters.enable(
-                "ffn_dictionary",
-                counter="ffn_dict_entries_used",
-                why="an enabled dictionary entry must contribute",
-            )
         counters.enable("norm", counter="norm_fwd", why="two pre-norms per block + final")
         counters.enable("head", counter="head_fwd", why="logits come from the tied head")
         counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
-        if self.rope:
-            counters.enable("rope", counter="rope_fwd", why="byte-level 1024 window, no prior")
+        for mechanism, counter, why in self.declarations:
+            counters.enable(mechanism, counter=counter, why=why)
 
     # ------------------------------------------------------------------- report
     def param_report(self) -> dict[str, int]:
