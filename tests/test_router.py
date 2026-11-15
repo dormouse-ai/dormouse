@@ -195,6 +195,42 @@ def test_the_router_traces_into_one_graph() -> None:
     assert torch.equal(traced.bias, reference.bias), "the QB update left the graph"
 
 
+def test_the_router_with_qb_captures_into_one_graph() -> None:
+    """`qb_update` holds no host read: the threshold is a scalar arg, not a tensor.
+
+    A `torch.tensor` threshold, or `.item()` on the CDF, is an `aten._to_copy`/
+    `_local_scalar_dense` and a capture aborts on it. `lt.Scalar` passes the float to the
+    kernel, so the whole routing path records; the bias the replay writes must be the
+    bias an eager call from zero computes, bit for bit.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("a CUDA graph needs a card")
+    torch.manual_seed(6)
+    router = Router(8, 4, 2).cuda()
+    x = torch.randn(64, 8, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            router(x)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        router(x)
+
+    router.bias.zero_()
+    graph.replay()
+    replayed = router.bias.clone()
+    assert not torch.equal(replayed, torch.zeros_like(replayed)), "the QB update did not run"
+
+    reference = Router(8, 4, 2).cuda()
+    reference.load_state_dict(router.state_dict())
+    reference.bias.zero_()
+    reference.qb_update(router.logits(x))
+    assert torch.equal(replayed, reference.bias), "the captured QB update left the graph"
+
+
 # --- state and refusals -----------------------------------------------------
 
 

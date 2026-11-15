@@ -46,6 +46,19 @@ invariance — a step whose magnitude does not depend on the spectrum — and ap
 ColRow to a NorMuon direction divides out exactly the per-row scale the second moment
 exists to set, so the normalization would be a no-op there.
 
+§4b. WHY THE CHAIN STAYS PER MATRIX, MEASURED. Batching the matrices that share a
+region shape into one `[N, m, n]` `bmm` — one call per shape group per iteration, which
+is what removes the launch storm — was built and measured on the profiled stack (33 Muon
+matrices, 13 region shapes, this card held by one process): 2,902 → 1,041 kernel
+launches, and 67.6 → 94.5 ms of Muon. It loses on both ends that matter. cuBLAS's
+batched path takes a 128x32-tile kernel for the `[6, 6144, 832]` group where `mm` takes
+magma's `sgemmEx` and a 256x128 tile (9.5 vs 5.5 ms for one iteration of the same
+FLOPs), and the re-association costs more than the 1e-6 anchor allows: 3.1e-6 relative
+on the first step's real momenta, worst at the ill-conditioned `[512, 64]`. A launch
+saved is 3-5 µs; the tiling and the anchor are worth more. So the chain is per matrix
+until a card or a torch build reports the other ordering — the lever is 15 lines in
+`directions` and the measurement is what decided it, not taste.
+
 §5. THE PER-HEAD ARM, AND ITS ONE HONEST PROPERTY. Kimi K3 §2.5 and DeepSeek V4.1
 apply the preconditioner per head to Q and K. Splitting a `[3d, d]` packed qkv weight
 into `2·n_heads` slices of `[head_dim, d]` and running the chain on each changes the
