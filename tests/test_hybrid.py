@@ -1,16 +1,17 @@
-"""The hybrid stack: the pattern tiles or it is refused, and the CSA layer is used.
+"""The hybrid stack: one pattern, two mechanisms, and the refusals around them.
 
-Three things are checked here that a shape test would miss:
+Four things are checked here that a shape test would miss:
 
-(a) `[KDA, KDA, KDA, CSA]` and `[KDA] x 4` produce different outputs, so the one
-    sparse layer is really in the path — a pattern that silently built four KDA
-    layers would pass every "does it run" test.
-(b) The bill per layer type is counted from the modules, not quoted: a hybrid
-    whose CSA layer costs more than the three KDA layers it replaces is a
-    different arm from the one that was measured.
-(c) An impossible combination dies before allocation, with the conflict named:
-    a pattern that does not tile, a mechanism that does not exist, a context that
-    contradicts a coeffect, and two mechanisms claiming one layer.
+(a) the pattern is `[kda, kda, kda, dsa]` and nothing else — there is no argument that
+    renames, reorders or extends it, because the previous version of this file offered
+    exactly that menu;
+(b) the DSA layer is really in the path: the stack's output is the residual
+    composition of its own layers, so a layer that was built and never called shows
+    up as a different tensor;
+(c) the bill per layer type is counted from the modules, not quoted;
+(d) an impossible combination dies before allocation, with the conflict named: a
+    layer count the period cannot tile, a mechanism that does not exist, a context
+    that contradicts a coeffect, and two mechanisms claiming one state.
 """
 
 from __future__ import annotations
@@ -27,59 +28,63 @@ N_HEADS = 2
 HEAD_DIM = 8
 SEQ = 32
 
+#: The DSA layer's budget, shrunk to the test window (`k >= seq` is refused).
+K, WINDOW = 8, 4
 
-def _stack(pattern: tuple[str, ...], **kwargs: int) -> HybridStack:
+
+def _stack(**kwargs: int) -> HybridStack:
     """A small stack with the same widths as the tests' other modules."""
     return HybridStack(
         D_MODEL,
         N_HEADS,
         HEAD_DIM,
-        n_layers=4,
-        pattern=pattern,
-        chunk=kwargs.get("chunk", 8),
-        csa_chunk=kwargs.get("csa_chunk", 8),
+        n_layers=int(kwargs.get("n_layers", 4)),
+        chunk=int(kwargs.get("chunk", 8)),
+        k=int(kwargs.get("k", K)),
+        window=int(kwargs.get("window", WINDOW)),
     )
 
 
-def test_the_default_pattern_is_the_three_to_one_recipe() -> None:
-    stack = _stack(HYBRID_3_TO_1)
-    assert stack.layer_types() == ("KDA", "KDA", "KDA", "CSA")
+def test_the_pattern_is_the_three_to_one_recipe() -> None:
+    stack = _stack()
+    assert stack.layer_types() == HYBRID_3_TO_1 == ("kda", "kda", "kda", "dsa")
     assert stack.coeffects().provides["attn.stack"] == "hybrid"
 
 
-def test_the_csa_layer_is_really_in_the_path() -> None:
-    """Parity against the two control arms: same shapes, different functions."""
+def test_the_dsa_layer_is_really_in_the_path() -> None:
+    """The stack IS the residual composition of the layers it says it built."""
     torch.manual_seed(21)
+    stack = _stack()
     x = torch.randn(1, SEQ, D_MODEL)
-    hybrid = _stack(HYBRID_3_TO_1)(x)
-    all_kda = _stack(("KDA",) * 4)(x)
-    all_csa = _stack(("CSA",) * 4)(x)
-    assert hybrid.shape == all_kda.shape == all_csa.shape
-    assert not torch.allclose(hybrid, all_kda, atol=1e-6)
-    assert not torch.allclose(hybrid, all_csa, atol=1e-6)
+    manual = x
+    for layer in stack.layers:
+        manual = manual + layer(manual)
+    assert torch.equal(stack(x), manual)
+    assert not torch.equal(manual, x)
 
 
 def test_the_bill_is_reported_per_layer_type() -> None:
-    stack = _stack(HYBRID_3_TO_1)
+    stack = _stack()
     report = stack.param_report()
-    assert report["per_kda"] > 0 and report["per_csa"] > 0
+    assert report["per_kda"] > 0 and report["per_dsa"] > 0
     assert report["kda"] == 3 * report["per_kda"]
-    assert report["csa"] == report["per_csa"]
+    assert report["dsa"] == report["per_dsa"]
     assert report["total"] == sum(p.numel() for p in stack.parameters())
-    assert report["total"] == report["kda"] + report["csa"]
+    assert report["total"] == report["kda"] + report["dsa"]
 
 
 def test_the_layer_counters_name_every_mechanism() -> None:
     counters = Counters()
-    _stack(HYBRID_3_TO_1)(torch.zeros(1, SEQ, D_MODEL), counters)
+    _stack()(torch.zeros(1, SEQ, D_MODEL), counters)
     assert counters.counts["hybrid_kda_layer_fwd"] == 3
-    assert counters.counts["hybrid_csa_layer_fwd"] == 1
+    assert counters.counts["hybrid_dsa_layer_fwd"] == 1
     assert counters.counts["hybrid_layer_fwd"] == 4
+    assert counters.counts["dsa_fwd"] == SEQ
 
 
 def test_a_later_token_cannot_change_an_earlier_output_through_the_stack() -> None:
     torch.manual_seed(22)
-    stack = _stack(HYBRID_3_TO_1)
+    stack = _stack()
     x = torch.randn(1, SEQ, D_MODEL)
     y = stack(x)
     moved = x.clone()
@@ -88,33 +93,29 @@ def test_a_later_token_cannot_change_an_earlier_output_through_the_stack() -> No
     assert not torch.equal(y[:, 24], stack(moved)[:, 24])
 
 
-def test_a_pattern_that_does_not_tile_is_refused_with_the_remainder() -> None:
+def test_a_layer_count_the_period_cannot_tile_is_refused_with_the_remainder() -> None:
     with pytest.raises(LoudError) as e:
-        HybridStack(D_MODEL, N_HEADS, HEAD_DIM, n_layers=10, pattern=HYBRID_3_TO_1)
+        _stack(n_layers=10)
     assert "2 layers are left over" in str(e.value)
 
 
 def test_an_unknown_mechanism_is_refused_by_name() -> None:
     with pytest.raises(LoudError) as e:
-        _stack(("KDA", "HCA", "KDA", "CSA"))
-    assert "HCA" in str(e.value)
-
-
-def test_an_empty_pattern_is_refused() -> None:
-    with pytest.raises(LoudError) as e:
-        _stack(())
-    assert "names no mechanism" in str(e.value)
+        check_compatible(["kda", "hca"], {"attn.pos": "none", "attn.rule": "delta"})
+    assert "kda" in str(e.value) and "dsa" in str(e.value)
 
 
 def test_a_context_that_contradicts_a_coeffect_is_refused_before_allocation() -> None:
-    """KDA has no rotary table: asking for RoPE must fail at construction."""
+    """Neither mechanism has a rotary table: asking for RoPE must fail at construction."""
     with pytest.raises(LoudError) as e:
         HybridStack(
             D_MODEL,
             N_HEADS,
             HEAD_DIM,
             n_layers=4,
-            pattern=HYBRID_3_TO_1,
+            chunk=8,
+            k=K,
+            window=WINDOW,
             context={"attn.pos": "rope"},
         )
     assert "attn.pos" in str(e.value) and "rope" in str(e.value)
@@ -124,17 +125,17 @@ def test_two_mechanisms_on_one_layer_conflict_by_name() -> None:
     """The first row of the conflict matrix, refused with both names in the message."""
     with pytest.raises(LoudError) as e:
         check_compatible(
-            ["KDA", "CSA"],
+            ["kda", "dsa"],
             {"attn.pos": "none", "attn.rule": "delta", "attn.selector": "true"},
         )
-    assert "KDA and CSA" in str(e.value)
+    assert "kda and dsa" in str(e.value)
     assert "attn.state" in str(e.value)
 
 
 def test_one_mechanism_on_its_own_is_compatible() -> None:
     """The check is not a blanket refusal: each layer alone is fine."""
-    check_compatible(["KDA"], {"attn.pos": "none", "attn.rule": "delta"})
-    check_compatible(["CSA"], {"attn.pos": "none", "attn.selector": "true"})
+    check_compatible(["kda"], {"attn.pos": "none", "attn.rule": "delta"})
+    check_compatible(["dsa"], {"attn.pos": "none", "attn.selector": "true"})
 
 
 def test_a_stack_with_no_layers_is_refused() -> None:
@@ -142,5 +143,5 @@ def test_a_stack_with_no_layers_is_refused() -> None:
         HybridStack(D_MODEL, N_HEADS, HEAD_DIM, n_layers=0)
 
 
-def test_the_repr_prints_the_pattern() -> None:
-    assert "pattern=['KDA', 'KDA', 'KDA', 'CSA']" in repr(_stack(HYBRID_3_TO_1))
+def test_the_repr_prints_the_period() -> None:
+    assert "period=['kda', 'kda', 'kda', 'dsa']" in repr(_stack())

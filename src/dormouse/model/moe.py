@@ -1,4 +1,4 @@
-"""The MoE FFN: 64 routed gated-SwiGLU experts plus one always-on shared expert.
+"""The MoE FFN: 64 routed MoA experts plus one always-on shared expert.
 
 THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert):
 
@@ -10,8 +10,12 @@ THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert):
     active (top-2 + shared)               = 46 059 520    (~46M)
 
 `3·d·f` is the gated SwiGLU's own bill: (gate, up, down), no bias, so an expert
-IS a `GatedFFN` and the bank reuses that class instead of re-implementing the
-formula. One number in the brief does not survive the arithmetic: `3·832·6144`
+IS an FFN arm (`GatedFFN` or, as the one architecture names it, `MoaFFN` over the
+six-entry dictionary) and the bank reuses that class instead of re-implementing the
+formula. The expert's `expert_tsct_rank` is a COMPUTE path (`tsct.py`): the three
+matrices are read through their rank-`r` spectrum in the forward while the masters
+stay the dense `3·d·f`, so the stored and active bills below are unchanged and only
+the multiplies drop. One number in the brief does not survive the arithmetic: `3·832·6144`
 is 15.34M, not 15.7M — at this width an expert would need `f=6291` to bill 15.7M,
 and the brief itself fixes `f=6144`. The refused configuration is the one that
 would make an expert a rounding error: below 10M parameters, or below 1% of the
@@ -75,6 +79,7 @@ from torch import nn
 from .ffn import PROJ_STD
 from .ffn_spec import FFNSpec
 from .router import Router
+from .tsct import TSCT_RANK
 
 #: An expert below this is not an expert at this project's scale; see the
 #: module docstring for why 10M and the live config that satisfies it.
@@ -154,8 +159,9 @@ class MoEFFN(nn.Module):
         n_experts: int = 64,
         topk: int = 2,
         n_shared: int = 1,
-        act: str = "silu",
+        act: str = "moa",
         d_ffn_gelu: int | None = None,
+        expert_tsct_rank: int = TSCT_RANK,
         write_std: float = PROJ_STD,
         qb: bool = True,
         min_expert_params: int = MIN_EXPERT_PARAMS,
@@ -179,7 +185,9 @@ class MoEFFN(nn.Module):
                 "use 0 (the parity control) or 1; a bank of shared experts is a "
                 "second dense path wearing the shared expert's name",
             )
-        self.expert_spec = FFNSpec(d_model, d_ffn, act=act, d_ffn_gelu=d_ffn_gelu)
+        self.expert_spec = FFNSpec(
+            d_model, d_ffn, act=act, d_ffn_gelu=d_ffn_gelu, tsct_rank=expert_tsct_rank
+        )
         per = expert_parameters(d_model, d_ffn) + self.expert_spec.added_parameters()
         active = per * (topk + n_shared)
         if per < min_expert_params:
@@ -203,6 +211,7 @@ class MoEFFN(nn.Module):
         self.n_experts = n_experts
         self.topk = topk
         self.n_shared = n_shared
+        self.expert_tsct_rank = expert_tsct_rank
         self.router = Router(d_model, n_experts, topk, qb=qb, device=device)
         self.experts = nn.ModuleList(
             self.expert_spec.build(write_std=write_std, device=device) for _ in range(n_experts)

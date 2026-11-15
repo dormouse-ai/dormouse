@@ -21,8 +21,7 @@ import pytest
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
-
-from dormouse.model.attn import Attention
+from reference_attn import Attention
 
 
 def _reference(x: torch.Tensor, attn: Attention, *, causal: bool) -> np.ndarray:

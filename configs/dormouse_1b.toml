@@ -1,0 +1,46 @@
+# dormouse_1b: the model. One architecture, one file.
+#
+# 12 layers, attention in a 3:1 pattern of KDA and DSA, both with GQA (2 KV heads per
+# 8 query heads) and a c_lat=512 bottleneck on q/kv; a bank of 64 routed MoA experts
+# of 15.34M plus one shared, top-2, dropless, each read through its rank-256 spectrum;
+# a tied head, chunked cross-entropy, Muon per head with AdamW on the vectors.
+#
+# There is no second config. The two control arms this model is measured against are
+# the SAME file with one width changed (attn="kda" or "dsa" for a uniform stack), and
+# every menu that used to live next to it (full/CSA/DSA/hybrid, gated/la/moa/moe FFNs)
+# is gone: a config that names one of those is refused by name.
+#
+# width arithmetic, so the numbers in the plan are checkable by hand:
+#   attention  q_lat+q_up   = 832·512 + 512·512 =  688,128  (x9 KDA layers)
+#              kv_lat+kv_up = 832·512 + 512·256 =  557,056  (+ gates, conv, proj)
+#   expert     3·832·6144   = 15,335,424  stored dense, read at rank 256
+#   bank       65 experts + router × 832    ≈ 996,855,808 stored
+#   active     top-2 + shared = 3 experts   =  46,006,272  (ffn active)
+
+unit = "bpe"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

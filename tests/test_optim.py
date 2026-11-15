@@ -14,8 +14,8 @@ import math
 import pytest
 import torch
 from dormouse_core.errors import LoudError
+from stacks import reference_stack
 
-from dormouse.model import Transformer
 from dormouse.train.optim import (
     COLROW_EPS,
     MUON_LR,
@@ -237,7 +237,7 @@ def test_polar_refuses_a_shape_that_is_not_a_matrix() -> None:
 
 
 def test_every_parameter_of_the_stack_is_routed() -> None:
-    table = route_all(Transformer(**SMALL))
+    table = route_all(reference_stack())
     assert table["embed.weight"] == "adamw"
     assert table["norm.weight"] == "adamw"
     assert table["blocks.0.norm1.weight"] == "adamw"
@@ -254,7 +254,7 @@ def test_a_shape_neither_rule_claims_is_refused() -> None:
 
 
 def test_the_packed_qkv_is_the_only_per_head_group() -> None:
-    model = Transformer(**SMALL)
+    model = reference_stack()
     mix = MixOptimizer(model)
     splits = {group["head_split"] for group in mix.muon.param_groups}
     assert splits == {None, (2 * SMALL["n_heads"], 2 * SMALL["d_model"])}
@@ -294,7 +294,7 @@ def test_mixing_a_model_without_matrices_is_refused() -> None:
 
 
 def test_set_lr_scales_both_peak_rates() -> None:
-    mix = MixOptimizer(Transformer(**SMALL), lr_muon=0.02, lr_adamw=0.003)
+    mix = MixOptimizer(reference_stack(), lr_muon=0.02, lr_adamw=0.003)
     mix.set_lr(0.5)
     assert mix.muon.param_groups[0]["lr"] == pytest.approx(0.01)
     assert mix.adamw.param_groups[0]["lr"] == pytest.approx(0.0015)
@@ -302,7 +302,7 @@ def test_set_lr_scales_both_peak_rates() -> None:
 
 def test_a_negative_lr_fraction_is_refused() -> None:
     with pytest.raises(LoudError, match="negative"):
-        MixOptimizer(Transformer(**SMALL)).set_lr(-0.1)
+        MixOptimizer(reference_stack()).set_lr(-0.1)
 
 
 def test_route_sends_a_vector_and_the_token_table_to_adamw() -> None:
@@ -314,8 +314,8 @@ def test_route_sends_a_vector_and_the_token_table_to_adamw() -> None:
 def test_state_dict_round_trips_between_two_optimizers() -> None:
     """A resume at step 1 must continue, not restart: the momentum is in the state."""
     torch.manual_seed(10)
-    model = Transformer(**SMALL)
-    twin = Transformer(**SMALL)
+    model = reference_stack()
+    twin = reference_stack()
     twin.load_state_dict(model.state_dict())
     first, second = MixOptimizer(model), MixOptimizer(twin)
     ids = torch.randint(0, SMALL["vocab"], (2, 9))

@@ -1,15 +1,18 @@
-"""The stack, built from the two configs, priced, trained for three steps, and gated.
+"""The stack, built from the one config, priced, trained for three steps, and gated.
 
 Three contracts live here, and each one is a number rather than an opinion:
 
-* `control.toml` builds a parameter count that equals the arithmetic written out by hand
-  (`4·d²` for attention, `3·d·d_ffn` for the FFN, `2·d` per block for the norms) — so a
-  builder that forgets a matrix disagrees with the formula instead of quietly costing
-  less;
-* `kitchen_sink.toml` stores about a billion parameters and runs at most 60M per token,
-  which is the contract that makes the stack trainable on one card;
-* both stacks take three CPU steps with a finite loss, and every enabled mechanism
-  moved its counter — no `MissingReport`, and no mechanism enabled and silent.
+* the model stores about a billion parameters and runs an FFN active set of 46.07M —
+  the pair the whole design is priced at — measured from the module tree, with the
+  attention share of the active set printed next to it;
+* every attention layer is one of the two mechanisms, in the 3:1 pattern, with GQA and
+  the bottleneck on both — and the DSA layers are where the plan says they are;
+* three CPU steps run with a finite loss and every enabled mechanism moved its
+  counter: `kda_fwd`/`kda_bwd`, `dsa_fwd`, `moe_rows_run`, `tsct_fwd`, `moa_fwd`.
+  A `MissingReport` here is the defect class the counters exist for.
+
+The smoke widths keep every slot and shrink only the numbers, so the wiring under test
+is the config's wiring.
 """
 
 from __future__ import annotations
@@ -22,65 +25,82 @@ import torch
 from dormouse_core.errors import LoudError
 
 from dormouse.model.assemble import assemble, plan_lines
+from dormouse.model.registry import pieces
 from dormouse.model.spec import StackSpec
 from dormouse.train.optim import MixOptimizer
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
-#: The stack a config names, at widths a CPU test can afford. Every slot is kept; only
-#: the widths shrink, so the wiring and the refusals are the ones the config asks for.
+#: The one config, at widths a CPU test can afford. Every slot is kept.
 SMOKE = {
     "d_model": 64,
     "n_heads": 4,
+    "n_kv_heads": 2,
     "head_dim": 16,
+    "c_lat": 32,
+    "n_layers": 4,
     "d_ffn": 128,
     "n_experts": 4,
     "topk": 1,
+    "expert_tsct_rank": 32,
+    "attn_k": 64,
+    "attn_window": 32,
     "seq_len": 128,
     "batch": 2,
     "tokens": 1_000_000,
 }
 
 
-def _smoke(name: str) -> StackSpec:
-    return replace(StackSpec.from_toml(CONFIGS / name), **SMOKE)
+def _smoke() -> StackSpec:
+    return replace(StackSpec.from_toml(CONFIGS / "dormouse_1b.toml"), **SMOKE)
 
 
-def _control_params(spec: StackSpec) -> int:
-    """The control stack's bill, written from the module widths and nothing else."""
-    embed = spec.vocab * spec.d_model
-    norms = (2 * spec.n_layers + 1) * spec.d_model
-    attention = spec.n_layers * 4 * spec.d_model**2
-    ffn = spec.n_layers * 3 * spec.d_model * spec.d_ffn
-    return embed + norms + attention + ffn
-
-
-def test_the_control_builds_the_parameter_count_the_arithmetic_promises() -> None:
-    spec = StackSpec.from_toml(CONFIGS / "control.toml")
-    report = assemble(spec).report()
-    expected = _control_params(spec)
-    print(f"\ncontrol: {report}")
-    print(f"control: formula={expected:,} tree={report['stored']:,}")
-    assert report["stored"] == expected
-    assert report["active"] == expected  # a dense stack runs every parameter
-    assert report["head"] == 0  # the head is tied; a nonzero here is a second matrix
-    assert report["ffn"] == spec.n_layers * 3 * spec.d_model * spec.d_ffn
-
-
-def test_the_kitchen_sink_stores_a_billion_and_runs_under_sixty_million() -> None:
-    spec = StackSpec.from_toml(CONFIGS / "kitchen_sink.toml")
+def test_the_model_stores_a_billion_and_runs_the_ffn_at_forty_six_million() -> None:
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
     report = assemble(spec, device="meta").report()
-    print(f"\nkitchen_sink: stored={report['stored']:,} active={report['active']:,}")
-    print(f"kitchen_sink: groups={report}")
-    assert 0.95e9 <= report["stored"] <= 1.10e9
-    assert 40e6 <= report["active"] <= 60e6
-    # The number the card cares about, as a hard gate rather than a printout.
-    assert report["active"] < 60_000_000
-    assert report["active"] < report["stored"] / 10
+    print(
+        f"\ndormouse_1b: stored={report['stored']:,} active={report['active']:,} "
+        f"ffn_active={report['active_ffn']:,} attention={report['attention']:,} "
+        f"embedding={report['embedding']:,}"
+    )
+    assert 0.99e9 <= report["stored"] <= 1.10e9
+    per_expert = 3 * 832 * 6144 + 832 * 6 + 2 * 6
+    assert report["active_ffn"] == 3 * per_expert + 64 * 832
+    assert report["active_ffn"] < report["stored"] / 20
+    assert report["head"] == 0  # tied: a nonzero here is a second matrix
+    assert report["ffn"] == per_expert * 65 + 64 * 832
+
+
+def test_the_attention_share_of_the_step_is_printed_and_is_the_minority() -> None:
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    report = assemble(spec, device="meta").report()
+    share = report["attention"] / report["active"]
+    print(f"\nattention share of the active set: {share:.1%}")
+    assert 0.2 <= share <= 0.4, share
+
+
+def test_the_layers_are_the_pattern_the_config_names() -> None:
+    assembled = assemble(_smoke(), smoke=True)
+    kinds = [type(block.attn).__name__ for block in assembled.model.blocks]
+    assert kinds == ["KDA", "KDA", "KDA", "DSA"]
+    kda = assembled.model.blocks[0].attn
+    assert (kda.n_heads, kda.n_kv_heads, kda.c_lat) == (4, 2, 32)
+    assert kda.latent, "the architecture's projections are the compressed ones"
+    dsa = assembled.model.blocks[3].attn
+    assert (dsa.n_kv_heads, dsa.c_lat, dsa.k) == (2, 32, 64)
+
+
+def test_muon_splits_the_compressed_projections_per_head() -> None:
+    """Per-head Muon on `q_up` and the K half of `kv_up`; V and `proj` stay whole."""
+    assembled = assemble(_smoke(), smoke=True)
+    splits = {group["head_split"] for group in MixOptimizer(assembled.model).muon.param_groups}
+    assert (4, 64) in splits  # q_up: 4 heads x 16 channels, every row is a head
+    assert (2, 32) in splits  # kv_up: 2 KV heads over the K half, V as the remainder
+    assert None in splits  # proj, the FFN and the rest are whole matrices
 
 
 def test_the_bank_is_one_module_shared_by_every_layer() -> None:
-    spec = _smoke("kitchen_sink.toml")
+    spec = _smoke()
     assembled = assemble(spec, smoke=True)
     banks = [module for module in assembled.model.modules() if type(module).__name__ == "FlatBank"]
     inner = {id(module.bank) for module in banks}
@@ -88,27 +108,28 @@ def test_the_bank_is_one_module_shared_by_every_layer() -> None:
     assert len(inner) == 1, "a bank per layer would store and run n_layers times as much"
 
 
-def test_the_kitchen_sink_plan_names_the_stack_and_its_mechanisms() -> None:
-    lines = plan_lines(StackSpec.from_toml(CONFIGS / "kitchen_sink.toml"))
+def test_the_plan_names_the_stack_the_bill_and_the_mechanisms() -> None:
+    lines = plan_lines(StackSpec.from_toml(CONFIGS / "dormouse_1b.toml"))
     text = "\n".join(lines)
     print("\n" + text)
     for expected in (
-        "hybrid 3:1",
-        "kda, kda, kda, csa",
+        "hybrid 3:1 kda:dsa",
+        "kda, kda, kda, dsa",
         "experts: moa",
-        "weight_qat=ternary",
-        "act_quant=int4",
-        "stored=1,010,891,710",
-        "741.6h  train",
+        "tsct rank 256",
+        "kv=2, c_lat=512",
         "moe→moe_fwd",
+        "moa→moa_fwd",
+        "tsct→tsct_fwd",
         "ntp→ntp_loss",
+        "attention=",
+        "of the active set",
     ):
         assert expected in text, expected
 
 
-@pytest.mark.parametrize("name", ["control.toml", "kitchen_sink.toml"])
-def test_three_cpu_steps_on_a_config_leave_every_enabled_mechanism_reported(name: str) -> None:
-    spec = _smoke(name)
+def test_three_cpu_steps_leave_every_enabled_mechanism_reported() -> None:
+    spec = _smoke()
     assembled = assemble(spec, smoke=True)
     optimizer = MixOptimizer(assembled.model, steps=2)
     ids = torch.randint(0, spec.vocab, (spec.batch, spec.seq_len + 1))
@@ -116,15 +137,15 @@ def test_three_cpu_steps_on_a_config_leave_every_enabled_mechanism_reported(name
         result, counters = assembled.step(ids, optimizer=optimizer)
         assert not result.skipped, f"step {step} tripped the NaN firewall"
         assert torch.isfinite(torch.tensor(result.loss)), f"step {step}: loss={result.loss}"
-    print(f"\n{name}: {counters.line()}")
-    print(f"{name}: enabled={sorted(counters.enabled)}")
+    print(f"\n{counters.line()}")
+    print(f"enabled={sorted(counters.enabled)}")
     assert counters.silent() == []
+    counters.check()
+    for counter in ("kda_fwd", "kda_bwd", "dsa_fwd", "moe_rows_run", "tsct_fwd", "moa_fwd"):
+        assert counters.counts[counter] > 0, counter
     declared = {piece.mechanism for piece in assembled.pieces}
     assert declared <= counters.enabled, declared - counters.enabled
-    if name == "kitchen_sink.toml":
-        assert {"kda", "csa", "moe", "ffn_moa", "weight_qat", "act_quant"} <= counters.enabled
-    else:
-        assert {"attention", "rope", "ffn"} <= counters.enabled
+    assert {"kda", "dsa", "moe", "moa", "tsct", "ffn_dictionary"} <= counters.enabled
 
 
 def test_a_mechanism_that_is_enabled_and_silent_still_raises() -> None:
@@ -132,31 +153,35 @@ def test_a_mechanism_that_is_enabled_and_silent_still_raises() -> None:
     from dormouse_core.counters import Counters, MissingReport
 
     counters = Counters()
-    counters.enable("ternary", counter="weight_ternary")
+    counters.enable("tsct", counter="tsct_fwd")
     with pytest.raises(MissingReport):
         counters.check()
 
 
-def test_the_assemble_side_refuses_the_same_conflicts_before_allocating() -> None:
+def test_the_assemble_side_refuses_a_context_the_mechanisms_cannot_take() -> None:
+    """The refusal is the mechanism's own `Coeffects`, not a table in the assembler."""
     with pytest.raises(LoudError) as caught:
-        assemble(StackSpec(attn="kda", attn_pos="rope", n_layers=4))
+        pieces(
+            _smoke(),
+            ctx={"attn.pos": "rope", "attn.rule": "delta", "attn.selector": "true"},
+        )
     assert "attn.pos" in str(caught.value) and "kda" in str(caught.value)
 
 
 def test_dorm_plan_is_wired_and_train_is_still_refused(capsys: pytest.CaptureFixture[str]) -> None:
     from dormouse.cli import main
 
-    assert main(["plan", str(CONFIGS / "kitchen_sink.toml")]) == 0
+    assert main(["plan", str(CONFIGS / "dormouse_1b.toml")]) == 0
     printed = capsys.readouterr().out
-    assert "params: stored=1,010,891,710" in printed
+    assert "params: stored=" in printed
     assert "mechanisms:" in printed
-    assert main(["train", "configs/control.toml"]) == 2
+    assert main(["train", "configs/dormouse_1b.toml"]) == 2
     assert "not wired yet" in capsys.readouterr().err
 
 
 def test_plan_needs_no_allocation_so_a_billion_parameter_stack_is_cheap() -> None:
     """The plan builds on `meta`: the same numbers, no 4 GiB of weights."""
-    spec = StackSpec.from_toml(CONFIGS / "kitchen_sink.toml")
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
     measured = assemble(spec, device="meta").report()
     assert measured["stored"] > 1e9
     assert all(isinstance(value, int) for value in measured.values())

@@ -6,17 +6,20 @@ Every parameterisation choice below is stated with its reason, because each one 
 number a later measurement will be compared against and a silent default here is a
 silent difference in every run.
 
-TIED HEAD. The logits' matrix IS the token table, transposed. At `vocab=256` a head
-of its own is 0.2M parameters (0.22% of a 12-layer d=832 model) that learn "predict
-byte b" separately from "read byte b" — for a 256-row table the two gradients belong
-in one matrix (GPT-2's choice at exactly this scale), and an untied head buys nothing
-a measurement here has shown.
+NO DEFAULT BLOCKS. The blocks come prebuilt from `assemble.assemble`, which is the
+one place that knows which attention mechanism a layer holds. A shell that also
+built its own would be a second model, and the two would disagree the first time a
+mechanism moved.
 
-PLAIN TOKEN TABLE, NOT FACTORISED. `vocab·d = 212 992` is 0.22% of the model; the
-`U·Vᵀ` factorisation that pays at 32k tokens would turn a 213k-parameter lookup into
-a rank bottleneck to save 100k, which is a rank cut paid for with model quality and
-no parameter budget returned. When the tokenizer moves to 32k, this is the line that
-changes, and it is one line.
+TIED HEAD. The logits' matrix IS the token table, transposed. At `vocab=32768` a
+head of its own is 27M parameters (2.6% of a 1B model) that learn "predict token t"
+separately from "read token t"; for a table this size the two gradients belong in one
+matrix, and the head's own bill stays 0 so a translation of the tying to a second
+matrix shows up as a number that moved.
+
+PLAIN TOKEN TABLE, NOT FACTORISED. `vocab·d = 27.3M` is 2.6% of the model; the
+`U·Vᵀ` factorisation would turn a lookup into a rank bottleneck to save half of it,
+which is a rank cut paid for with model quality and no parameter budget returned.
 
 INITIALISATION. Token rows and every projection draw `N(0, 0.02²)`, except the two
 projections that write the residual (`attn.proj`, `ffn.down`), which draw
@@ -28,10 +31,9 @@ at any depth instead of growing with L. Token rows are `N(0, 1)` because RMSNorm
 defined against a unit-RMS input: the first block's pre-norm is near-identity at step
 0, which is the state every anchor below is written against.
 
-ROPE. The live recipe is a byte-level model over a 1024-token window with no
-positional prior in the tokenizer; without rotations every position sees the same
-multiset of bytes (measured: loss 4.28 → 16.4). `Attention` owns the formula; this
-class only decides that the stack uses it, and `rope=True` is the recipe.
+NO ROTARY TABLE. Neither attention mechanism uses one (KDA's decay and DSA's
+selection are their own positional signal), so the stack has no `rope` switch and no
+position table to disagree with a checkpoint.
 """
 
 from __future__ import annotations
@@ -43,126 +45,53 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from .blocks import EPS, Block, RMSNorm
-from .ffn_spec import FFNSpec
-
-
-def _default_declarations(ffn_act: str, rope: bool) -> tuple[tuple[str, str, str], ...]:
-    """Return the mechanisms the dense default stack runs, as `(mechanism, counter, why)`.
-
-    This is what `_enable` declared inline before the stack became assemblable; it
-    stays a value so a caller that builds its own blocks can hand over its own list
-    instead of a boolean the stack has to guess from.
-    """
-    declared = [
-        ("attention", "attn_fwd", "every block attends"),
-        ("ffn", "ffn_fwd", "every block has a gated FFN"),
-    ]
-    if ffn_act == "la":
-        declared.append(("ffn_la", "ffn_la", "la mixes the dictionary"))
-    elif ffn_act == "moa":
-        declared.append(("ffn_moa", "ffn_moa", "moa gates the dictionary"))
-    if ffn_act in ("la", "moa"):
-        declared.append(
-            (
-                "ffn_dictionary",
-                "ffn_dict_entries_used",
-                "an enabled dictionary entry must contribute",
-            )
-        )
-    if rope:
-        declared.append(("rope", "rope_fwd", "byte-level 1024 window, no prior"))
-    return tuple(declared)
+from .blocks import EPS, RMSNorm
 
 
 class Transformer(nn.Module):
-    """A decoder-only transformer with the live recipe's defaults."""
+    """A decoder-only transformer over a stack of prebuilt blocks."""
 
     def __init__(
         self,
         *,
-        vocab: int = 256,
+        vocab: int = 32768,
         d_model: int = 832,
-        n_layers: int = 12,
-        n_heads: int = 13,
-        head_dim: int = 64,
-        d_ffn: int = 2048,
-        d_ffn_gelu: int | None = None,
-        ffn_act: str = "silu",
-        ffn_dict: Sequence[str] | None = None,
-        ffn_moa_sides: str | None = None,
+        d_ffn: int = 6144,
         max_seq_len: int = 1024,
-        rope: bool = True,
         eps: float = EPS,
         device: torch.device | str | None = None,
-        blocks: Sequence[nn.Module] | None = None,
-        declarations: Sequence[tuple[str, str, str]] | None = None,
+        blocks: Sequence[nn.Module],
+        declarations: Sequence[tuple[str, str, str]],
     ) -> None:
         """Build the table, the stack, the final norm and the (tied) head."""
         super().__init__()
-        if n_heads * head_dim != d_model:
-            raise LoudError(
-                f"n_heads·head_dim = {n_heads}·{head_dim} = {n_heads * head_dim} "
-                f"≠ d_model={d_model}",
-                "the split into heads must tile the residual width exactly",
-            )
         if vocab < 2:
             raise LoudError(
                 f"vocab={vocab}: a model that predicts one symbol predicts nothing",
-                "byte-level is 256",
+                "BPE is 32768 symbols; a 256-symbol byte model is the data layer's arm",
             )
-        if n_layers < 1:
+        if d_model < 1 or d_ffn < 1:
             raise LoudError(
-                f"n_layers={n_layers} builds no blocks",
-                "a stack needs at least one layer",
+                f"the stack needs positive widths, got d_model={d_model}, d_ffn={d_ffn}",
+                "pass the residual and FFN widths the blocks were built at",
             )
-        if blocks is not None and len(blocks) != n_layers:
-            n_layers = len(blocks)
+        if not blocks:
+            raise LoudError(
+                "the stack needs at least one block",
+                "build them with assemble.assemble: a block's attention arm is not a default",
+            )
         self.vocab = vocab
         self.d_model = d_model
-        self.n_layers = n_layers
+        self.n_layers = len(blocks)
         self.d_ffn = d_ffn
         self.max_seq_len = max_seq_len
-        self.rope = rope
-        ffn_spec = FFNSpec(
-            d_model,
-            d_ffn,
-            act=ffn_act,
-            dictionary=None if ffn_dict is None else tuple(ffn_dict),
-            sides=ffn_moa_sides,
-            d_ffn_gelu=d_ffn_gelu,
-        )
-        self.ffn_act = ffn_spec.act
         self.embed = nn.Embedding(vocab, d_model, device=device)
         nn.init.normal_(self.embed.weight, std=1.0)
-        #: Prebuilt blocks win, so a caller can hand over a mixed stack (KDA/CSA
-        #: layers, a routed bank); `declarations` is then the list of mechanisms
-        #: whose counters prove that stack ran, and `_enable` declares nothing on
-        #: its own beyond the parts every stack shares.
-        self.declarations = (
-            tuple(declarations)
-            if declarations is not None
-            else _default_declarations(ffn_spec.act, rope)
-        )
-        self.blocks = nn.ModuleList(
-            blocks
-            if blocks is not None
-            else [
-                Block(
-                    d_model,
-                    n_heads,
-                    head_dim,
-                    d_ffn,
-                    n_layers=n_layers,
-                    rope=rope,
-                    max_seq_len=max_seq_len,
-                    eps=eps,
-                    ffn=ffn_spec,
-                    device=device,
-                )
-                for _ in range(n_layers)
-            ]
-        )
+        #: `declarations` is the list of mechanisms whose counters prove this stack
+        #: ran; the constructor cannot infer it from the modules, and a mechanism the
+        #: forward cannot count is a mechanism nobody can see was skipped.
+        self.declarations = tuple(declarations)
+        self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(d_model, eps, device=device)
 
     # ------------------------------------------------------------------ forward

@@ -36,8 +36,10 @@ from torch import nn
 #: K3's SiTU soft-cap scale on the gate branch (arXiv 2607.24653 §2.3.2).
 SITU_BETA = 4.0
 
-#: The paper's `gsr2lr` dictionary, and the default for both mixtures.
-DEFAULT_DICTIONARY: tuple[str, ...] = ("gelu", "silu", "relu2", "leaky", "tanh")
+#: The paper's `gsr2lr` dictionary plus K3's SiTU gate factor, and the default for
+#: both mixtures. SiTU is the one bounded-nonlinearity candidate the paper's set
+#: lacks at unit scale (`tanh`'s cap of 1 is too tight for a pre-activation).
+DEFAULT_DICTIONARY: tuple[str, ...] = ("gelu", "silu", "relu2", "leaky", "tanh", "situ")
 
 
 def _gelu(z: torch.Tensor) -> torch.Tensor:
