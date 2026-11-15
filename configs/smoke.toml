@@ -1,0 +1,53 @@
+# smoke: the CI seam test — twenty steps on the committed 2 MB byte slice.
+#
+# NOT A MEASUREMENT. Every number this run reports is twenty steps of a 47k-parameter
+# stack on a 2 MB fixture. The file exists to make `dorm train`'s journal, checkpoint,
+# eval, harness and artifact run in under a minute on a CPU, so a change that breaks one
+# of them is a red build instead of a bug found on the card. The eval window is the
+# fixture's own tail, which `train/entry.py:_heldout` refuses to overlap with training.
+#
+# The widths are the live slots at the smallest size each arm accepts: the GQA/latent
+# projections, a two-expert MoA bank read through rank-8 factors, and one attention arm
+# (DSA, two layers). The harness generates ~750 windows in one go and that is the cost of
+# this file, so the seam test spends it on the cheapest stack the arms accept; the
+# architecture itself is priced by `dorm plan configs/dormouse_1b.toml`. (`dorm plan`
+# refuses THIS file by design: a bank of 6k-parameter experts is below the 10M floor the
+# plan prices at, and `train/entry.py:_plan` names that when it prices the step.) The
+# arms are tested where they live. `unit = "byte"` because the fixture is raw bytes, so
+# one token is one byte and the BPB conversion is exact.
+
+unit = "byte"
+attn = "dsa"
+optimizer = "muon"
+objective = "ntp"
+sources = "fixture"
+
+d_model = 32
+n_layers = 2
+n_heads = 2
+n_kv_heads = 1
+head_dim = 16
+c_lat = 8
+d_ffn = 64
+n_experts = 2
+topk = 1
+expert_tsct_rank = 8
+attn_k = 64
+attn_window = 32
+seq_len = 128
+batch = 8
+
+# 20 480 tokens = 20 steps of 8 x 128: the horizon `--smoke` takes and `dorm plan` prints.
+tokens = 20_480
+throughput_tflops = 1.0
+
+schedule = "cosine"
+seed = 7
+eval_every = 0
+ckpt_every = 0
+eval_batches = 1
+eval = "../tests/fixtures/corpus_2mb.bin"
+
+[[source]]
+path = "../tests/fixtures/corpus_2mb.bin"
+weight = 1.0

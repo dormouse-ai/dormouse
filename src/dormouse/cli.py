@@ -1,9 +1,10 @@
 """The `dorm` command: one entry point, no silent exits.
 
-Three commands are real today — `doctor`, which says what this machine can do, `plan`,
-which prices a config on the `meta` device without allocating it, and `status`, which
-reads a run journal. The rest refuse with a named escape instead of pretending: a
-command that is not wired must not look like one that ran.
+Five commands are real today — `doctor`, which says what this machine can do, `plan`,
+which prices a config on the `meta` device without allocating it, `train`, which runs
+that config end to end, `eval`, which scores a checkpoint, and `status`, which reads a
+run journal. The rest refuse with a named escape instead of pretending: a command that
+is not wired must not look like one that ran.
 
 The CLI's contract, in three lines:
 
@@ -15,6 +16,7 @@ The CLI's contract, in three lines:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import platform
 import shutil
@@ -31,16 +33,14 @@ from dormouse_core.errors import LoudError
 from dormouse_core.journal import Journal
 
 #: Commands that exist and do something. Everything else refuses.
-READY = frozenset({"doctor", "status", "plan"})
+READY = frozenset({"doctor", "status", "plan", "train", "eval"})
 
 #: Commands that are planned; the escape tells the reader what to use instead.
 PLANNED = {
-    "train": "use the current port/ trainer until the model layer moves; see PLAN.md step 4",
-    "run": "same as train: the pipeline moves after the model layer",
+    "run": "`dorm train` runs one config end to end today; the multi-stage chain is next",
     "tokenize": "scripts/tokenize_corpus.py in port/ until the data layer moves",
-    "eval": "port/scripts for now; the harness moves in PLAN.md step 4",
     "serve": "port/ serve for now; the Rust binary arrives in step 7",
-    "export": "port/ export for now; moves with the model layer",
+    "export": "`dorm train` writes runs/<id>/export/model.pt; the quantised package is next",
     "audit": "the invariants live in dormouse-core's tests today",
 }
 
@@ -79,6 +79,17 @@ def _parser() -> argparse.ArgumentParser:
         help="a run journal whose eval events measure the quality/data elasticity",
     )
 
+    run = sub.add_parser("train", help="run a config: model, mixture, loop, journal, artifact")
+    run.add_argument("config", help="path to a run .toml, e.g. configs/dormouse_1b.toml")
+    run.add_argument("--yes", action="store_true", help="accept a plan past the budget")
+    run.add_argument("--smoke", action="store_true", help="20 steps, every seam still runs")
+    run.add_argument("--resume", action="store_true", help="continue runs/<id> from the checkpoint")
+    run.add_argument("--steps", type=int, default=None, help="absolute horizon, to pause a run")
+    run.add_argument("--runs", default="runs", help="the directory run directories live in")
+
+    score = sub.add_parser("eval", help="score a checkpoint: the harness table and its BPB")
+    score.add_argument("checkpoint", help="runs/<id>/final.pt, or the run directory")
+
     for name in sorted(PLANNED):
         cmd = sub.add_parser(name, help=f"not wired yet: {PLANNED[name]}")
         cmd.add_argument("target", nargs="?", default="")
@@ -93,6 +104,10 @@ def _dispatch(args: argparse.Namespace) -> int:
         return _status(args.journal)
     if args.command == "plan":
         return _plan(args.config, args.journal)
+    if args.command == "train":
+        return _train(args)
+    if args.command == "eval":
+        return _eval(args.checkpoint)
     raise LoudError(
         f"{args.command} is not wired yet",
         PLANNED.get(args.command, "see PLAN.md for the order of work"),
@@ -150,6 +165,38 @@ def _plan(config: str, journal: str | None = None) -> int:
     return 0
 
 
+def _train(args: argparse.Namespace) -> int:
+    """Run the config; the receipt is printed, not logged.
+
+    Imported here for the same reason `plan` is: the run needs torch and the model
+    layer, and `dorm doctor` has to work on a machine where neither is installed.
+    """
+    from .train.entry import train
+
+    receipt = train(
+        args.config,
+        runs=args.runs,
+        resume=args.resume,
+        smoke=args.smoke,
+        until=args.steps,
+        approve=args.yes,
+        echo=print,
+    )
+    print(
+        f"artifact {receipt.get('artifact', '(paused: none yet)')}  "
+        f"plan {receipt['plan_flops']:,} FLOP/step"
+    )
+    return 0
+
+
+def _eval(checkpoint: str) -> int:
+    """Score a checkpoint: the harness table, then its BPB with the window it saw."""
+    from .train.entry import evaluate
+
+    evaluate(checkpoint, echo=print)
+    return 0
+
+
 def _elasticity(journal: str | None) -> tuple[float, str]:
     """Return the elasticity the lever verdicts use, and where it came from."""
     from .economics import ELASTICITY, measured_elasticity
@@ -175,8 +222,16 @@ def _spec(config: str) -> StackSpec:
 
 
 def _status(pattern: str) -> int:
-    """Print one line per journal found, newest last."""
-    paths = sorted(Path().glob(pattern)) if any(ch in pattern for ch in "*?[") else [Path(pattern)]
+    """Print one line per journal found, newest last.
+
+    `glob.glob` rather than `Path().glob`: an absolute pattern is a path a user typed,
+    and `pathlib` refuses one. The pattern is the CLI's own argument, never a name from
+    the run.
+    """
+    if any(char in pattern for char in "*?["):
+        paths = sorted(Path(found) for found in glob.glob(pattern, recursive=True))  # noqa: PTH207
+    else:
+        paths = [Path(pattern)]
     found = [p for p in paths if p.is_file()]
     if not found:
         raise LoudError(

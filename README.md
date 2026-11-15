@@ -46,9 +46,8 @@ line that mattered. So:
 * **no log grepping** — a run writes a journal; `status` reads it.
 
 ```console
-$ dorm train
-train is not wired yet. Escape: use the current port/ trainer until the model
-layer moves; see PLAN.md step 4
+$ dorm serve runs/smoke/final.pt
+serve is not wired yet. Escape: port/ serve for now; the Rust binary arrives in step 7
 $ echo $?
 2
 ```
@@ -57,11 +56,13 @@ $ echo $?
 
 | | status |
 |---|---|
-| `doctor`, `status` | working, tested |
-| `data/bin.py` | working: memory-mapped token stream, manifest-checked, resume by arithmetic |
+| `doctor`, `status`, `plan` | working, tested |
+| `train` | working: model, mixture, optimizer, schedule, journal, checkpoint, eval, artifact |
+| `eval` | working: the five-task harness and BPB with its byte window |
+| `data/bin.py`, `data/mix.py` | working: memory-mapped streams, exact shares, resume by arithmetic |
 | `metrics.py` | working: BPB is a type that cannot exist without its evaluation window |
-| `model/` | transformer, gated FFN, attention with RoPE — each checked against a numpy reference, not against our old code |
-| the rest | refuse by design until the layer behind them moves |
+| `model/` | the one 1B/46M stack, priced on the meta device and assembled from the spec |
+| `run`, `serve`, `export`, `tokenize` | refuse by design until the layer behind them moves |
 
 The old research stack lives in [sehaxe/dormouse](https://github.com/sehaxe/dormouse)
 as an archive; nothing here imports it.
@@ -73,6 +74,7 @@ src/dormouse/
   cli.py        one entry point
   metrics.py    BPB as a type
   data/bin.py   token stream with a manifest
+  train/        the loop, its recipe, its guards — and entry.py, the one command
   model/        ffn, attn, blocks, model
 ```
 
