@@ -48,7 +48,10 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "RET", "SIM", "PTH", "R
 ignore = ["D203", "D213", "N818"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D"]
+"tests/*" = ["D", "RUF002", "RUF003"]
+# The train package's docstrings are derivations. `σ`, `×` and `–` there are notation,
+# not typos: rewriting them as ASCII turns the formulas into something read as code.
+"src/dormouse/train/*" = ["RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -60,6 +63,12 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["dormouse.model.*"]
+disallow_subclassing_any = false
+
+# The optimizers subclass `torch.optim.Optimizer`; torch ships its types only in the
+# stub package, so the base resolves to Any under `ignore_missing_imports`.
+[[tool.mypy.overrides]]
+module = ["dormouse.train.*"]
 disallow_subclassing_any = false
 
 [tool.coverage.run]
