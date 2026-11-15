@@ -40,7 +40,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .attn import PROJ_STD, Attention
-from .ffn import GatedFFN
+from .ffn_spec import FFNSpec
 
 __concepts__ = ("RMSNorm", "Block")
 
@@ -92,6 +92,7 @@ class Block(nn.Module):
         rope: bool = True,
         max_seq_len: int = 1024,
         eps: float = EPS,
+        ffn: FFNSpec | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         """Build both pre-norms and both sublayers.
@@ -112,6 +113,13 @@ class Block(nn.Module):
                 "pass the depth of the stack this block belongs to",
             )
         write_std = PROJ_STD / (2.0 * n_layers) ** 0.5
+        spec = ffn or FFNSpec(d_model, d_ffn)
+        if spec.d_model != d_model or spec.d_ffn != d_ffn:
+            raise LoudError(
+                f"the FFN spec is d_model={spec.d_model}, d_ffn={spec.d_ffn} "
+                f"but the block is d_model={d_model}, d_ffn={d_ffn}",
+                "build the spec from the block's own widths; a spec is not a default",
+            )
         self.norm1 = RMSNorm(d_model, eps, device=device)
         self.attn = Attention(
             d_model,
@@ -123,7 +131,7 @@ class Block(nn.Module):
             device=device,
         )
         self.norm2 = RMSNorm(d_model, eps, device=device)
-        self.ffn = GatedFFN(d_model, d_ffn, write_std=write_std, device=device)
+        self.ffn = spec.build(write_std=write_std, device=device)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` in, the residual stream out, same shape."""
