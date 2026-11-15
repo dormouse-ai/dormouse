@@ -34,9 +34,10 @@ from dormouse_core.counters import Counters
 from dormouse_core.plan import Phase, Plan
 from torch import nn
 
+from ..train.mup import Parametrisation
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
-from . import quant, registry
+from . import fp4, quant, registry
 from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
 from .blocks import PROJ_STD, Block
@@ -70,6 +71,10 @@ class FlatBank(nn.Module):
         out = self.bank(x.reshape(batch * seq, width), counters)
         return cast(torch.Tensor, out.reshape(batch, seq, width))
 
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the bank's bill: the adapter adds reshapes, not multiples."""
+        return self.bank.macs_per_token(seq_len)
+
 
 class Assembled:
     """A built stack, the pieces it is made of, and the bill it is priced at."""
@@ -80,12 +85,14 @@ class Assembled:
         model: Transformer,
         pieces: tuple[registry.Piece, ...],
         bank: MoEFFN | None,
+        parametrisation: Parametrisation | None = None,
     ) -> None:
         """Hold the four things a caller needs: the model, the spec, the pieces, the bank."""
         self.spec = spec
         self.model = model
         self.pieces = pieces
         self.bank = bank
+        self.parametrisation = parametrisation
 
     # ------------------------------------------------------------------ the bill
     def report(self) -> dict[str, int]:
@@ -112,6 +119,17 @@ class Assembled:
     def mechanisms(self) -> dict[str, str]:
         """Every enabled mechanism mapped to the counter that proves it ran."""
         return {piece.mechanism: piece.counter for piece in self.pieces}
+
+    def quant_report(self) -> dict[str, int | str]:
+        """Which path the fp4 format actually took in this process, if the rung is on.
+
+        The counters say the rung ran; this says whether `_scaled_mm` served it or
+        whether every matmul went through the reference fake-quant. A run that claims
+        fp4 and reports `fp4_scaled_mm=0` is visible here rather than assumed absent.
+        """
+        if "fp4" not in (self.spec.weight_qat, self.spec.act_quant):
+            return {}
+        return fp4.tally(next(self.model.parameters()).device)
 
     # ------------------------------------------------------------------ the step
     def step(
@@ -175,8 +193,27 @@ def assemble(
         declarations=registry.declarations(pieces),
         device=device,
     )
+    parametrisation = _parametrise(model, spec)
     _quantize(model, spec)
-    return Assembled(spec=spec, model=model, pieces=pieces, bank=bank)
+    return Assembled(
+        spec=spec, model=model, pieces=pieces, bank=bank, parametrisation=parametrisation
+    )
+
+
+def _parametrise(model: Transformer, spec: StackSpec) -> Parametrisation | None:
+    """Apply the μP table before anything quantises the weights it just drew.
+
+    `sp` returns `None`, so no attribute is set and every later read is the standard
+    path. `mup` draws the classified parameters at the table's std, attaches the
+    parametrisation to the model so `MixOptimizer(model)` finds it without a second
+    argument, and sets the tied head's forward scale.
+    """
+    if spec.parametrisation == "sp":
+        return None
+    parametrisation = Parametrisation.from_spec(spec)
+    parametrisation.apply(model)
+    cast(Any, model).parametrisation = parametrisation
+    return parametrisation
 
 
 def _attention(
@@ -232,15 +269,17 @@ def _bank(
 
 def _quantize(model: Transformer, spec: StackSpec) -> None:
     """Apply the quantization slots, and wrap each block so both counters can move."""
-    if spec.weight_qat == "ternary":
-        quant.ternarize(model)
+    if spec.weight_qat != "none":
+        quant.quantize_weights(model, spec.weight_qat, activations_fp4=spec.act_quant == "fp4")
     if spec.weight_qat == "none" and spec.act_quant == "none":
         return
     wrapped = [
         quant.QuantBlock(
             block,
             matrices=sum(type(m) is quant.QuantLinear for m in block.modules()),
+            weight_key=f"weight_{spec.weight_qat}",
             act_int4=spec.act_quant == "int4",
+            act_fp4=spec.act_quant == "fp4",
         )
         for block in model.blocks
     ]
@@ -264,7 +303,7 @@ def plan_data(
     tokens_per_step = spec.batch * spec.seq_len
     steps = max(spec.tokens // tokens_per_step, 1)
     seconds = steps * 6 * report["active"] * tokens_per_step / (spec.throughput_tflops * 1e12)
-    bits = 0.25 if spec.weight_qat == "ternary" else 4.0
+    bits = {"ternary": 0.25, "fp4": 4.5}.get(spec.weight_qat, 4.0)
     attention_share = report["attention"] / report["active"] if report["active"] else 0.0
     plan = Plan().add(
         "train",
@@ -277,6 +316,8 @@ def plan_data(
         f"the bank is shared by {spec.n_layers} layers: stored is "
         f"{report['stored']:,}, not {spec.n_layers} banks"
     )
+    if "fp4" in (spec.weight_qat, spec.act_quant):
+        plan.warn(fp4.build_note())
     return {
         "stack": {
             "attn": spec.attn,
@@ -345,5 +386,6 @@ def plan_data(
             ],
         },
         "mechanisms": assembled.mechanisms(),
+        "quant": assembled.quant_report(),
         "warnings": list(plan.warnings),
     }
