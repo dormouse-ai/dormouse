@@ -16,7 +16,6 @@ from __future__ import annotations
 import math
 
 import torch
-
 from reference_attn import Attention
 
 HEAD_DIM = 8
