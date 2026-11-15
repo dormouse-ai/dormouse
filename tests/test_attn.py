@@ -104,12 +104,13 @@ def test_a_later_token_cannot_change_an_earlier_output() -> None:
 def test_without_rope_or_mask_attention_is_permutation_equivariant() -> None:
     """A bag of positions: permuting the input permutes the output, nothing else.
 
-    Compared at 1e-6 rather than bit-for-bit because the softmax's reduction runs
-    in the permuted order — the same sum, rounded in a different sequence.
+    The reference is the permutation itself. The band is 1e-6 because the softmax's
+    reduction runs in the permuted order; the measured rounding floor on this case is
+    1.2e-7, so 1e-6 is the arithmetic's noise and not a tolerance for a difference.
     """
     torch.manual_seed(3)
     attn = Attention(d_model=8, n_heads=2, head_dim=4, rope=False)
-    x = torch.randn(1, 4, 8)
+    x = torch.randn(1, 4, 8) * 100.0
     perm = torch.tensor([2, 0, 3, 1])
     plain = attn(x, causal=False)
     shuffled = attn(x[:, perm], causal=False)
@@ -120,21 +121,20 @@ def test_the_causal_mask_alone_breaks_that_equivariance() -> None:
     """The mask is a function of index, so order now matters even without RoPE."""
     torch.manual_seed(4)
     attn = Attention(d_model=8, n_heads=2, head_dim=4, rope=False)
-    x = torch.randn(1, 4, 8)
+    x = torch.randn(1, 4, 8) * 100.0
     perm = torch.tensor([2, 0, 3, 1])
-    assert not torch.allclose(attn(x)[:, perm], attn(x[:, perm]), atol=1e-6, rtol=0)
+    delta = (attn(x)[:, perm] - attn(x[:, perm])).abs().max().item()
+    assert delta > 0.1  # measured 0.90: the mask, three orders above the noise
 
 
 def test_rope_alone_breaks_it_too() -> None:
     """Rotations are a function of absolute position, so even unmasked it differs."""
     torch.manual_seed(5)
     attn = Attention(d_model=8, n_heads=2, head_dim=4, rope=True)
-    x = torch.randn(1, 4, 8)
+    x = torch.randn(1, 4, 8) * 100.0
     perm = torch.tensor([2, 0, 3, 1])
-    masked = torch.allclose(
-        attn(x, causal=False)[:, perm], attn(x[:, perm], causal=False), atol=1e-6, rtol=0
-    )
-    assert not masked
+    delta = (attn(x, causal=False)[:, perm] - attn(x[:, perm], causal=False)).abs().max()
+    assert delta > 0.1  # measured 0.99 without a mask in sight
 
 
 def test_it_reports_attn_and_rope() -> None:

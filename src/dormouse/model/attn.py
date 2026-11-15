@@ -27,6 +27,8 @@ is the identity of a non-causal attention, not a training option.
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
@@ -94,6 +96,10 @@ class Attention(nn.Module):
         freq = rope_base ** (-2.0 * torch.arange(half, dtype=torch.float32) / head_dim)
         pos = torch.arange(max_seq_len, dtype=torch.float32)
         ang = torch.outer(pos, freq)
+        #: Annotated because `register_buffer` stores the tensor behind
+        #: `__getattr__`, which types as `Tensor | Module` and is not indexable.
+        self.cos: torch.Tensor
+        self.sin: torch.Tensor
         self.register_buffer("cos", ang.cos(), persistent=False)
         self.register_buffer("sin", ang.sin(), persistent=False)
 
@@ -124,7 +130,7 @@ class Attention(nn.Module):
             counters.count("attn_fwd", batch * seq)
             if self.rope:
                 counters.count("rope_fwd", batch * seq)
-        return self.proj(y)
+        return cast(torch.Tensor, self.proj(y))
 
     @staticmethod
     def _rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

@@ -27,6 +27,8 @@ is a place for a silent default, so the activation is one line, not a table.
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
@@ -83,7 +85,7 @@ class GatedFFN(nn.Module):
         h = nn.functional.silu(self.gate(x)) * self.up(x)
         if counters is not None:
             counters.count("ffn_fwd", x.shape[0] * x.shape[1])
-        return self.down(h)
+        return cast(torch.Tensor, self.down(h))
 
     def extra_repr(self) -> str:
         """Show the shape the parameter bill is quoted for."""
