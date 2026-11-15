@@ -6,6 +6,7 @@ next one safe:
     registry.pieces(spec)   refuse a conflicting pair, naming it, with nothing allocated
     build per layer         one attention arm per layer, one FFN arm (or one bank) for all
     quantize                ternary weights / int4 activations, if the slots ask
+    aux head                LightMTP-S, attached after quantization (a training-only path)
     declarations            the mechanisms the forward must count, for `Counters.check`
 
 WHY THE BANK IS SHARED BY THE LAYERS. `ffn=moe` is one bank of `n_experts`, and every
@@ -33,6 +34,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.plan import Plan
 from torch import nn
 
+from ..train.aux import LightMTP
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
 from . import quant, registry
@@ -81,12 +83,14 @@ class Assembled:
         model: Transformer,
         pieces: tuple[registry.Piece, ...],
         bank: MoEFFN | None,
+        aux: LightMTP | None = None,
     ) -> None:
-        """Hold the four things a caller needs: the model, the spec, the pieces, the bank."""
+        """Hold the five things a caller needs: model, spec, pieces, bank, aux head."""
         self.spec = spec
         self.model = model
         self.pieces = pieces
         self.bank = bank
+        self.aux = aux
 
     # ------------------------------------------------------------------ the bill
     def report(self) -> dict[str, int]:
@@ -118,7 +122,9 @@ class Assembled:
         produces must not be enabled before the forward has had its chance to finish.
         """
         counters = Counters()
-        result = train_step(self.model, ids, optimizer=optimizer, accum=accum, counters=counters)
+        result = train_step(
+            self.model, ids, optimizer=optimizer, accum=accum, counters=counters, aux=self.aux
+        )
         if not result.skipped:
             counters.count("ntp_loss")
         counters.enable("ntp", counter="ntp_loss", why="the step computes the NTP loss")
@@ -165,7 +171,17 @@ def assemble(
         device=device,
     )
     _quantize(model, spec)
-    return Assembled(spec=spec, model=model, pieces=pieces, bank=bank)
+    aux = None
+    if spec.aux != "none":
+        aux = LightMTP(
+            model,
+            k=spec.aux_k,
+            layer=spec.aux_layer,
+            weight=spec.aux_weight,
+            varreg=spec.aux_varreg,
+        )
+        aux.attach(model)
+    return Assembled(spec=spec, model=model, pieces=pieces, bank=bank, aux=aux)
 
 
 def _attention(
@@ -272,6 +288,14 @@ def plan_lines(spec: StackSpec) -> list[str]:
         f"bytes/step: state={STATE_BYTES * report['stored']:,} (weights+grad+2 moments), "
         f"checkpoint={int(bits * report['stored']):,}",
     ]
+    if assembled.aux is not None:
+        head = assembled.aux
+        trunk = report["stored"] - head.head_params
+        lines.append(
+            f"aux: lightmtp k={head.k} layer={head.layer} weight={head.weight} "
+            f"varreg={head.varreg}, head={head.head_params:,} params "
+            f"(+{head.fraction:.2%} of the {trunk:,}-parameter trunk), discarded at inference"
+        )
     plan = Plan().add(
         "train",
         seconds,

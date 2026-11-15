@@ -28,9 +28,21 @@ it is logged at ERROR. It is not raised, because one bad batch in a 10 GB stream
 data event, not a programming defect; the policy for how many skips end a run belongs
 to the loop, and returning `skipped=True` is what lets that loop exist.
 
+THE AUXILIARY OBJECTIVE. `aux` is `train/aux.py`'s LightMTP-S: a head that predicts the
+trunk's own hidden state `k` steps ahead. It is added to the loss the step accumulates
+(`L_total = L_NTP + λ·L_MTP`) and its value is reported separately, in `StepResult.aux_loss`
+and on its own log line, because the token loss is the number a run is compared by and an
+auxiliary term folded into it would make two runs disagree for a reason nobody can see.
+It never touches the token loss itself: the logits are the same tensor, the CE is the same
+sum, and with `aux=None` the branch is not taken at all — the step is bit-identical to the
+one that shipped before this objective existed. A non-finite aux loss trips the same NaN
+firewall, and its head is attached to the model (see `LightMTP.attach`), so the clip and
+the optimizer see it and an unattached head is refused rather than left untrained.
+
 COUNTERS. `fwd`, `bwd`, `clip`, `opt_muon`, `opt_adamw`, `nan_guard` — and each is
 enabled only when the mechanism is about to run, so a firewalled step reports
-`nan_guard` instead of claiming an optimizer step that never happened. `check()` closes
+`nan_guard` instead of claiming an optimizer step that never happened. `aux_fwd` and
+`aux_loss` join them only when the head ran. `check()` closes
 the step; an enabled mechanism with a zero counter raises `MissingReport`.
 """
 
@@ -38,6 +50,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from dormouse_core.counters import Counters
@@ -46,6 +59,9 @@ from torch import nn
 from torch.nn import functional
 
 from .optim import MixOptimizer
+
+if TYPE_CHECKING:
+    from .aux import LightMTP
 
 __all__ = ["StepResult", "chunked_cross_entropy", "train_step"]
 
@@ -67,11 +83,15 @@ class StepResult:
     `skipped=True` means the NaN firewall fired and **no parameter changed**. `loss`
     is then the non-finite value that tripped it, and `grad_norm` is NaN because the
     norm was never computed — a skipped step has no norm to report.
+
+    `aux_loss` is `None` when no auxiliary objective ran, and the mean of the step's
+    micro-batches when one did: the token loss is `loss`, never `loss - aux_loss`.
     """
 
     loss: float
     grad_norm: float
     skipped: bool
+    aux_loss: float | None = None
 
 
 def chunked_cross_entropy(
@@ -120,6 +140,7 @@ def train_step(
     accum: int = 1,
     clip: float = CLIP,
     counters: Counters | None = None,
+    aux: LightMTP | None = None,
 ) -> StepResult:
     """One optimizer step over `ids [accum·batch, seq+1]`, as the docstring orders it."""
     if ids.dim() != 2:
@@ -143,10 +164,17 @@ def train_step(
             f"clip={clip} scales every gradient to zero",
             "use the ceiling in loss units (1.0 for this recipe) or math.inf for none",
         )
+    if aux is not None and getattr(model, "aux", None) is not aux:
+        raise LoudError(
+            "the auxiliary head is not attached to this model, so no optimizer owns it",
+            "call aux.attach(model) before MixOptimizer(model): an unattached head is "
+            "routed to no parameter group and its 692k parameters never move",
+        )
     inputs, targets = ids[:, :-1], ids[:, 1:]
     rows = ids.shape[0] // accum
     optimizer.zero_grad(set_to_none=True)
     loss_total = 0.0
+    aux_total = 0.0
     for micro in range(accum):
         x = inputs[micro * rows : (micro + 1) * rows]
         y = targets[micro * rows : (micro + 1) * rows]
@@ -155,15 +183,41 @@ def train_step(
             # `forward`, so a counter this module owns must already be non-zero there.
             counters.enable("fwd", counter="fwd", why="a forward runs in the step")
             counters.count("fwd", x.numel())
-        logits = model(x, counters)
+        if aux is None:
+            logits = model(x, counters)
+        else:
+            with aux.capture(model) as seen:
+                logits = model(x, counters)
         loss = chunked_cross_entropy(logits, y)
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
             return _skip(counters, float(loss.detach()), "the loss is not finite")
+        total = loss
+        if aux is not None:
+            extra = aux.loss(seen)
+            if not torch.isfinite(extra):
+                optimizer.zero_grad(set_to_none=True)
+                return _skip(counters, float(extra.detach()), "the aux loss is not finite")
+            total = loss + aux.weight * extra
+            aux_total += float(extra.detach()) / accum
+            if counters is not None:
+                # Enabled after the forward: the stack checks its own counters inside
+                # `model.forward`, so these must not be declared before it returns.
+                counters.enable("aux_head", counter="aux_fwd", why="the head predicts a state")
+                counters.enable("aux", counter="aux_loss", why="the aux loss is added in")
+                counters.count("aux_fwd", x.shape[0] * (x.shape[1] - aux.k))
+                counters.count("aux_loss")
+            _LOG.info(
+                "aux lightmtp loss=%.6f weighted=%.6f k=%d layer=%d",
+                float(extra.detach()),
+                float(extra.detach()) * aux.weight,
+                aux.k,
+                aux.layer,
+            )
         if counters is not None:
             counters.enable("bwd", counter="bwd", why="the backward runs in the step")
         # torch's stub for `Tensor.backward` is unannotated, and this is the call.
-        (loss / accum).backward()  # type: ignore[no-untyped-call]
+        (total / accum).backward()  # type: ignore[no-untyped-call]
         if counters is not None:
             counters.count("bwd", x.numel())
         loss_total += float(loss.detach()) / accum
@@ -186,4 +240,9 @@ def train_step(
         counters.count("opt_muon", sizes["muon"])
         counters.count("opt_adamw", sizes["adamw"])
         counters.check()
-    return StepResult(loss=loss_total, grad_norm=norm, skipped=False)
+    return StepResult(
+        loss=loss_total,
+        grad_norm=norm,
+        skipped=False,
+        aux_loss=aux_total if aux is not None else None,
+    )

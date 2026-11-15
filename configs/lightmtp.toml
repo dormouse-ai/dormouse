@@ -1,0 +1,44 @@
+# lightmtp: control.toml plus one auxiliary objective, and nothing else.
+#
+# This file is control.toml with the aux block added, because the first A/B is a
+# one-variable comparison: same unit, attn, ffn, optimizer, widths, batch, seq_len.
+#   aux=lightmtp  LightMTP-S (arXiv:2610.06031 §3.2): one MLP head predicts the trunk's
+#                 OWN hidden state 8 positions ahead, stop-gradient, no vocabulary
+#                 projection, discarded at inference
+#   aux_k=8       the horizon the paper's Countdown number is best at (50.6 → 56.7)
+#   aux_layer=0   target the final block's output; the paper's own default is two-thirds
+#                 of depth, which is the next knob after the first A/B, not this one
+#   aux_weight=0.1  the paper's λ_MTP
+#   aux_varreg=false  +VarReg improves probing and degrades every LM column (Table 1:
+#                 FineWeb-Edu PPL 1.684 → 1.694, LAMBADA 16.28 → 17.53); leave it off
+#
+# The head is 2·d·(d/2) = 692,224 parameters, +0.73% of the 94.6M trunk, and `dorm plan`
+# prints that number next to the arithmetic that produced it.
+
+unit = "byte"
+attn = "full"
+ffn = "gated"
+activation = "none"
+expert_tsct_rank = 0
+optimizer = "muon"
+objective = "ntp"
+aux = "lightmtp"
+aux_k = 8
+aux_layer = 0
+aux_weight = 0.1
+aux_varreg = false
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 13
+head_dim = 64
+d_ffn = 2048
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

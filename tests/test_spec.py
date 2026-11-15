@@ -19,6 +19,7 @@ from dormouse.model.spec import (
     ACT_QUANT,
     ACTIVATIONS,
     ATTN,
+    AUXES,
     FFNS,
     OBJECTIVES,
     OPTIMIZERS,
@@ -45,6 +46,7 @@ def _refused(**slots: object) -> str:
         ("activation", "gelu", ACTIVATIONS),
         ("optimizer", "sgd", OPTIMIZERS),
         ("objective", "mlm", OBJECTIVES),
+        ("aux", "mtp", AUXES),
         ("weight_qat", "int2", WEIGHT_QAT),
         ("act_quant", "int8", ACT_QUANT),
     ],
@@ -164,6 +166,41 @@ def test_the_two_configs_differ_in_exactly_the_stack() -> None:
     shared = {"unit", "optimizer", "objective", "sources", "d_model", "n_heads", "head_dim"}
     for key in shared:
         assert getattr(control, key) == getattr(sink, key), key
+
+
+def test_a_config_value_no_head_reads_is_refused_by_name() -> None:
+    """`aux_k=4` with `aux='none'` is a number nothing reads: the four are checked."""
+    message = _refused(aux_k=4)
+    assert "aux='none'" in message and "aux_k=4" in message
+    assert "no head is built" in message
+
+
+def test_an_aux_horizon_with_no_target_is_refused() -> None:
+    message = _refused(aux="lightmtp", aux_k=0)
+    assert "aux_k=0" in message and "zero positions ahead" in message
+    message = _refused(aux="lightmtp", aux_k=12, seq_len=8)
+    assert "aux_k=12" in message and "seq_len=8" in message
+
+
+def test_an_aux_weight_that_trains_nothing_is_refused() -> None:
+    message = _refused(aux="lightmtp", aux_weight=0.0)
+    assert "aux_weight=0.0" in message and "0.1 is the paper's λ_MTP" in message
+
+
+def test_a_target_layer_outside_the_stack_is_refused() -> None:
+    message = _refused(aux="lightmtp", aux_layer=13)
+    assert "aux_layer=13" in message and "12-layer stack" in message
+    assert "1..n_layers-1" in message
+
+
+def test_the_lightmtp_config_is_the_control_plus_one_slot() -> None:
+    """The first A/B is one variable, and this is the assertion that keeps it one."""
+    control = StackSpec.from_toml(CONFIGS / "control.toml")
+    auxed = StackSpec.from_toml(CONFIGS / "lightmtp.toml")
+    assert (auxed.aux, auxed.aux_k, auxed.aux_layer, auxed.aux_varreg) == ("lightmtp", 8, 0, False)
+    assert control.aux == "none"
+    differing = {key for key in control.as_dict() if getattr(control, key) != getattr(auxed, key)}
+    assert differing == {"aux"}, differing
 
 
 def test_a_config_is_a_value_and_a_copy_can_be_scaled() -> None:

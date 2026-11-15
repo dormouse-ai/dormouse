@@ -32,6 +32,12 @@ The slots, and what each one decides:
 * `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. The
   `+tst` and `+jepa` arms have no loss module in any branch, so they are refused
   with that reason instead of being accepted and silently not run.
+* `aux` — the second objective added to the token loss: `none`, or `lightmtp`
+  (`train/aux.py`, arXiv:2610.06031): a head that predicts the trunk's own hidden
+  state `aux_k` positions ahead, discarded at inference. `aux_k`, `aux_layer`,
+  `aux_weight` and `aux_varreg` are its four numbers, and setting any of them with
+  `aux=none` is refused — a config value nothing reads is the defect class this file
+  exists for.
 * `weight_qat`, `act_quant` — the two quantization slots (`model/quant.py`):
   ternary weights (BitNet b1.58 straight-through) and int4 activations.
 * `torch_compile` — whether the stack is handed to `torch.compile`. It is a slot and
@@ -48,7 +54,7 @@ build" (`assemble.assemble`).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
@@ -61,6 +67,7 @@ FFNS: tuple[str, ...] = ("gated", "la", "moa", "moe")
 ACTIVATIONS: tuple[str, ...] = ("none", "silu", "situ", "la", "moa")
 OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
+AUXES: tuple[str, ...] = ("none", "lightmtp")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
 
@@ -115,6 +122,11 @@ class StackSpec(Config):
     expert_tsct_rank: int = 0
     optimizer: str = "muon"
     objective: str = "ntp"
+    aux: str = "none"
+    aux_k: int = 8
+    aux_layer: int = 0
+    aux_weight: float = 0.1
+    aux_varreg: bool = False
     weight_qat: str = "none"
     act_quant: str = "none"
 
@@ -156,8 +168,10 @@ class StackSpec(Config):
         _literal("activation", self.activation, ACTIVATIONS)
         _literal("optimizer", self.optimizer, OPTIMIZERS)
         _literal("objective", self.objective, OBJECTIVES)
+        _literal("aux", self.aux, AUXES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
+        _aux_slot(self)
         if self.attn_pos:
             _literal("attn_pos", self.attn_pos, ATTN_POS)
         if self.expert_tsct_rank:
@@ -193,7 +207,8 @@ class StackSpec(Config):
             raise LoudError(
                 f"objective={self.objective!r}: no loss module computes it",
                 "this stack assembles ntp (train/step.py's chunked cross-entropy); a "
-                "tst or jepa term needs a second loss that no branch ships yet",
+                "tst or jepa term needs a second loss that no branch ships yet, and a "
+                "future-token objective belongs in the aux slot: aux='lightmtp'",
             )
         if self.act_quant == "int4" and self.torch_compile:
             raise LoudError(
@@ -244,6 +259,45 @@ class StackSpec(Config):
     def d_ffn_gelu(self) -> int:
         """The GELU width a mixture's `3·d·d_ffn` bill is checked against."""
         return 3 * self.d_ffn // 2
+
+
+def _aux_slot(spec: StackSpec) -> None:
+    """Refuse an aux horizon with no target, and four numbers nobody reads."""
+    if spec.aux == "none":
+        defaults = {f.name: f.default for f in fields(StackSpec) if f.name.startswith("aux_")}
+        named = [
+            f"{key}={getattr(spec, key)!r}"
+            for key, default in defaults.items()
+            if getattr(spec, key) != default
+        ]
+        if named:
+            raise LoudError(
+                f"aux='none' with {', '.join(named)}: no head is built, so nothing reads them",
+                "drop the aux_* keys, or set aux='lightmtp' so a run trains the second "
+                "objective those numbers describe",
+            )
+        return
+    if spec.aux_k < 1:
+        raise LoudError(
+            f"aux_k={spec.aux_k} looks zero positions ahead",
+            "k=8 is the A/B's horizon; k=1 is a next-state prediction, not the paper's k",
+        )
+    if spec.aux_k >= spec.seq_len:
+        raise LoudError(
+            f"aux_k={spec.aux_k} over seq_len={spec.seq_len} leaves no position with a target",
+            "keep k below seq_len: the aux loss reads position t and target t+k in one window",
+        )
+    if not 0 <= spec.aux_layer <= spec.n_layers:
+        raise LoudError(
+            f"aux_layer={spec.aux_layer} is not a block of this {spec.n_layers}-layer stack",
+            "0 and n_layers both mean the final block's output; 1..n_layers-1 index an "
+            "intermediate block, where the paper takes its targets (l=16 of 24)",
+        )
+    if spec.aux_weight <= 0.0:
+        raise LoudError(
+            f"aux_weight={spec.aux_weight} gives the head a zero or reversed gradient",
+            "0.1 is the paper's λ_MTP, and the head costs parameters whether it learns or not",
+        )
 
 
 def _pattern(spelling: str, n_layers: int) -> tuple[str, ...]:
