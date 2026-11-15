@@ -21,7 +21,8 @@ gpu = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(gpu)
 
 #: Every counter `check_train` requires, at 1 — the shape of a healthy step.
-HEALTHY = dict.fromkeys(gpu.REQUIRED, 1)
+HEALTHY = dict.fromkeys((*gpu.CORE, "kda_fwd", "dsa_fwd", "moe_fwd"), 1)
+EXPECTED = sorted(HEALTHY)
 
 
 # ------------------------------------------------------------------------ check 1
@@ -29,21 +30,22 @@ HEALTHY = dict.fromkeys(gpu.REQUIRED, 1)
 
 def test_a_healthy_step_passes() -> None:
     """Twenty finite losses and every mechanism reporting is no failure."""
-    assert gpu.train_failures([5.5] * 20, HEALTHY) == []
+    assert gpu.train_failures([5.5] * 20, HEALTHY, EXPECTED) == []
 
 
 def test_a_non_finite_loss_fails_and_names_the_step() -> None:
     """The NaN firewall returns the bad value; the gate must refuse it by name."""
-    failures = gpu.train_failures([5.5, float("nan"), 5.4], HEALTHY)
+    failures = gpu.train_failures([5.5, float("nan"), 5.4], HEALTHY, EXPECTED)
     assert len(failures) == 1
     assert "step 1" in failures[0]
 
 
 def test_a_silent_mechanism_fails() -> None:
     """A counter at zero is the historical defect: the flag was set, nothing ran."""
-    failures = gpu.train_failures([5.5], {**HEALTHY, "bwd": 0, "rope_fwd": 0})
+    failures = gpu.train_failures([5.5], {**HEALTHY, "bwd": 0, "kda_fwd": 0}, EXPECTED)
     assert len(failures) == 2
     assert any("bwd" in failure for failure in failures)
+    assert any("kda_fwd" in failure for failure in failures)
 
 
 # ------------------------------------------------------------------------ check 2

@@ -79,9 +79,14 @@ than competing for VRAM.
 
 `tools/gpu_check.py`, four checks, each a defect this project has actually shipped:
 
-1. **20 steps** of the live recipe in fp32: every loss finite, and every mechanism the
-   stack declares enabled reports a non-zero counter in the step that ran it. A
-   silently absent mechanism raises `MissingReport` from inside `train_step`.
+1. **20 steps** of the one stack in fp32 — one 3:1 attention period (3 KDA, 1 DSA),
+   GQA with `c_lat=512`, the MoE bank with the MoA dictionary and the rank-256 TSCT
+   read, at `d_model=832` — every loss finite, and every mechanism the stack declares
+   enabled reports a non-zero counter in the step that ran it. A silently absent
+   mechanism raises `MissingReport` from inside `train_step`; the list checked from
+   outside keeps a deleted `enable()` from making the check vacuous. Batch and
+   `d_ffn` are what a 16 GB card affords, and `tools/gpu_check.py` says which
+   measurement set them.
 2. **bf16 against fp32** on the first step, same seed, same weights, within 1%. A
    canary matmul inside the same autocast must return `bfloat16`: without it, a silent
    fp32 fallback would *pass* the tolerance, because falling back makes the match

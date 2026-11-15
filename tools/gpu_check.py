@@ -2,14 +2,15 @@
 
 Every serious defect this project has shipped was GPU-side and invisible to a green
 CPU suite: an arm that ran 3126 forwards with zero backwards, kernels that failed to
-compile for the arch, a bf16 path that silently fell back to fp32, a batch that did
-not fit, a CUDA-graph capture that silently ran eager. So this script runs the four
-checks that need the card, and fails on the number, not on the log:
+compile for the arch, a bf16 path that silently fell back, a batch that did not fit, a
+CUDA-graph capture that silently ran eager. So this script runs the four checks that
+need the card, and fails on the number, not on the log:
 
-1. TRAIN — 20 steps of the live recipe, in fp32, on the card. Every loss finite, and
-   every mechanism the stack declares enabled reports a non-zero counter at the end
-   of the step it ran in. A mechanism that is silently absent raises `MissingReport`
-   from inside `train_step`, before the loss is ever returned.
+1. TRAIN — 20 steps of the live stack, in fp32, on the card. Every loss finite, and
+   every mechanism the assembled stack declares reporting a non-zero counter at the
+   end of the step it ran in. `Assembled.step` closes the counters itself, so a
+   silently absent mechanism raises `MissingReport` before the loss is returned; the
+   list this script checks from outside is what keeps that from being vacuous.
 2. DTYPE — the first step's loss under bf16 autocast against its fp32 twin, from the
    same seed and the same weights, within `DTYPE_TOL` relative. The tolerance alone
    cannot see a silent fallback: fp32 fallback gives a *closer* match, not a worse
@@ -36,34 +37,56 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from dormouse_core.counters import Counters
 
-from dormouse.model.model import Transformer
+from dormouse.model.assemble import Assembled, assemble
+from dormouse.model.spec import StackSpec
 from dormouse.train.optim import MixOptimizer
-from dormouse.train.step import train_step
 
-#: The live recipe — `Transformer`'s own defaults, spelled out so a change to them is
-#: a change to this check rather than a silently different model under test.
-LIVE = {
-    "vocab": 256,
-    "d_model": 832,
-    "n_layers": 12,
-    "n_heads": 13,
-    "head_dim": 64,
-    "d_ffn": 2048,
-    "max_seq_len": 1024,
-}
+#: The live stack at one attention period: `d_model`, `n_heads`/`head_dim`, `c_lat`,
+#: `attn_k`/`attn_window`, the expert arm, the MoA dictionary and the TSCT rank are the
+#: recipe's, so every arm the architecture has runs at its own width. What is lowered is
+#: lowered because a measurement says it must be, not to make the gate pass:
+#:
+#: * `n_layers=4` is one 3:1 period — the pattern must tile the layer count for every
+#:   layer, and 12 is the 1B stack.
+#: * `d_ffn=2048` and `n_experts=4` (the recipe is 6144 and 64): the bank's MoA keeps one
+#:   copy of `d_ffn` per dictionary entry per routed row, and measured on the card at
+#:   1024 rows that is 2.45 GiB of forward activations at 6144/8 experts against 0.80 GiB
+#:   at 2048/4. The live bank does not fit this script's budget: one step at 6144 with 8
+#:   experts OOM'd at 12.69 GiB on a 15.56 GiB card, before any backward.
+#: * `batch=1` by the same measurement; `seq_len=1024` cannot go lower without taking
+#:   `attn_k=512` with it (DSA refuses `k >= seq` rather than quietly going dense).
+#: * `unit="byte"` because the tokenizer that produces BPE ids is data-layer work this
+#:   package does not have.
+#: * `smoke=True` waives the 10M-parameter expert floor, which 3·832·2048 does not clear.
+#:   `Assembled.report()` prints the discounted bill, so it is said out loud.
+SPEC = StackSpec(
+    unit="byte",
+    d_model=832,
+    n_layers=4,
+    n_heads=8,
+    n_kv_heads=2,
+    head_dim=64,
+    c_lat=512,
+    d_ffn=2048,
+    n_experts=4,
+    topk=2,
+    n_shared=1,
+    expert_tsct_rank=256,
+    attn_k=512,
+    attn_window=128,
+    seq_len=1024,
+    batch=1,
+)
 
 #: Steps, batch and window. Twenty is the shortest run that has ever shown the
-#: zero-backwards class; batch 8 by 512 tokens is what fits a 16 GB card beside a desktop.
+#: zero-backwards class; the spec's batch 8 by 1024 is what fits a 16 GB card beside a desktop.
 STEPS = 20
-BATCH = 8
-SEQ_LEN = 512
 SEED = 1234
 
 #: bf16 vs fp32 relative tolerance on the first step's loss. fp32 upcasts inside bf16
-#: matmuls move a 75 M-parameter first step by well under 1%; a kernel that is wrong
-#: instead of imprecise moves it by much more. Re-record with a real measurement.
+#: matmuls move a first step by well under 1%; a kernel that is wrong instead of
+#: imprecise moves it by much more. Re-record with a real measurement.
 DTYPE_TOL = 0.01
 
 #: Default ceiling, GiB. 16 GB card, 4 GB left for the desktop that shares it.
@@ -72,23 +95,22 @@ VRAM_CEILING_GB = 12.0
 #: The committed fixture, the same slice the CPU regression gate trains on.
 FIXTURE = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "corpus_2mb.bin"
 
-#: Counters that must be non-zero after a live step. `Counters.check()` already
-#: refuses an enabled-but-silent mechanism; this list is the same statement made from
-#: outside, so deleting an `enable()` call cannot make the check vacuous.
-REQUIRED = (
+#: Counters every stack's forward and step produce, whichever arms it holds. The
+#: per-arm counters come from `Assembled.mechanisms()` — the spec's own declaration —
+#: and both are checked here from outside, so deleting an `enable()` call cannot make
+#: the check vacuous.
+CORE = (
     "fwd",
     "bwd",
     "clip",
     "opt_muon",
     "opt_adamw",
+    "ntp_loss",
     "embed_fwd",
     "block_fwd",
-    "attn_fwd",
-    "ffn_fwd",
     "norm_fwd",
     "head_fwd",
     "tied_head",
-    "rope_fwd",
 )
 
 
@@ -97,7 +119,7 @@ REQUIRED = (
 # on a CPU runner, without a card.
 
 
-def train_failures(losses: list[float], counts: dict[str, int]) -> list[str]:
+def train_failures(losses: list[float], counts: dict[str, int], expected: list[str]) -> list[str]:
     """Return the failures of check 1: a non-finite loss, or a silent mechanism."""
     failures = [
         f"step {i} loss is {loss!r}: a step that is not finite cannot be taken"
@@ -106,7 +128,7 @@ def train_failures(losses: list[float], counts: dict[str, int]) -> list[str]:
     ]
     failures += [
         f"{key} is {counts.get(key, 0)} after a step that ran it: the mechanism is silent"
-        for key in REQUIRED
+        for key in expected
         if counts.get(key, 0) <= 0
     ]
     return failures
@@ -152,46 +174,50 @@ def vram_failures(peak_bytes: int, ceiling_gb: float) -> list[str]:
 
 def _batch(tokens: np.ndarray, step: int) -> torch.Tensor:
     """One `[BATCH, SEQ_LEN + 1]` window of the fixture, on the card."""
-    span = BATCH * (SEQ_LEN + 1)
-    start = (step * BATCH * SEQ_LEN) % (len(tokens) - span)
+    span = SPEC.batch * (SPEC.seq_len + 1)
+    start = (step * SPEC.batch * SPEC.seq_len) % (len(tokens) - span)
     window = torch.from_numpy(tokens[start : start + span].astype(np.int64))
-    return window.reshape(BATCH, SEQ_LEN + 1).cuda()
+    return window.reshape(SPEC.batch, SPEC.seq_len + 1).cuda()
 
 
-def _model(seed: int = SEED) -> Transformer:
-    """Build the live config, seeded, and on the card."""
+def _assembled(seed: int = SEED) -> Assembled:
+    """Build the live stack, seeded, on the card."""
     torch.manual_seed(seed)
-    return Transformer(**LIVE, device="cuda")
+    return assemble(SPEC, device="cuda", smoke=True)
 
 
 def check_train(tokens: np.ndarray) -> tuple[list[str], list[float]]:
     """Check 1: twenty real steps, finite losses, every enabled mechanism reporting."""
-    model = _model()
-    optimizer = MixOptimizer(model)
+    assembled = _assembled()
+    optimizer = MixOptimizer(assembled.model)
+    expected = [*CORE, *assembled.mechanisms().values()]
     losses, counts = [], {}
     started = time.perf_counter()
     for step in range(STEPS):
-        # A fresh `Counters` per step: the claim is about THIS step, and a counter that
-        # accumulated from step 0 would hide a mechanism that stopped running at step 1.
-        counters = Counters()
-        result = train_step(model, _batch(tokens, step), optimizer=optimizer, counters=counters)
+        # `Assembled.step` builds a fresh `Counters` per step and closes it, so the
+        # claim is about THIS step: a counter accumulated from step 0 would hide a
+        # mechanism that stopped running at step 1.
+        result, counters = assembled.step(_batch(tokens, step), optimizer=optimizer)
         losses.append(result.loss)
         counts.update(counters.snapshot())
         print(f"step {step:2d} loss {result.loss:.6f} norm {result.grad_norm:.3f}", flush=True)
     seconds = time.perf_counter() - started
-    parameters = sum(p.numel() for p in model.parameters())
+    bill = assembled.report()
     print(
-        f"{parameters:,} params, {STEPS} steps in {seconds:.1f}s on {torch.cuda.get_device_name()}"
+        f"{bill['stored']:,} stored / {bill['active']:,} active params, {STEPS} steps in "
+        f"{seconds:.1f}s on {torch.cuda.get_device_name()}"
     )
-    return train_failures(losses, counts), losses
+    print(f"mechanisms {assembled.mechanisms()}")
+    return train_failures(losses, counts, expected), losses
 
 
 def _first_step_loss(tokens: np.ndarray, *, bf16: bool) -> float:
     """Return the first step's loss, bf16-autocast or fp32, from one seed."""
-    model = _model()
-    optimizer = MixOptimizer(model)
+    assembled = _assembled()
+    optimizer = MixOptimizer(assembled.model)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-        return train_step(model, _batch(tokens, 0), optimizer=optimizer).loss
+        result, _ = assembled.step(_batch(tokens, 0), optimizer=optimizer)
+    return result.loss
 
 
 def check_dtype(tokens: np.ndarray) -> tuple[list[str], float, float]:
@@ -284,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
         "",
         "| check | number |",
         "|---|---|",
-        f"| device | {torch.cuda.get_device_name()} |",
+        f"| device | {torch.cuda.get_device_name()} sm_{capability} |",
         f"| train | {STEPS} steps, loss {losses[0]:.6f} -> {losses[-1]:.6f} |",
         f"| bf16 vs fp32 first step | {bf16_loss:.6f} vs {fp32_loss:.6f} "
         f"({abs(bf16_loss - fp32_loss) / max(abs(fp32_loss), 1e-12):.3%}, tol {DTYPE_TOL:.1%}) |",
