@@ -37,6 +37,8 @@ from .recipe import LoopConfig
 
 __all__ = ["CKPT", "MIRROR", "Resumable", "Snapshot", "capture", "load", "restore", "save"]
 
+__concepts__ = ("Resumable", "Snapshot")
+
 #: The single file a run keeps: the last checkpoint, not a rolling set. A rolling set
 #: is what a resume has to choose from, and picking the wrong one is a silent replay.
 CKPT = "ckpt.pt"
