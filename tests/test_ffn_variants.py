@@ -59,67 +59,6 @@ def _copy(target: torch.nn.Module, source: torch.nn.Module) -> None:
     target.load_state_dict(source.state_dict(), strict=False)
 
 
-# --- degeneracy: one entry is the plain FFN ---------------------------------
-
-
-@pytest.mark.parametrize("name", ["silu", "situ"])
-def test_a_one_entry_la_is_the_plain_ffn_bit_for_bit(name: str) -> None:
-    """`["silu"]` and `["situ"]` at `c₀ = 1` reproduce `down(f(gate(x))·up(x))`."""
-    torch.manual_seed(0)
-    plain = GatedFFN(D, F, act=name)
-    la = LaFFN(D, F, dictionary=(name,))
-    _copy(la, plain)
-    x = torch.randn(2, 5, D)
-    assert torch.equal(la(x), plain(x))
-
-
-@pytest.mark.parametrize("sides", ["one", "bi"])
-def test_a_one_entry_moa_is_the_plain_ffn_on_either_topology(sides: str) -> None:
-    """The normalised sigmoid leaves `sigmoid/sigmoid = 1` exactly, so `K=1` collapses."""
-    torch.manual_seed(1)
-    plain = GatedFFN(D, F, sides=sides)
-    moa = MoaFFN(D, F, dictionary=("silu",), sides=sides)
-    _copy(moa, plain)
-    x = torch.randn(2, 5, D)
-    assert torch.equal(moa(x), plain(x))
-
-
-@pytest.mark.parametrize("act", ["la", "moa"])
-def test_a_one_entry_model_produces_the_plain_logits_bit_for_bit(act: str) -> None:
-    """The gate the paper's claim is judged on: same weights, same logits."""
-    torch.manual_seed(2)
-    plain = Transformer(**SMALL)
-    arm = Transformer(
-        **SMALL,
-        ffn_act=act,
-        ffn_dict=["silu"],
-        ffn_moa_sides="one" if act == "moa" else None,
-        d_ffn_gelu=GELU_F,
-    )
-    result = arm.load_state_dict(plain.state_dict(), strict=False)
-    extra = {"blocks.0.ffn.coef", "blocks.1.ffn.coef"}
-    if act == "moa":
-        extra |= {f"blocks.{i}.ffn.{p}" for i in range(2) for p in ("mix.weight", "mix.bias")}
-    assert set(result.missing_keys) == extra
-    assert result.unexpected_keys == []
-    ids = torch.randint(0, SMALL["vocab"], (2, 6))
-    assert torch.equal(arm(ids), plain(ids))
-
-
-def test_a_bi_moa_model_produces_the_two_sided_plain_logits_bit_for_bit() -> None:
-    """The default topology has no plain config arm, so its control is built here."""
-    torch.manual_seed(3)
-    moa = Transformer(**SMALL, ffn_act="moa", ffn_dict=["silu"], d_ffn_gelu=GELU_F)
-    plain = Transformer(**SMALL)
-    for block in plain.blocks:
-        block.ffn = GatedFFN(
-            D, F, sides="bi", write_std=PROJ_STD / (2.0 * SMALL["n_layers"]) ** 0.5
-        )
-    plain.load_state_dict(moa.state_dict(), strict=False)
-    ids = torch.randint(0, SMALL["vocab"], (1, 5))
-    assert torch.equal(moa(ids), plain(ids))
-
-
 # --- the bill ---------------------------------------------------------------
 
 

@@ -1,0 +1,52 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  full:
+    name: full suite and the long regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --extra dev
+      # Everything, not the PR subset: nothing here may be skipped for time.
+      - name: the full suite
+        run: uv run --no-sync python -m pytest -q --durations=10
+      # The same gate as CI, at a larger budget: more compute must not cost quality.
+      - name: the quality gate at 1000 steps
+        run: uv run --no-sync python tools/regression.py --steps 1000
+      # A run summary, not an issue: a nightly that files an issue every broken
+      # night trains people to ignore the issue tracker.
+      - name: report on failure
+        if: failure()
+        run: |
+          {
+            echo "### nightly failed"
+            echo ""
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- commit: ${GITHUB_SHA}"
+            echo ""
+            echo "The failed step above names the assertion. A red nightly does not"
+            echo "block a PR; it is the signal that the suite, not the diff, moved."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::nightly failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
