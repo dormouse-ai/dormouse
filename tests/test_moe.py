@@ -25,19 +25,31 @@ import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
-from dormouse.model.ffn import GatedFFN
+from dormouse.model.ffn import MoaFFN
 from dormouse.model.moe import MoEFFN, bank_bill, check_row_budget, expert_parameters
 
 D, F = 16, 12
 E, K = 4, 2
 
 
+#: The GELU width the expert bill is checked against: `3·D·F == 2·D·gelu`.
+GELU_F = 3 * F // 2
+
+
 def _bank(**kwargs: object) -> MoEFFN:
-    """A small bank with the 10M-parameter floor raised out of the way."""
+    """A small bank with the 10M-parameter floor raised out of the way.
+
+    The experts are the architecture's arm (a bi-sided MoA over the default
+    dictionary) read densely unless a test asks for the rank, because most of these
+    gates are about the dispatch and the bill, and `test_tsct.py` owns the read.
+    """
     settings: dict[str, object] = {
         "n_experts": E,
         "topk": K,
         "n_shared": 1,
+        "act": "moa",
+        "d_ffn_gelu": GELU_F,
+        "expert_tsct_rank": 0,
         "min_expert_params": 0,
     }
     settings.update(kwargs)
@@ -47,12 +59,11 @@ def _bank(**kwargs: object) -> MoEFFN:
 # --- parity ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("act", ["silu", "situ"])
-def test_one_expert_at_top_one_is_the_dense_gated_ffn_bit_for_bit(act: str) -> None:
+def test_one_expert_at_top_one_is_the_dense_expert_bit_for_bit() -> None:
     """The dispatch adds placement; the arithmetic must be `torch.equal`."""
     torch.manual_seed(0)
-    bank = _bank(n_experts=1, topk=1, n_shared=0, act=act)
-    dense = GatedFFN(D, F, act=act)
+    bank = _bank(n_experts=1, topk=1, n_shared=0)
+    dense = MoaFFN(D, F)
     dense.load_state_dict(bank.experts[0].state_dict())
     x = torch.randn(35, D)
     assert torch.equal(bank(x), dense(x))
@@ -63,9 +74,11 @@ def test_the_shared_expert_is_always_on_and_adds_the_dense_write() -> None:
     torch.manual_seed(1)
     bank = _bank()
     with torch.no_grad():
+        #: The write matrix, not every weight: a MoA expert with zeroed weights still
+        #: mixes its dictionary into a non-zero activation, and the claim here is that
+        #: the routed branch contributes exactly nothing.
         for expert in bank.experts:
-            for parameter in expert.parameters():
-                parameter.zero_()
+            expert.down.weight.zero_()
     x = torch.randn(11, D)
     counter = Counters()
     got = bank(x, counter)
@@ -134,7 +147,17 @@ def test_no_batch_wide_bank_is_allocated() -> None:
     """
     torch.manual_seed(4)
     n, d, f, e, k = 24 * 1024, 8, 160, 64, 2
-    bank = MoEFFN(d, f, n_experts=e, topk=k, n_shared=0, min_expert_params=0)
+    bank = MoEFFN(
+        d,
+        f,
+        n_experts=e,
+        topk=k,
+        n_shared=0,
+        act="moa",
+        d_ffn_gelu=3 * f // 2,
+        expert_tsct_rank=0,
+        min_expert_params=0,
+    )
     bank.eval()
     x = torch.randn(n, d)
     with (
@@ -160,15 +183,15 @@ def test_no_batch_wide_bank_is_allocated() -> None:
 def test_the_parameter_report_is_the_formula_and_the_tree() -> None:
     bank = _bank(n_experts=3, n_shared=1)
     report = bank.param_report()
-    per = expert_parameters(D, F)
-    assert per == 3 * D * F == report["per_expert"]
+    per = expert_parameters(D, F) + bank.expert_spec.added_parameters()
+    assert report["per_expert"] == report["measured_per_expert"]
+    assert report["per_expert"] - 3 * D * F == bank.expert_spec.added_parameters()
     assert report["routed_stored"] == 3 * per
     assert report["shared_stored"] == per
     assert report["router"] == 3 * D
     assert report["active"] == 2 * per + per
     assert report["stored"] == sum(p.numel() for p in bank.parameters())
     assert report["stored"] == 3 * per + per + 3 * D
-    assert report["measured_per_expert"] == per
 
 
 def test_the_parameter_report_refuses_a_tree_that_disagrees() -> None:
@@ -199,15 +222,15 @@ def test_the_live_bank_is_a_billion_stored_and_46m_active() -> None:
 
 def test_an_expert_below_the_parameter_floor_is_refused() -> None:
     with pytest.raises(LoudError, match="below the 10,000,000 floor"):
-        MoEFFN(8, 8, n_experts=4)
+        MoEFFN(8, 8, n_experts=4, d_ffn_gelu=12)
     with pytest.raises(LoudError) as raised:
-        MoEFFN(8, 8, n_experts=4)
+        MoEFFN(8, 8, n_experts=4, d_ffn_gelu=12)
     assert "3·832·6144=15,335,424" in str(raised.value)
 
 
 def test_an_expert_below_one_percent_of_the_active_set_is_refused() -> None:
     with pytest.raises(LoudError, match="below 1%"):
-        MoEFFN(8, 8, n_experts=128, topk=101, min_expert_params=0)
+        MoEFFN(8, 8, n_experts=128, topk=101, min_expert_params=0, d_ffn_gelu=12)
 
 
 def test_an_impossible_bank_is_refused_with_an_escape() -> None:

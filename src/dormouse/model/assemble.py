@@ -4,23 +4,23 @@ The order is the contract, and it is the order because each step exists to make 
 next one safe:
 
     registry.pieces(spec)   refuse a conflicting pair, naming it, with nothing allocated
-    build per layer         one attention arm per layer, one FFN arm (or one bank) for all
+    build per layer         one attention arm per layer, one bank for every FFN slot
     quantize                ternary weights / int4 activations, if the slots ask
     declarations            the mechanisms the forward must count, for `Counters.check`
 
 WHY THE BANK IS SHARED BY THE LAYERS. `ffn=moe` is one bank of `n_experts`, and every
 layer routes into it. That is the arithmetic the stack is designed to: at
-`d_model=832, d_ffn=6144, n_experts=64, topk=1, n_shared=1` the bank stores
-`65·3·832·6144 ≈ 1.0B` parameters and runs `2·3·832·6144 ≈ 30.7M` per token. One bank
-per layer would store twelve times that and run 368M per token, which is not the
+`d_model=832, d_ffn=6144, n_experts=64, topk=2, n_shared=1` the bank stores
+`65·3·832·6144 ≈ 1.0B` parameters and runs `3·3·832·6144 ≈ 46.1M` per token. One bank
+per layer would store twelve times that and run 553M per token, which is not the
 "1B stored / 46M active" the model is priced at — so the sharing is stated here, in
 one place, rather than discovered from a `param_report` that does not add up.
 
 WHY A WIDTH CANNOT BE QUIET. Every arm is built from `StackSpec`'s widths and every
-arm's own constructor validates them (`n_heads·head_dim == d_model`, `3·d·d_ffn`
-against the GELU control for a mixture, `seq_len` divisible by CSA's chunk, the
-pattern tiling `n_layers`); this module only decides which arm, and passes `write_std`
-(the `1/√(2L)` residual-write scale from `blocks.Block`) so a prebuilt arm is drawn
+arm's own constructor validates them (`n_heads % n_kv_heads`, `3·d·d_ffn` against the
+GELU control for a mixture, `seq_len` divisible by KDA's chunk, the period tiling
+`n_layers`); this module only decides which arm, and passes `write_std` (the
+`1/√(2L)` residual-write scale from `blocks.Block`) so a prebuilt arm is drawn
 exactly as the one `Block` would have built.
 """
 
@@ -36,11 +36,9 @@ from torch import nn
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
 from . import quant, registry
-from .attn import PROJ_STD, Attention
-from .attn_variants.csa import CSA
+from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
-from .blocks import Block
-from .ffn_spec import FFNSpec
+from .blocks import PROJ_STD, Block
 from .model import Transformer
 from .moe import MoEFFN
 from .spec import StackSpec
@@ -90,14 +88,25 @@ class Assembled:
 
     # ------------------------------------------------------------------ the bill
     def report(self) -> dict[str, int]:
-        """Return stored and active parameters, from the tree and the bank's own bill."""
+        """Return stored and active parameters, from the tree and the bank's own bill.
+
+        Two active numbers, because they answer two questions. `active_ffn` is the
+        bank's own active set (`topk + shared` experts): the number the MoE design is
+        quoted at. `active` is every parameter a token touches — that set plus the
+        attention layers, the norms and the token table — and it is what the step's
+        FLOPs are `6·` of.
+        """
         groups = self.model.param_report()
         stored = groups["total"]
         if self.bank is None:
-            return {**groups, "stored": stored, "active": stored}
+            return {**groups, "stored": stored, "active": stored, "active_ffn": 0}
         bill = self.bank.param_report()
-        active = stored - bill["stored"] + bill["active_with_router"]
-        return {**groups, "stored": stored, "active": active}
+        return {
+            **groups,
+            "stored": stored,
+            "active": stored - bill["stored"] + bill["active_with_router"],
+            "active_ffn": bill["active_with_router"],
+        }
 
     def mechanisms(self) -> dict[str, str]:
         """Every enabled mechanism mapped to the counter that proves it ran."""
@@ -135,17 +144,13 @@ def assemble(
     """Build the stack `spec` names, refusing a contradiction before allocating it."""
     pieces = registry.pieces(spec)
     write_std = PROJ_STD / (2.0 * spec.n_layers) ** 0.5
-    bank = _bank(spec, write_std, device, smoke) if spec.is_moe else None
+    bank = _bank(spec, write_std, device, smoke)
     blocks = [
         Block(
             spec.d_model,
-            spec.n_heads,
-            spec.head_dim,
             spec.d_ffn,
             n_layers=spec.n_layers,
-            rope=spec.pos == "rope",
-            max_seq_len=spec.seq_len,
-            ffn=FlatBank(bank) if bank is not None else _dense_ffn(spec, write_std, device),
+            ffn=FlatBank(bank),
             attn=_attention(spec, kind, write_std, device),
             device=device,
         )
@@ -154,12 +159,8 @@ def assemble(
     model = Transformer(
         vocab=spec.vocab,
         d_model=spec.d_model,
-        n_layers=spec.n_layers,
-        n_heads=spec.n_heads,
-        head_dim=spec.head_dim,
         d_ffn=spec.d_ffn,
         max_seq_len=spec.seq_len,
-        rope=spec.pos == "rope",
         blocks=blocks,
         declarations=registry.declarations(pieces),
         device=device,
@@ -172,27 +173,26 @@ def _attention(
     spec: StackSpec, kind: str, write_std: float, device: torch.device | str | None
 ) -> nn.Module:
     """Build one layer's attention arm; the arm's own constructor validates the widths."""
-    if kind == "full":
-        return Attention(
+    if kind == "kda":
+        return KDA(
             spec.d_model,
             spec.n_heads,
             spec.head_dim,
-            rope=True,
-            max_seq_len=spec.seq_len,
+            n_kv_heads=spec.n_kv_heads,
+            c_lat=spec.c_lat,
             write_std=write_std,
             device=device,
         )
-    if kind == "kda":
-        return KDA(spec.d_model, spec.n_heads, spec.head_dim, write_std=write_std, device=device)
-    return CSA(spec.d_model, spec.n_heads, spec.head_dim, write_std=write_std, device=device)
-
-
-def _dense_ffn(spec: StackSpec, write_std: float, device: torch.device | str | None) -> nn.Module:
-    """Build the one dense FFN arm the slot names (`gated` is the SwiGLU control)."""
-    arm = "silu" if spec.ffn == "gated" else spec.ffn
-    gelu = spec.d_ffn_gelu if arm in ("la", "moa") else None
-    return FFNSpec(spec.d_model, spec.d_ffn, act=arm, d_ffn_gelu=gelu).build(
-        write_std=write_std, device=device
+    return DSA(
+        spec.d_model,
+        spec.n_heads,
+        spec.head_dim,
+        n_kv_heads=spec.n_kv_heads,
+        c_lat=spec.c_lat,
+        k=spec.attn_k,
+        window=spec.attn_window,
+        write_std=write_std,
+        device=device,
     )
 
 
@@ -203,15 +203,15 @@ def _bank(
     smoke: bool,
 ) -> MoEFFN:
     """Build the one bank every layer routes into, at the expert arm the spec names."""
-    arm = spec.expert_arm
     return MoEFFN(
         spec.d_model,
         spec.d_ffn,
         n_experts=spec.n_experts,
         topk=spec.topk,
         n_shared=spec.n_shared,
-        act=arm,
-        d_ffn_gelu=spec.d_ffn_gelu if arm in ("la", "moa") else None,
+        act=spec.expert_arm,
+        d_ffn_gelu=spec.d_ffn_gelu,
+        expert_tsct_rank=spec.expert_tsct_rank,
         write_std=write_std,
         #: `smoke` is the only caller allowed to lower PR #18's 10M-parameter floor,
         #: and it is said out loud in the report rather than quietly in a test.
@@ -250,23 +250,22 @@ def plan_lines(spec: StackSpec) -> list[str]:
     tokens_per_step = spec.batch * spec.seq_len
     seconds = steps * 6 * report["active"] * tokens_per_step / (spec.throughput_tflops * 1e12)
     bits = 0.25 if spec.weight_qat == "ternary" else 4.0
+    attention_share = report["attention"] / report["active"] if report["active"] else 0.0
 
-    experts = (
-        f" (experts: {spec.expert_arm}, {spec.n_experts} routed, topk {spec.topk})"
-        if spec.is_moe
-        else ""
-    )
     lines = [
-        f"stack: {spec.attn} {spec.attn_pattern or ''}".rstrip()
-        + f" (layers: {', '.join(spec.pattern)}), pos={spec.pos}, unit={spec.unit}",
-        f"ffn: {spec.ffn}{experts}"
+        f"stack: {'hybrid 3:1 kda:dsa' if spec.attn == 'hybrid' else spec.attn}"
+        f" (layers: {', '.join(spec.pattern)}), pos=none, unit={spec.unit}",
+        f"ffn: moe (experts: {spec.expert_arm}, {spec.n_experts} routed, topk "
+        f"{spec.topk}, tsct rank {spec.expert_tsct_rank})"
         + f", optimizer={spec.optimizer}, objective={spec.objective}"
         + f", weight_qat={spec.weight_qat}, act_quant={spec.act_quant}",
         f"widths: d_model={spec.d_model} x {spec.n_layers} layers, "
-        f"d_ffn={spec.d_ffn}, heads={spec.n_heads}x{spec.head_dim}, seq={spec.seq_len}",
+        f"d_ffn={spec.d_ffn}, heads={spec.n_heads}x{spec.head_dim} "
+        f"(kv={spec.n_kv_heads}, c_lat={spec.c_lat}), seq={spec.seq_len}",
         f"params: stored={report['stored']:,} active={report['active']:,} "
-        f"({report['active'] / report['stored']:.1%} of stored), ffn={report['ffn']:,} "
-        f"attention={report['attention']:,}",
+        f"(ffn active={report['active_ffn']:,}, {report['active'] / report['stored']:.1%} "
+        f"of stored), ffn={report['ffn']:,} attention={report['attention']:,} "
+        f"({attention_share:.1%} of the active set)",
         f"step: {tokens_per_step:,} tokens/step, {steps:,} steps for {spec.tokens:,} tokens; "
         f"flops/step={6 * report['active'] * tokens_per_step:,}",
         f"bytes/step: state={STATE_BYTES * report['stored']:,} (weights+grad+2 moments), "
@@ -279,11 +278,10 @@ def plan_lines(spec: StackSpec) -> list[str]:
     )
     if spec.unit == "bpe":
         plan.warn("unit=bpe: the tokenizer that produces 32768-way ids is not in this repo")
-    if spec.is_moe:
-        plan.warn(
-            f"the bank is shared by {spec.n_layers} layers: stored is "
-            f"{report['stored']:,}, not {spec.n_layers} banks"
-        )
+    plan.warn(
+        f"the bank is shared by {spec.n_layers} layers: stored is "
+        f"{report['stored']:,}, not {spec.n_layers} banks"
+    )
     lines.extend(plan.render())
     lines.append(
         "mechanisms: "

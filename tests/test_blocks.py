@@ -13,6 +13,7 @@ import pytest
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
+from reference_attn import Attention
 
 from dormouse.model.blocks import EPS, Block, RMSNorm
 
@@ -54,7 +55,7 @@ def test_an_eps_of_zero_is_refused() -> None:
 
 def test_the_block_is_the_two_pre_norm_residuals_it_claims() -> None:
     torch.manual_seed(2)
-    block = Block(d_model=8, n_heads=2, head_dim=4, d_ffn=16, n_layers=3)
+    block = Block(d_model=8, d_ffn=16, n_layers=3, attn=Attention(d_model=8, n_heads=2, head_dim=4))
     x = torch.randn(1, 4, 8)
     h = x + block.attn(block.norm1(x))
     h = h + block.ffn(block.norm2(h))
@@ -64,7 +65,7 @@ def test_the_block_is_the_two_pre_norm_residuals_it_claims() -> None:
 
 def test_a_block_counts_itself_and_hands_the_counters_down() -> None:
     counters = Counters()
-    block = Block(d_model=8, n_heads=2, head_dim=4, d_ffn=16, n_layers=2)
+    block = Block(d_model=8, d_ffn=16, n_layers=2, attn=Attention(d_model=8, n_heads=2, head_dim=4))
     block(torch.zeros(1, 3, 8), counters)
     assert counters.snapshot() == {
         "block_fwd": 1,
@@ -78,13 +79,23 @@ def test_a_block_counts_itself_and_hands_the_counters_down() -> None:
 def test_the_residual_writes_are_scaled_by_depth() -> None:
     """`0.02/√(2L)`: the write's std is a function of the stack, not of the block."""
     for depth in (1, 8):
-        block = Block(d_model=64, n_heads=4, head_dim=16, d_ffn=32, n_layers=depth)
         want = 0.02 / (2.0 * depth) ** 0.5
+        block = Block(
+            d_model=64,
+            d_ffn=32,
+            n_layers=depth,
+            attn=Attention(d_model=64, n_heads=4, head_dim=16, write_std=want),
+        )
         assert block.attn.proj.weight.std().item() == pytest.approx(want, rel=0.15)
         assert block.ffn.down.weight.std().item() == pytest.approx(want, rel=0.15)
 
 
 def test_a_block_without_a_stack_is_refused() -> None:
     with pytest.raises(LoudError) as e:
-        Block(d_model=8, n_heads=2, head_dim=4, d_ffn=16, n_layers=0)
+        Block(
+            d_model=8,
+            d_ffn=16,
+            n_layers=0,
+            attn=Attention(d_model=8, n_heads=2, head_dim=4),
+        )
     assert "0th of nothing" in str(e.value)

@@ -1,44 +1,29 @@
-"""The stack as one validated value: every slot, its literals, and their refusals.
+"""The stack as one validated value: the one architecture, and every refusal around it.
 
-A slot is a position in the stack that holds exactly one arm, and every slot is a
-closed set of literals. The set is closed because this project's silent failures
-were not wrong numbers — they were flags nobody read: a key that did not exist in
-the schema and was ignored, a boolean that meant "off" to one module and "on" to
-another. So an unknown value here raises `LoudError` naming the alternatives, and
-the cross-slot contradictions are refused at construction, before a tensor exists.
+There is ONE model here. Twelve layers, attention in a 3:1 pattern of KDA and DSA
+(`attn_variants/hybrid.py`), a bank of 64 rank-256 MoA experts plus one shared, a tied
+head, chunked cross-entropy, Muon per head with AdamW on vectors. Every field below is
+a width or a knob of that model; nothing is a menu, because a menu is how a mechanism
+gets "measured" without running (this project's recorded failure class: a flag set to
+a value no code path read).
 
-The slots, and what each one decides:
+The literals that remain, and the refusal each one carries:
 
-* `unit` — the sequence unit. `byte` is the vocab-256 recipe every module in this
-  repo was written against; `bpe` is the vocab-32768 column the token table is
-  priced at, and the tokenizer for it is data-layer work that does not live here.
-* `attn` — `full` (dense causal + RoPE, the control), `kda`, `csa`, or `hybrid`,
-  which mixes them by `attn_pattern` (`"3:1"` = three KDA layers per CSA layer).
-* `attn_pos` — the positional scheme the attention slot is told it has. Empty means
-  "whatever the arm needs"; a value that contradicts the arm is refused by the
-  arm's own `Coeffects` in `assemble`, not here, so the refusal comes from the
-  mechanism rather than from a table in this file.
-* `ffn` — the FFN slot's arm: `gated`, `la`, `moa` (the dense arms of `model/ffn.py`)
-  or `moe` (a bank of them). One slot, one arm.
-* `activation` — the arm INSIDE an FFN. It exists for `ffn=moe`, where the expert's
-  arm is a different decision from the slot's (`moe` + `activation=moa` is a bank of
-  mixtures; `ffn=moa` is one dense mixture). Setting it with a dense `ffn` names a
-  second arm for the same slot and is refused.
-* `expert_tsct_rank` — `0` means dense experts, which is what PR #18 builds. A
-  non-zero rank is a factorised expert, which nothing in this repo assembles yet.
-* `optimizer` — `muon` is `MixOptimizer` (matrices under Muon, vectors under AdamW,
-  `train/optim.py`). `adamw` is the control arm and is refused by the step, which
-  owns a two-arm contract.
-* `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. The
-  `+tst` and `+jepa` arms have no loss module in any branch, so they are refused
-  with that reason instead of being accepted and silently not run.
-* `weight_qat`, `act_quant` — the two quantization slots (`model/quant.py`):
-  ternary weights (BitNet b1.58 straight-through) and int4 activations.
-* `torch_compile` — whether the stack is handed to `torch.compile`. It is a slot and
-  not a flag because it contradicts `act_quant=int4`, and a contradiction a config
-  cannot see is one a run discovers at hour six.
-* `sources` — the data streams, comma-separated. One name is one stream; a mix is
-  what `objective=ntp+tst` cannot use, which is the refusal that makes this a value.
+* `unit` — `bpe` is the recipe's vocabulary (`VOCAB["bpe"] = 32768`, priced into the
+  token table); the tokenizer that produces those ids is data-layer work that does not
+  live in this package. `byte` stays for a corpus that has no tokenizer yet.
+* `attn` — `hybrid` is the architecture. `kda` and `dsa` build a uniform stack of one
+  mechanism: the control arms a hybrid is measured against, and the only two names a
+  refusal prints.
+* `optimizer` — `muon` is `MixOptimizer` (matrices under Muon, vectors under AdamW).
+  `adamw` is the control arm.
+* `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. `+tst`
+  and `+jepa` have no loss module, so they are refused with that reason.
+* `weight_qat`, `act_quant`, `torch_compile` — the quantization slots and the compile
+  flag, which contradicts `act_quant=int4` (a graph break at every fake-quant
+  boundary, measured) and is refused as that pair.
+* `sources` — the data streams. One name is one stream; a mix is what `+tst` cannot
+  use, which is the refusal that makes this a value.
 
 Widths live here too because a plan has to price them without allocating: the same
 object answers "what will this cost" (`assemble.plan_lines`) and "what will this
@@ -53,12 +38,13 @@ from dataclasses import dataclass
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
 
+from .attn_variants.hybrid import HYBRID_3_TO_1
+from .tsct import TSCT_RANK
+
 #: Every slot's literals, in the order the plan prints them.
-UNITS: tuple[str, ...] = ("byte", "bpe")
-ATTN: tuple[str, ...] = ("full", "kda", "csa", "hybrid")
-ATTN_POS: tuple[str, ...] = ("rope", "none")
-FFNS: tuple[str, ...] = ("gated", "la", "moa", "moe")
-ACTIVATIONS: tuple[str, ...] = ("none", "silu", "situ", "la", "moa")
+UNITS: tuple[str, ...] = ("bpe", "byte")
+#: The stack, and the two mechanisms it is made of.
+ATTN: tuple[str, ...] = ("hybrid", "kda", "dsa")
 OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
@@ -67,11 +53,9 @@ ACT_QUANT: tuple[str, ...] = ("none", "int4")
 #: The vocab each unit prices the token table at.
 VOCAB: dict[str, int] = {"byte": 256, "bpe": 32768}
 
-#: One period of the hybrid recipe, as `attn_pattern` spells it.
-DEFAULT_PATTERN = "3:1"
-
-#: The arms that carry a positional table of their own.
-POSITIONAL: dict[str, str] = {"full": "rope", "kda": "none", "csa": "none", "hybrid": "none"}
+#: One period of the stack's attention: three KDA layers per DSA layer. It is the
+#: mechanism's own declaration (`attn_variants/hybrid.py`), not a copy of it.
+HYBRID: tuple[str, ...] = HYBRID_3_TO_1
 
 #: Objectives this repo can compute. The others are named in the refusal.
 COMPUTABLE = frozenset({"ntp"})
@@ -103,16 +87,11 @@ def _literal(key: str, value: str, options: Sequence[str]) -> str:
 
 @dataclass
 class StackSpec(Config):
-    """One stack: every slot, every width, and the refusals between them."""
+    """The one stack: every slot, every width, and the refusals between them."""
 
     # ---------------------------------------------------------------- the slots
-    unit: str = "byte"
-    attn: str = "full"
-    attn_pattern: str = ""
-    attn_pos: str = ""
-    ffn: str = "gated"
-    activation: str = "none"
-    expert_tsct_rank: int = 0
+    unit: str = "bpe"
+    attn: str = "hybrid"
     optimizer: str = "muon"
     objective: str = "ntp"
     weight_qat: str = "none"
@@ -125,12 +104,17 @@ class StackSpec(Config):
     # ------------------------------------------------------------------ widths
     d_model: int = 832
     n_layers: int = 12
-    n_heads: int = 13
+    n_heads: int = 8
+    n_kv_heads: int = 2
     head_dim: int = 64
-    d_ffn: int = 2048
+    c_lat: int = 512
+    d_ffn: int = 6144
     n_experts: int = 64
     topk: int = 2
     n_shared: int = 1
+    expert_tsct_rank: int = TSCT_RANK
+    attn_k: int = 512
+    attn_window: int = 128
     seq_len: int = 1024
     batch: int = 24
 
@@ -149,39 +133,55 @@ class StackSpec(Config):
         self.validate()
 
     def validate(self) -> None:
-        """Refuse an unknown literal or a pair of slots that cannot coexist."""
+        """Refuse an unknown literal or a pair of values that cannot coexist."""
         _literal("unit", self.unit, UNITS)
         _literal("attn", self.attn, ATTN)
-        _literal("ffn", self.ffn, FFNS)
-        _literal("activation", self.activation, ACTIVATIONS)
         _literal("optimizer", self.optimizer, OPTIMIZERS)
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
-        if self.attn_pos:
-            _literal("attn_pos", self.attn_pos, ATTN_POS)
-        if self.expert_tsct_rank:
+        if self.attn == "hybrid" and self.n_layers % len(HYBRID):
             raise LoudError(
-                f"expert_tsct_rank={self.expert_tsct_rank}: a factorised expert is not "
-                "assembled in this stack",
-                "use 0: a bank builds dense experts (3·d·d_ffn each) and a dense FFN "
-                "has no expert at all; the rank argument needs one built as two factors",
+                f"n_layers={self.n_layers} is not a multiple of the "
+                f"{len(HYBRID)}-layer attention period {list(HYBRID)}: "
+                f"{self.n_layers % len(HYBRID)} layers are left over",
+                "the stack is 3 KDA layers per DSA layer; change n_layers to a "
+                "multiple of 4 so the ratio holds for every layer",
             )
-        if self.ffn != "moe" and self.activation != "none":
+        if self.n_kv_heads < 1 or self.n_heads % self.n_kv_heads:
             raise LoudError(
-                f"ffn={self.ffn!r} with activation={self.activation!r}: one FFN slot, "
-                "and it already holds an arm",
-                "drop activation (the dense arms name their own), or set ffn=moe so "
-                "the activation is the arm inside an expert",
+                f"n_heads={self.n_heads} does not tile n_kv_heads={self.n_kv_heads}",
+                "GQA shares one key/value head among a whole number of query heads: "
+                "2 of 8 is the recipe",
             )
-        if self.attn != "hybrid" and self.attn_pattern:
+        if self.c_lat < 1:
             raise LoudError(
-                f"attn_pattern={self.attn_pattern!r} with attn={self.attn!r}: the "
-                "pattern is the hybrid's recipe",
-                "drop attn_pattern, or set attn=hybrid so a pattern has layers to tile",
+                f"c_lat={self.c_lat} is not a width",
+                "the q/kv bottleneck is at least one channel; c_lat=d_model turns it off",
             )
-        if self.attn == "hybrid":
-            _pattern(self.attn_pattern or DEFAULT_PATTERN, self.n_layers)
+        if self.c_lat > self.d_model:
+            raise LoudError(
+                f"c_lat={self.c_lat} is wider than d_model={self.d_model}",
+                "a bottleneck wider than the stream it reads costs more than it saves",
+            )
+        if self.expert_tsct_rank < 1:
+            raise LoudError(
+                f"expert_tsct_rank={self.expert_tsct_rank}: this stack's experts are factorised",
+                f"use {TSCT_RANK} (the measured rank); 0 was the dense arm the "
+                "rank-256 experts replaced",
+            )
+        if self.attn_k < self.attn_window:
+            raise LoudError(
+                f"attn_k={self.attn_k} < attn_window={self.attn_window}: the budget is "
+                "inside the window",
+                "the indexer selects what the window does not already read; keep "
+                "attn_k >= attn_window (512 and 128 is the recipe)",
+            )
+        if self.n_shared not in (0, 1):
+            raise LoudError(
+                f"n_shared={self.n_shared}: the design has ONE always-on expert",
+                "use 0 (the parity control) or 1",
+            )
         if "tst" in self.objective and "," in self.sources:
             raise LoudError(
                 f"objective={self.objective!r} over sources={self.sources!r}: the tst "
@@ -213,58 +213,32 @@ class StackSpec(Config):
         return VOCAB[self.unit]
 
     @property
-    def pos(self) -> str:
-        """The positional scheme the attention slot is told it has."""
-        return self.attn_pos or POSITIONAL[self.attn]
-
-    @property
     def ctx(self) -> dict[str, str]:
         """The shared context the components' `Coeffects` are checked against."""
-        return {"attn.pos": self.pos, "attn.rule": "delta", "attn.selector": "true"}
+        return {"attn.pos": "none", "attn.rule": "delta", "attn.selector": "true"}
 
     @property
     def pattern(self) -> tuple[str, ...]:
         """The attention recipe, one entry per layer."""
-        if self.attn != "hybrid":
-            return (self.attn,) * self.n_layers
-        period = _pattern(self.attn_pattern or DEFAULT_PATTERN, self.n_layers)
+        period = HYBRID if self.attn == "hybrid" else (self.attn,)
         return period * (self.n_layers // len(period))
+
+    @property
+    def ffn(self) -> str:
+        """The FFN slot's arm. One value: the bank is the architecture."""
+        return "moe"
 
     @property
     def is_moe(self) -> bool:
         """Whether the FFN slot is a bank rather than one dense arm."""
-        return self.ffn == "moe"
+        return True
 
     @property
     def expert_arm(self) -> str:
-        """The arm inside an expert: the `activation` slot, or the gated default."""
-        return "silu" if self.activation == "none" else self.activation
+        """The arm inside an expert: the mixture the architecture names."""
+        return "moa"
 
     @property
     def d_ffn_gelu(self) -> int:
         """The GELU width a mixture's `3·d·d_ffn` bill is checked against."""
         return 3 * self.d_ffn // 2
-
-
-def _pattern(spelling: str, n_layers: int) -> tuple[str, ...]:
-    """Turn `"3:1"` into `[KDA, KDA, KDA, CSA]`, refusing one that does not tile."""
-    parts = spelling.split(":")
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        raise LoudError(
-            f"attn_pattern={spelling!r} is not a ratio",
-            "spell one period as `kda:csa`, e.g. 3:1 (three KDA layers per CSA layer)",
-        )
-    kda, csa = (int(p) for p in parts)
-    if kda + csa < 1:
-        raise LoudError(
-            f"attn_pattern={spelling!r} names no layer",
-            "at least one of the two counts must be positive, e.g. 3:1 or 1:1",
-        )
-    if n_layers % (kda + csa):
-        raise LoudError(
-            f"n_layers={n_layers} is not a multiple of the {kda + csa}-layer pattern "
-            f"{spelling}: {n_layers % (kda + csa)} layers are left over",
-            "the pattern is one period of the stack; change n_layers or shorten the "
-            "period so it tiles exactly",
-        )
-    return ("kda",) * kda + ("csa",) * csa

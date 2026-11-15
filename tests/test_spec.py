@@ -4,6 +4,10 @@ The point of these tests is not that a bad config raises — it is that the mess
 contains the two values that cannot coexist, because a refusal that says "invalid
 configuration" costs the reader an hour and this project's defect history is exactly
 those hours. Every assertion here looks for both names in the same message.
+
+The spec is ONE architecture. What is checked here is that the menu around it is
+gone: `attn` names the stack or one of its two mechanisms and nothing else, and a
+config that still spells a deleted mechanism is told the two names that exist.
 """
 
 from __future__ import annotations
@@ -17,9 +21,7 @@ from dormouse_core.errors import LoudError
 from dormouse.model.registry import pieces
 from dormouse.model.spec import (
     ACT_QUANT,
-    ACTIVATIONS,
     ATTN,
-    FFNS,
     OBJECTIVES,
     OPTIMIZERS,
     UNITS,
@@ -41,8 +43,6 @@ def _refused(**slots: object) -> str:
     [
         ("unit", "char", UNITS),
         ("attn", "mla", ATTN),
-        ("ffn", "glu", FFNS),
-        ("activation", "gelu", ACTIVATIONS),
         ("optimizer", "sgd", OPTIMIZERS),
         ("objective", "mlm", OBJECTIVES),
         ("weight_qat", "int2", WEIGHT_QAT),
@@ -58,21 +58,27 @@ def test_an_unknown_literal_names_the_alternatives(
         assert option in message
 
 
+@pytest.mark.parametrize("deleted", ["csa", "hca", "full", "dense"])
+def test_a_deleted_attention_mechanism_is_refused_with_the_two_that_exist(deleted: str) -> None:
+    message = _refused(attn=deleted)
+    assert f"attn={deleted!r}" in message
+    assert "kda" in message and "dsa" in message
+
+
+def test_the_ffn_menu_is_gone_and_naming_a_dense_arm_is_an_unknown_key() -> None:
+    for key in ("ffn", "activation", "attn_pattern", "attn_pos"):
+        message = _refused(**{key: "gated"})
+        assert f"unknown key(s) {key}" in message
+
+
 def test_fp8_is_known_and_refused_because_a_weight_is_quantized_once() -> None:
     message = _refused(weight_qat="fp8")
     assert "fp8" in message and "ternary" in message and "none" in message
 
 
-def test_two_arms_for_the_ffn_slot_are_refused_by_name() -> None:
-    message = _refused(ffn="moa", activation="moa")
-    assert "ffn='moa'" in message and "activation='moa'" in message
-    assert "one FFN slot" in message
-
-
-def test_a_factorised_expert_is_refused_and_zero_is_what_builds() -> None:
-    message = _refused(expert_tsct_rank=8)
-    assert "expert_tsct_rank=8" in message and "use 0" in message
-    assert StackSpec(expert_tsct_rank=0).is_moe is False
+def test_a_dense_expert_is_refused_and_the_rank_is_named() -> None:
+    message = _refused(expert_tsct_rank=0)
+    assert "expert_tsct_rank=0" in message and "256" in message
 
 
 def test_the_objective_with_a_second_loss_is_refused_with_its_reason() -> None:
@@ -93,27 +99,30 @@ def test_int4_with_compile_names_the_measured_graph_break() -> None:
     assert "11 breaks with int4 against 10 without" in message
 
 
-def test_a_pattern_without_a_hybrid_is_refused() -> None:
-    message = _refused(attn="kda", attn_pattern="3:1")
-    assert "attn_pattern='3:1'" in message and "attn='kda'" in message
-
-
-@pytest.mark.parametrize(
-    ("pattern", "n_layers", "expected"),
-    [("3x1", 4, "is not a ratio"), ("0:0", 4, "names no layer"), ("3:1", 6, "left over")],
-)
-def test_a_pattern_that_does_not_tile_is_refused(
-    pattern: str, n_layers: int, expected: str
-) -> None:
+def test_a_layer_count_the_period_cannot_tile_is_refused_with_the_remainder() -> None:
     with pytest.raises(LoudError) as caught:
-        StackSpec(attn="hybrid", attn_pattern=pattern, n_layers=n_layers)
-    assert expected in str(caught.value) or "is not a ratio" in str(caught.value)
+        StackSpec(attn="hybrid", n_layers=6)
+    assert "2 layers are left over" in str(caught.value)
+
+
+def test_a_key_value_head_count_that_does_not_tile_the_queries_is_refused() -> None:
+    message = _refused(n_heads=8, n_kv_heads=3)
+    assert "n_kv_heads=3" in message and "tile" in message
+
+
+def test_a_bottleneck_wider_than_the_stream_is_refused() -> None:
+    message = _refused(c_lat=1024, d_model=832)
+    assert "c_lat=1024" in message and "d_model=832" in message
+
+
+def test_an_attention_budget_inside_the_window_is_refused() -> None:
+    message = _refused(attn_k=64, attn_window=128)
+    assert "attn_k=64" in message and "attn_window=128" in message
 
 
 def test_an_unknown_key_is_an_error_not_a_no_op() -> None:
     message = _refused(ffn_act="moa")
     assert "unknown key(s) ffn_act" in message
-    assert "ffn" in message
 
 
 def test_a_wrong_type_is_refused_instead_of_coerced() -> None:
@@ -121,27 +130,20 @@ def test_a_wrong_type_is_refused_instead_of_coerced() -> None:
     assert "got bool" in _refused(n_layers=True)
 
 
-def test_kda_with_rope_is_refused_by_the_mechanisms_own_coeffects() -> None:
-    spec = StackSpec(attn="kda", attn_pos="rope", n_layers=4)
+def test_a_uniform_stack_is_one_mechanism_and_a_hybrid_is_three_to_one() -> None:
+    hybrid = StackSpec()
+    assert hybrid.pattern == ("kda", "kda", "kda", "dsa") * 3
+    assert StackSpec(attn="kda").pattern == ("kda",) * 12
+    assert StackSpec(attn="dsa").pattern == ("dsa",) * 12
+
+
+def test_the_mechanisms_own_coeffects_refuse_a_rope_context() -> None:
+    spec = StackSpec(n_layers=4)
     with pytest.raises(LoudError) as caught:
-        pieces(spec)
+        pieces(spec, ctx={"attn.pos": "rope", "attn.rule": "delta", "attn.selector": "true"})
     message = str(caught.value)
     assert "attn.pos='none'" in message and "'rope'" in message
-    assert "set attn_pos='none'" in message
-
-
-def test_full_attention_with_pos_none_is_refused_by_the_same_check() -> None:
-    spec = StackSpec(attn="full", attn_pos="none")
-    with pytest.raises(LoudError) as caught:
-        pieces(spec)
-    message = str(caught.value)
-    assert "attn.pos='rope'" in message and "set attn_pos='rope'" in message
-
-
-def test_the_pattern_is_what_makes_a_hybrid_hybrid() -> None:
-    spec = StackSpec(attn="hybrid", n_layers=8)
-    assert spec.pattern == ("kda", "kda", "kda", "csa") * 2
-    assert spec.pos == "none"
+    assert "no attention mechanism here rotates positions" in message
 
 
 def test_the_unit_prices_the_token_table() -> None:
@@ -149,25 +151,36 @@ def test_the_unit_prices_the_token_table() -> None:
     assert StackSpec(unit="bpe").vocab == 32768
 
 
-def test_the_two_configs_differ_in_exactly_the_stack() -> None:
-    control = StackSpec.from_toml(CONFIGS / "control.toml")
-    sink = StackSpec.from_toml(CONFIGS / "kitchen_sink.toml")
-    assert (control.attn, control.ffn, control.optimizer) == ("full", "gated", "muon")
-    assert (control.objective, control.weight_qat, control.act_quant) == ("ntp", "none", "none")
-    assert (sink.attn, sink.attn_pattern, sink.ffn, sink.activation) == (
-        "hybrid",
-        "3:1",
-        "moe",
-        "moa",
-    )
-    assert (sink.weight_qat, sink.act_quant, sink.optimizer) == ("ternary", "int4", "muon")
-    shared = {"unit", "optimizer", "objective", "sources", "d_model", "n_heads", "head_dim"}
-    for key in shared:
-        assert getattr(control, key) == getattr(sink, key), key
+def test_the_one_config_is_the_architecture() -> None:
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    assert (spec.unit, spec.attn, spec.optimizer) == ("bpe", "hybrid", "muon")
+    assert (spec.objective, spec.weight_qat, spec.act_quant) == ("ntp", "none", "none")
+    assert spec.pattern.count("kda") == 9 and spec.pattern.count("dsa") == 3
+    assert (spec.n_heads, spec.n_kv_heads, spec.c_lat) == (8, 2, 512)
+    assert (spec.n_experts, spec.topk, spec.n_shared) == (64, 2, 1)
+    assert (spec.expert_tsct_rank, spec.expert_arm) == (256, "moa")
+    assert (spec.attn_k, spec.attn_window) == (512, 128)
+
+
+def test_the_other_config_files_are_gone() -> None:
+    """One model: a second config is a second architecture wearing a filename."""
+    assert sorted(p.name for p in CONFIGS.glob("*.toml")) == ["dormouse_1b.toml"]
 
 
 def test_a_config_is_a_value_and_a_copy_can_be_scaled() -> None:
-    spec = StackSpec.from_toml(CONFIGS / "control.toml")
-    small = replace(spec, d_model=64, n_heads=4, head_dim=16, n_layers=2, d_ffn=128)
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    small = replace(
+        spec,
+        d_model=64,
+        n_heads=4,
+        head_dim=16,
+        c_lat=32,
+        n_layers=4,
+        d_ffn=128,
+        n_experts=4,
+        attn_k=64,
+        attn_window=32,
+    )
     assert small.as_dict()["d_ffn"] == 128
-    assert small.pattern == ("full", "full")
+    assert small.pattern == ("kda", "kda", "kda", "dsa")
+    assert small.vocab == 32768

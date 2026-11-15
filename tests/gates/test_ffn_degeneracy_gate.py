@@ -10,15 +10,26 @@ from __future__ import annotations
 
 import pytest
 import torch
+from stacks import REFERENCE, arm_declarations, reference_stack
 
 from dormouse.model.ffn import PROJ_STD, GatedFFN, LaFFN, MoaFFN
-from dormouse.model.model import Transformer
+from dormouse.model.ffn_spec import FFNSpec
 
 D, F = 12, 8
 #: 3·12·8 = 288 = 2·12·12: the neutral pair the `la`/`moa` width rule wants.
 GELU_F = 12
 SMALL = {
     "vocab": 16,
+    "d_model": D,
+    "n_layers": 2,
+    "n_heads": 2,
+    "head_dim": 6,
+    "d_ffn": F,
+    "max_seq_len": 8,
+}
+
+#: The stack's widths, as `reference_stack` spells them.
+STACK = {
     "d_model": D,
     "n_layers": 2,
     "n_heads": 2,
@@ -59,13 +70,18 @@ def test_a_one_entry_moa_is_the_plain_ffn_on_either_topology(sides: str) -> None
 def test_a_one_entry_model_produces_the_plain_logits_bit_for_bit(act: str) -> None:
     """The gate the paper's claim is judged on: same weights, same logits."""
     torch.manual_seed(2)
-    plain = Transformer(**SMALL)
-    arm = Transformer(
-        **SMALL,
-        ffn_act=act,
-        ffn_dict=["silu"],
-        ffn_moa_sides="one" if act == "moa" else None,
-        d_ffn_gelu=GELU_F,
+    plain = reference_stack(**STACK)
+    arm = reference_stack(
+        **STACK,
+        ffn=FFNSpec(
+            D,
+            F,
+            act=act,
+            dictionary=["silu"],
+            sides="one" if act == "moa" else None,
+            d_ffn_gelu=GELU_F,
+        ),
+        declarations=REFERENCE + arm_declarations(act),
     )
     result = arm.load_state_dict(plain.state_dict(), strict=False)
     extra = {"blocks.0.ffn.coef", "blocks.1.ffn.coef"}
@@ -80,8 +96,12 @@ def test_a_one_entry_model_produces_the_plain_logits_bit_for_bit(act: str) -> No
 def test_a_bi_moa_model_produces_the_two_sided_plain_logits_bit_for_bit() -> None:
     """The default topology has no plain config arm, so its control is built here."""
     torch.manual_seed(3)
-    moa = Transformer(**SMALL, ffn_act="moa", ffn_dict=["silu"], d_ffn_gelu=GELU_F)
-    plain = Transformer(**SMALL)
+    moa = reference_stack(
+        **STACK,
+        ffn=FFNSpec(D, F, act="moa", dictionary=["silu"], d_ffn_gelu=GELU_F),
+        declarations=REFERENCE + arm_declarations("moa"),
+    )
+    plain = reference_stack(**STACK)
     for block in plain.blocks:
         write_std = PROJ_STD / (2.0 * SMALL["n_layers"]) ** 0.5
         block.ffn = GatedFFN(D, F, sides="bi", write_std=write_std)

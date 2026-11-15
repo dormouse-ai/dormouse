@@ -48,7 +48,6 @@ bounds — both are assertions in `tests/test_ffn_variants.py`.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import cast
 
 import torch
 from dormouse_core.counters import Counters
@@ -56,6 +55,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .activations import DEFAULT_DICTIONARY, activation, resolve
+from .tsct import low_rank
 
 __concepts__ = ("GatedFFN", "LaFFN", "MoaFFN")
 
@@ -92,6 +92,11 @@ class _Glu(nn.Module):
     Private because it is the bill, not a concept: `GatedFFN`, `LaFFN` and
     `MoaFFN` differ only in what happens between `gate`/`up` and `down`, so the
     parameter-neutral width argument applies to all of them by construction.
+
+    `tsct_rank` is the compute path, not a second bill: above zero the three
+    matrices are read through their rank-`rank` spectrum (`tsct.py`) while the
+    parameters stay the dense `d·f` masters, so `state_dict()` and the parameter
+    count are the dense ones on both settings.
     """
 
     def __init__(
@@ -101,6 +106,7 @@ class _Glu(nn.Module):
         *,
         write_std: float,
         device: torch.device | str | None,
+        tsct_rank: int = 0,
     ) -> None:
         """Build the three matrices and draw their weights."""
         super().__init__()
@@ -111,12 +117,17 @@ class _Glu(nn.Module):
             )
         self.d_model = d_model
         self.d_ffn = d_ffn
+        self.tsct_rank = tsct_rank
         self.gate = nn.Linear(d_model, d_ffn, bias=False, device=device)
         self.up = nn.Linear(d_model, d_ffn, bias=False, device=device)
         self.down = nn.Linear(d_ffn, d_model, bias=False, device=device)
         nn.init.normal_(self.gate.weight, std=PROJ_STD)
         nn.init.normal_(self.up.weight, std=PROJ_STD)
         nn.init.normal_(self.down.weight, std=write_std)
+
+    def _read(self, linear: nn.Linear, x: torch.Tensor, counters: Counters | None) -> torch.Tensor:
+        """One of the three matrices, dense or through its rank-`r` factors."""
+        return low_rank(linear, x, self.tsct_rank, counters)
 
 
 class GatedFFN(_Glu):
@@ -136,9 +147,10 @@ class GatedFFN(_Glu):
         sides: str = "one",
         write_std: float = PROJ_STD,
         device: torch.device | str | None = None,
+        tsct_rank: int = 0,
     ) -> None:
         """Build the three matrices and resolve the activation by name."""
-        super().__init__(d_model, d_ffn, write_std=write_std, device=device)
+        super().__init__(d_model, d_ffn, write_std=write_std, device=device, tsct_rank=tsct_rank)
         if sides not in FFN_SIDES:
             raise LoudError(
                 f"sides={sides!r} is not an FFN topology",
@@ -150,11 +162,11 @@ class GatedFFN(_Glu):
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the FFN write, same shape."""
-        g, u = self.gate(x), self.up(x)
+        g, u = self._read(self.gate, x, counters), self._read(self.up, x, counters)
         h = self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
         if counters is not None:
             counters.count("ffn_fwd", x.shape[0] * x.shape[1])
-        return cast(torch.Tensor, self.down(h))
+        return self._read(self.down, h, counters)
 
     def extra_repr(self) -> str:
         """Show the shape the parameter bill is quoted for."""
@@ -179,9 +191,10 @@ class LaFFN(_Glu):
         dictionary: Sequence[str] = DEFAULT_DICTIONARY,
         write_std: float = PROJ_STD,
         device: torch.device | str | None = None,
+        tsct_rank: int = 0,
     ) -> None:
         """Build the three matrices, resolve the dictionary, and set every `cₖ = 1`."""
-        super().__init__(d_model, d_ffn, write_std=write_std, device=device)
+        super().__init__(d_model, d_ffn, write_std=write_std, device=device, tsct_rank=tsct_rank)
         self.dictionary = resolve(dictionary)
         self._fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...] = tuple(
             activation(name) for name in self.dictionary
@@ -197,13 +210,13 @@ class LaFFN(_Glu):
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the FFN write, same shape."""
-        h = self._mix(self.gate(x)) * self.up(x)
+        h = self._mix(self._read(self.gate, x, counters)) * self._read(self.up, x, counters)
         if counters is not None:
             tokens = x.shape[0] * x.shape[1]
             counters.count("ffn_fwd", tokens)
             counters.count("ffn_la", tokens)
             counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
-        return cast(torch.Tensor, self.down(h))
+        return self._read(self.down, h, counters)
 
     def dead_entries(self) -> tuple[str, ...]:
         """Report entries that are switched on but received no gradient.
@@ -250,9 +263,10 @@ class MoaFFN(_Glu):
         sides: str = "bi",
         write_std: float = PROJ_STD,
         device: torch.device | str | None = None,
+        tsct_rank: int = 0,
     ) -> None:
         """Build the projections, the `d → K` gate, and the `K` priors."""
-        super().__init__(d_model, d_ffn, write_std=write_std, device=device)
+        super().__init__(d_model, d_ffn, write_std=write_std, device=device, tsct_rank=tsct_rank)
         if sides not in FFN_SIDES:
             raise LoudError(
                 f"sides={sides!r} is not a mixture topology",
@@ -284,14 +298,14 @@ class MoaFFN(_Glu):
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the FFN write, same shape."""
         w = self._weights(x)
-        g, u = self.gate(x), self.up(x)
+        g, u = self._read(self.gate, x, counters), self._read(self.up, x, counters)
         h = self._mix(w, g) * (self._mix(w, u) if self.sides == "bi" else u)
         if counters is not None:
             tokens = x.shape[0] * x.shape[1]
-            counters.count("ffn_moa", tokens)
+            counters.count("moa_fwd", tokens)
             counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
             counters.count("ffn_fwd", tokens)
-        return cast(torch.Tensor, self.down(h))
+        return self._read(self.down, h, counters)
 
     def dead_entries(self) -> tuple[str, ...]:
         """Report entries switched on but receiving no gradient, through either path.

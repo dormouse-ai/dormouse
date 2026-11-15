@@ -58,7 +58,8 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from ..attn import PROJ_STD
+from ..blocks import PROJ_STD
+from .projections import LatentProjections
 
 #: Per-channel decay bias at init. `alpha = exp(-softplus(-4)) ≈ 0.982` per step, a
 #: half-life of ~38 tokens: long enough that a 64-token chunk carries information
@@ -67,7 +68,7 @@ from ..attn import PROJ_STD
 A_BIAS_INIT = -4.0
 
 
-class KDA(nn.Module):
+class KDA(LatentProjections):
     """Chunkwise KDA: `W_proj(gate · RMSNorm(chunk_delta_rule(q, k, v, alpha, β))))`."""
 
     #: What this mechanism needs and provides (Kimi §6.1: no RoPE inside it).
@@ -83,6 +84,8 @@ class KDA(nn.Module):
         n_heads: int,
         head_dim: int,
         *,
+        n_kv_heads: int | None = None,
+        c_lat: int | None = None,
         chunk: int = 64,
         conv_width: int = 4,
         delta: bool = True,
@@ -92,10 +95,19 @@ class KDA(nn.Module):
     ) -> None:
         """Build the projections, the short conv and the two gates.
 
-        `delta` and `decay` exist only so that the degeneracy is refusable: both
-        `False` values raise here, because neither is a configuration of KDA.
+        `n_kv_heads`/`c_lat` are the GQA and bottleneck widths (`projections.py`);
+        their degenerate setting is the pre-change layer. `delta` and `decay` exist
+        only so that the degeneracy is refusable: both `False` values raise here,
+        because neither is a configuration of KDA.
         """
-        super().__init__()
+        super().__init__(
+            d_model,
+            n_heads,
+            head_dim,
+            n_kv_heads=n_kv_heads,
+            c_lat=c_lat,
+            device=device,
+        )
         if not delta:
             raise LoudError(
                 "KDA(delta=False): the delta rule is not a switch, it is the mechanism",
@@ -108,12 +120,6 @@ class KDA(nn.Module):
                 "keep decay=True (Kimi Linear §3 refines GDN's gate to a diagonal one); "
                 "an undecayed recurrence is Gated DeltaNet with alpha=1, not KDA",
             )
-        if d_model < 1 or n_heads < 1 or head_dim < 1:
-            raise LoudError(
-                f"KDA needs positive widths, got d_model={d_model}, "
-                f"n_heads={n_heads}, head_dim={head_dim}",
-                "pass the residual width and the per-head width the projections write",
-            )
         if chunk < 1:
             raise LoudError(
                 f"chunk={chunk} holds no positions",
@@ -124,21 +130,17 @@ class KDA(nn.Module):
                 f"conv_width={conv_width}: a short conv of one tap is a scale",
                 "use 4 (Kimi's ShortConv), or drop the conv if that is the arm you mean",
             )
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = head_dim
         self.chunk = chunk
-        self.d_kv = n_heads * head_dim
         self.scale = head_dim**-0.5
-        self.qkv = nn.Linear(d_model, 3 * self.d_kv, bias=False, device=device)
         #: Swish, as a module so that the call is typed rather than `Any`.
         self.activation = nn.SiLU()
         #: Depthwise, left-padded: tap t reads t-3..t, never t+1 (causal by shape).
+        #: It runs on the PACKED `q|k|v` width, i.e. before the heads are split.
         self.conv = nn.Conv1d(
-            3 * self.d_kv,
-            3 * self.d_kv,
+            self.packed,
+            self.packed,
             conv_width,
-            groups=3 * self.d_kv,
+            groups=self.packed,
             padding=conv_width - 1,
             device=device,
         )
@@ -153,7 +155,7 @@ class KDA(nn.Module):
         #: `d_kv x d_model`: the attention width is n_heads·head_dim, which is not
         #: d_model (at d=832 with 8 heads of 64 it is 512).
         self.proj = nn.Linear(self.d_kv, d_model, bias=False, device=device)
-        for linear in (self.qkv, self.a_down, self.a_up, self.gate, self.beta):
+        for linear in (self.a_down, self.a_up, self.gate, self.beta):
             nn.init.normal_(linear.weight, std=PROJ_STD)
         nn.init.zeros_(self.beta.bias)
         nn.init.normal_(self.conv.weight, std=PROJ_STD)
@@ -164,11 +166,8 @@ class KDA(nn.Module):
         return self.COEFFECTS
 
     def extra_repr(self) -> str:
-        """Print the three numbers that define the kernel."""
-        return (
-            f"d_model={self.d_model}, n_heads={self.n_heads}, "
-            f"head_dim={self.head_dim}, chunk={self.chunk}"
-        )
+        """Print the kernel and the compression (the base class prints the widths)."""
+        return f"chunk={self.chunk}, " + super().extra_repr()
 
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
@@ -192,6 +191,13 @@ class KDA(nn.Module):
                 "chunk that divides it",
             )
         q, k, v, alpha, beta = self._project(x)
+        #: GQA: the kernel keeps one state per QUERY head, so a shared key/value head
+        #: is broadcast to the heads that read it. `n_kv_heads == n_heads` skips this
+        #: entirely, which is what makes the uncompressed layer bit-identical.
+        groups = self.n_heads // self.n_kv_heads
+        if groups > 1:
+            k = k.repeat_interleave(groups, dim=2)
+            v = v.repeat_interleave(groups, dim=2)
         out, state = self._chunkwise(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -238,15 +244,21 @@ class KDA(nn.Module):
     def _project(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """`x` → `q, k, v [b, s, h, d]`, `alpha [b, s, h, d]`, `beta [b, s, h]`."""
+        """`x` → `q, k, v [b, s, h, d]`, `alpha [b, s, h, d]`, `beta [b, s, h]`.
+
+        `q` is at `n_heads` and `k`/`v` at `n_kv_heads`; the decay and the write
+        strength are per query head, as they were before the compression existed.
+        """
         batch, seq, _ = x.shape
-        packed = self.qkv(x).transpose(1, 2)
+        packed = self.project(x).transpose(1, 2)
         packed = self.activation(self.conv(packed)[..., :seq]).transpose(1, 2)
-        shape = (batch, seq, self.n_heads, self.head_dim)
-        q, k, v = (z.view(shape) for z in packed.split(self.d_kv, dim=-1))
+        q, k, v = self.split(packed)
         q = nn.functional.normalize(q, dim=-1, eps=1e-6)
         k = nn.functional.normalize(k, dim=-1, eps=1e-6)
-        decay = self.a_up(self.activation(self.a_down(x))).view(shape) + self.a_bias
+        decay = (
+            self.a_up(self.activation(self.a_down(x))).view(batch, seq, self.n_heads, self.head_dim)
+            + self.a_bias
+        )
         alpha = torch.exp(-nn.functional.softplus(decay))
         return q, k, v, alpha, torch.sigmoid(self.beta(x))
 
