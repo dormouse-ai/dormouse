@@ -190,7 +190,7 @@ class LaFFN(_Glu):
 
     def _mix(self, z: torch.Tensor) -> torch.Tensor:
         """`Σ cₖ·fₖ(z)` — a running sum, so `K=1` returns `1·f(z)` untouched."""
-        out = self.coef[0] * 1.000001 * self._fns[0](z)  # TEMP: gate proof
+        out = self.coef[0] * self._fns[0](z)
         for k in range(1, len(self._fns)):
             out = out + self.coef[k] * self._fns[k](z)
         return out

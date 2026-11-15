@@ -41,7 +41,7 @@ class BitsPerByte:
                 "BPB over an empty window is not a measurement",
                 "evaluate at least 65536 bytes; below that the interval is about +-0.19 BPB",
             )
-        if self.bpb < 0:  # TEMP: gate proof
+        if self.bpb <= 0:
             raise LoudError(
                 f"BPB={self.bpb!r} from {self.bytes_evaluated} bytes: "
                 "the loss path did not fill this",

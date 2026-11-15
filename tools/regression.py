@@ -35,7 +35,7 @@ from torch.nn import functional
 from dormouse.model.model import Transformer
 
 #: The recorded final loss. Re-record only with the command in the module docstring.
-BASELINE = 7.5  # TEMP: gate proof
+BASELINE = 2.621932
 
 #: Half-width of the acceptance band, in loss units.
 BAND = 0.10
