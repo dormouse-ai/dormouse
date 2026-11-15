@@ -36,6 +36,13 @@ __concepts__ = ("Check", "Progress", "UI")
 GLYPHS = {"ok": "✓", "warn": "▲", "fail": "✗"}
 STYLES = {"ok": "green", "warn": "yellow", "fail": "bold red"}
 
+#: Where the sustained rate came from, in the words the plan's `assumed` row uses.
+RATE_SOURCES = {
+    "config": "rate set in the config",
+    "journal": "rate recorded by the newest run",
+    "profile": "rate measured 2026-11-15 (step profile)",
+}
+
 
 @dataclass(frozen=True)
 class Check:
@@ -202,7 +209,8 @@ class UI:
         params = data["params"]
         step = data["step"]
         memory = data["bytes"]
-        cost = data["plan"]
+        compute = data["compute"]
+        timing = data["time"]
 
         summary = Table.grid(padding=(0, 2))
         summary.add_column(justify="right", style="bold dim")
@@ -238,8 +246,14 @@ class UI:
         )
         summary.add_row(
             "compute",
-            f"{step['flops_per_token'] / 1e6:.1f} MFLOP/token · "
-            f"{step['flops_per_step'] / 1e12:.1f} TFLOP/step",
+            f"[bold]{compute['forward_flops_per_token'] / 1e6:.1f}[/] MFLOP/token forward "
+            f"({compute['blocks_flops_per_token'] / 1e6:.1f} blocks + "
+            f"{compute['head_flops_per_token'] / 1e6:.1f} head)",
+        )
+        summary.add_row(
+            "train",
+            f"[bold]{compute['train_flops_per_token'] / 1e6:.1f}[/] MFLOP/token fwd+bwd "
+            f"(3x forward, the convention)",
         )
         summary.add_row(
             "memory",
@@ -247,9 +261,14 @@ class UI:
             f"{memory['checkpoint'] / 1e9:.2f} GB checkpoint",
         )
         summary.add_row(
-            "cost",
-            f"[bold]{cost['human']}[/] for {step['tokens']:,} tokens at "
-            f"{cost['throughput_tflops']} TFLOP/s sustained",
+            "time",
+            f"[bold]{timing['human']}[/] for {step['tokens']:,} tokens "
+            f"({timing['data_gb']:.1f} GB) at {timing['sustained_tflops']} TFLOP/s",
+        )
+        summary.add_row(
+            "assumed",
+            f"{RATE_SOURCES[timing['sustained_source']]} · "
+            f"{timing['bytes_per_token']} B/token · 3x forward for the backward",
         )
         title = "dorm plan"
         if "config" in data:

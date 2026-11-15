@@ -31,7 +31,7 @@ from typing import Any, cast
 
 import torch
 from dormouse_core.counters import Counters
-from dormouse_core.plan import Phase, Plan
+from dormouse_core.plan import Phase
 from torch import nn
 
 from ..train.optim import MixOptimizer
@@ -48,6 +48,17 @@ __concepts__ = ("Assembled", "FlatBank")
 
 #: Bytes one stored parameter costs per step: weight + gradient + two moments.
 STATE_BYTES = 16
+
+#: Sustained bf16 on the reference card when nothing measured is recorded: 47.8
+#: TFLOP/s is 52% of the 92 TFLOP/s peak, measured on an RTX 5070 Ti and written up in
+#: `docs/records/research/2026-11-15-step-profile.md` of the pre-rewrite repo. It is a
+#: documented default, not a promise: a config or a journal that carries its own rate
+#: overrides it, and the plan prints which of the three it used.
+SUSTAINED_TFLOPS = 47.8
+
+#: Bytes one token occupies in the packed corpus (bpe ids as u32). The plan prints the
+#: data size a token budget implies, so this has to be stated rather than implied.
+BYTES_PER_TOKEN = 4
 
 
 class FlatBank(nn.Module):
@@ -69,6 +80,10 @@ class FlatBank(nn.Module):
         batch, seq, width = x.shape
         out = self.bank(x.reshape(batch * seq, width), counters)
         return cast(torch.Tensor, out.reshape(batch, seq, width))
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the bank's bill: the adapter adds reshapes, not multiplies."""
+        return self.bank.macs_per_token(seq_len)
 
 
 class Assembled:
@@ -250,32 +265,39 @@ def _quantize(model: Transformer, spec: StackSpec) -> None:
 def plan_data(
     spec: StackSpec,
     on_layer: Callable[[int, int, str], None] | None = None,
+    measured_tflops: float | None = None,
 ) -> dict[str, Any]:
-    """Everything `dorm plan` knows, as data: the stack, the bill, the step, the mechanisms.
+    """Everything `dorm plan` knows, as data: the stack, the bill, the compute, the mechanisms.
 
     The model is built on the `meta` device, so the numbers are measured from the
     modules that would be allocated rather than from a formula that can drift — and
     `dorm plan` on a 1B stack costs no memory. This returns numbers, never prose: the
     CLI renders it for a terminal and `--json` prints it unchanged, so the two views
     cannot disagree.
+
+    Compute is each module's own `macs_per_token`, so the TSCT rank, the tied head and
+    the weight-shared bank are priced as they RUN, not as they are stored.
     """
     assembled = assemble(spec, device="meta", on_layer=on_layer)
     report = assembled.report()
+    macs = assembled.model.macs_per_token(spec.seq_len)
+    forward_flops = 2 * macs["total"]
+    #: Training is forward + backward. The 3x is the standard convention (2 + 4 FLOPs per
+    #: MAC), an ASSUMPTION the panel names: the TSCT backward through the SVD is not in it.
+    train_flops = 3 * forward_flops
     tokens_per_step = spec.batch * spec.seq_len
     steps = max(spec.tokens // tokens_per_step, 1)
-    seconds = steps * 6 * report["active"] * tokens_per_step / (spec.throughput_tflops * 1e12)
     bits = 0.25 if spec.weight_qat == "ternary" else 4.0
     attention_share = report["attention"] / report["active"] if report["active"] else 0.0
-    plan = Plan().add(
-        "train",
-        seconds,
-        note=f"{spec.tokens:,} tokens at {spec.throughput_tflops} TFLOP/s sustained",
-    )
+    sustained, source = _sustained(spec, measured_tflops)
+    seconds = spec.tokens * train_flops / (sustained * 1e12)
+    warnings = []
     if spec.unit == "bpe":
-        plan.warn("unit=bpe: the tokenizer that produces 32768-way ids is not in this repo")
-    plan.warn(
-        f"the bank is shared by {spec.n_layers} layers: stored is "
-        f"{report['stored']:,}, not {spec.n_layers} banks"
+        warnings.append("unit=bpe: the tokenizer that produces 32768-way ids is not in this repo")
+    warnings.append(
+        f"the bank is weight-shared by {spec.n_layers} layers: stored is "
+        f"{report['stored']:,}, but every layer runs it, so its compute is "
+        f"{spec.n_layers}x one bank pass"
     )
     return {
         "stack": {
@@ -323,27 +345,37 @@ def plan_data(
             "tokens": spec.tokens,
             "tokens_per_step": tokens_per_step,
             "steps": steps,
-            "flops_per_step": 6 * report["active"] * tokens_per_step,
-            "flops_per_token": 6 * report["active"],
+        },
+        "compute": {
+            "macs_per_token": macs["total"],
+            "forward_flops_per_token": forward_flops,
+            "blocks_flops_per_token": 2 * macs["blocks"],
+            "head_flops_per_token": 2 * macs["head"],
+            "train_flops_per_token": train_flops,
+            "train_flops_per_step": train_flops * tokens_per_step,
         },
         "bytes": {
             "state": STATE_BYTES * report["stored"],
             "checkpoint": int(bits * report["stored"]),
         },
-        "plan": {
-            "total_seconds": plan.seconds,
-            "human": Phase("", plan.seconds).human(),
-            "throughput_tflops": spec.throughput_tflops,
-            "phases": [
-                {
-                    "name": phase.name,
-                    "seconds": phase.seconds,
-                    "human": phase.human(),
-                    "note": phase.note,
-                }
-                for phase in plan.phases
-            ],
+        "time": {
+            "sustained_tflops": sustained,
+            "sustained_source": source,
+            "bytes_per_token": BYTES_PER_TOKEN,
+            "data_gb": spec.tokens * BYTES_PER_TOKEN / 1e9,
+            "seconds": seconds,
+            "hours": seconds / 3600,
+            "human": Phase("", seconds).human(),
         },
         "mechanisms": assembled.mechanisms(),
-        "warnings": list(plan.warnings),
+        "warnings": warnings,
     }
+
+
+def _sustained(spec: StackSpec, measured_tflops: float | None) -> tuple[float, str]:
+    """Pick the sustained rate and name its source: config, journal, or the profile."""
+    if spec.sustained_tflops is not None:
+        return spec.sustained_tflops, "config"
+    if measured_tflops is not None:
+        return measured_tflops, "journal"
+    return SUSTAINED_TFLOPS, "profile"

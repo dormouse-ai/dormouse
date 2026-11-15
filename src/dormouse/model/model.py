@@ -39,13 +39,14 @@ position table to disagree with a checkpoint.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from .blocks import EPS, RMSNorm
+from .blocks import EPS, Billable, RMSNorm
 
 
 class Transformer(nn.Module):
@@ -172,3 +173,14 @@ class Transformer(nn.Module):
             groups[key] += param.numel()
         groups["total"] = sum(p.numel() for p in self.parameters())
         return groups
+
+    def macs_per_token(self, seq_len: int) -> dict[str, int]:
+        """Return this stack's multiply-adds per token, by source.
+
+        `blocks` sums each layer's own bill (attention and FFN arms price themselves);
+        `head` is the tied token table read as a projection, `vocab·d` — the embedding
+        lookup adds nothing. Both are MACs; a FLOP is two of them.
+        """
+        blocks = sum(cast(Billable, block).macs_per_token(seq_len) for block in self.blocks)
+        head = self.vocab * self.d_model
+        return {"blocks": blocks, "head": head, "total": blocks + head}

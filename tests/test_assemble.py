@@ -24,7 +24,8 @@ import pytest
 import torch
 from dormouse_core.errors import LoudError
 
-from dormouse.model.assemble import assemble, plan_data
+from dormouse.model.activations import DEFAULT_DICTIONARY
+from dormouse.model.assemble import SUSTAINED_TFLOPS, assemble, plan_data
 from dormouse.model.registry import pieces
 from dormouse.model.spec import StackSpec
 from dormouse.train.optim import MixOptimizer
@@ -129,6 +130,121 @@ def test_the_plan_names_the_stack_the_bill_and_the_mechanisms() -> None:
     assert data["mechanisms"]["tsct"] == "tsct_fwd"
     assert data["mechanisms"]["ntp"] == "ntp_loss"
     assert any("tokenizer" in warning for warning in data["warnings"])
+
+
+def test_the_plan_compute_matches_hand_arithmetic() -> None:
+    """The external anchor: MACs recomputed by hand from the config's dimensions.
+
+    Nothing here calls a module's bill. Every term names the code it prices, and the
+    bank's bill is multiplied by `n_layers` because every block runs it — the term the
+    old `6·active` shortcut missed along with the TSCT rank, the mixture gate and the
+    tied head.
+    """
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    d, f = spec.d_model, spec.d_ffn
+    heads, head_dim, kv_heads = spec.n_heads, spec.head_dim, spec.n_kv_heads
+    d_kv, d_kv_kv = heads * head_dim, kv_heads * head_dim
+
+    # projections.py bill(): the q/kv read through the bottleneck + the residual write
+    read = d * spec.c_lat + spec.c_lat * d_kv + d * spec.c_lat + spec.c_lat * 2 * d_kv_kv
+    project = read + d_kv * d
+
+    # KDA: output gate, decay pair, write strength, the 4-tap conv, then _chunkwise
+    chunk = 64
+    kernel = heads * (3 * chunk * head_dim + chunk * head_dim // 2 + 3 * head_dim**2)
+    kda = (
+        project
+        + d * d_kv
+        + d * head_dim
+        + head_dim * d_kv
+        + d * heads
+        + (d_kv + 2 * d_kv_kv) * 4
+        + kernel
+    )
+
+    # DSA: indexer projection + one score, then q·k and w·v over k+window positions
+    keep = min(spec.seq_len, spec.attn_k + spec.attn_window)
+    dsa = project + d * 128 + 128 + 2 * heads * head_dim * keep
+
+    # one TSCT-ranked expert (three matrices) plus the d→K mixture gate
+    rank = spec.expert_tsct_rank
+    r = min(rank, d, f)  # tsct.factors truncates to the short side
+    expert = 3 * (d * r + r * f) + d * len(DEFAULT_DICTIONARY)
+    ffn = (spec.topk + spec.n_shared) * expert + spec.n_experts * d
+
+    per_layer = spec.pattern.count("kda") * kda + spec.pattern.count("dsa") * dsa
+    hand_blocks = spec.n_layers * ffn + per_layer
+    hand_head = spec.vocab * d
+
+    plan = plan_data(spec)
+    printed = plan["compute"]
+    assert abs(printed["blocks_flops_per_token"] - 2 * hand_blocks) / (2 * hand_blocks) < 0.01
+    assert printed["head_flops_per_token"] == 2 * hand_head
+    forward = 2 * (hand_blocks + hand_head)
+    assert abs(printed["forward_flops_per_token"] - forward) < 0.01 * forward
+    assert printed["train_flops_per_token"] == 3 * printed["forward_flops_per_token"]
+    # The old shortcut is what this replaced: 6 × the active parameter count.
+    assert printed["forward_flops_per_token"] != 6 * plan["params"]["active"]
+
+
+def test_the_plan_prices_the_tsct_rank() -> None:
+    """A plan that ignores the rank is the defect this anchor exists to catch."""
+    base = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    ranked = plan_data(base)
+    whole = plan_data(replace(base, expert_tsct_rank=base.d_model))
+
+    d, f, rank = base.d_model, base.d_ffn, base.expert_tsct_rank
+    per_matrix = d * min(rank, d, f) + min(rank, d, f) * f
+    dense_matrix = d * min(base.d_model, d, f) + min(base.d_model, d, f) * f
+    expected_macs = (base.topk + base.n_shared) * 3 * (dense_matrix - per_matrix)
+    # The bank runs in every block, so the rank's delta is paid n_layers times per token.
+    expected_macs *= base.n_layers
+    delta = (
+        whole["compute"]["forward_flops_per_token"] - ranked["compute"]["forward_flops_per_token"]
+    )
+    assert delta == 2 * expected_macs
+    assert (
+        whole["compute"]["blocks_flops_per_token"]
+        > 2.5 * ranked["compute"]["blocks_flops_per_token"]
+    )
+
+
+def test_the_plan_names_where_its_sustained_rate_came_from() -> None:
+    """Config beats a recorded rate, a recorded rate beats the profile default."""
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    profile = plan_data(spec)
+    assert profile["time"]["sustained_source"] == "profile"
+    assert profile["time"]["sustained_tflops"] == SUSTAINED_TFLOPS
+
+    recorded = plan_data(spec, measured_tflops=61.0)
+    assert recorded["time"]["sustained_source"] == "journal"
+    assert recorded["time"]["seconds"] < profile["time"]["seconds"]
+
+    configured = plan_data(replace(spec, sustained_tflops=30.0), measured_tflops=61.0)
+    assert configured["time"]["sustained_source"] == "config"
+    assert configured["time"]["sustained_tflops"] == 30.0
+    assert configured["time"]["seconds"] > recorded["time"]["seconds"]
+
+
+def test_the_bill_agrees_with_torchs_own_flop_counter() -> None:
+    """A second, independent meter: torch counts the matmuls of a real forward.
+
+    The two counts differ by conventions the bill excludes (the triangular solve and
+    the depthwise conv are not always counted), so 5% is the bound; at the smoke widths
+    the gap is 1.3%, and a missing layer or a dense-instead-of-ranked expert is far
+    outside it.
+    """
+    from torch.utils.flop_counter import FlopCounterMode
+
+    spec = _smoke()
+    assembled = assemble(spec, smoke=True)
+    ids = torch.randint(0, spec.vocab, (spec.batch, spec.seq_len))
+    with FlopCounterMode(display=False) as meter:
+        assembled.model(ids)
+    counted = sum(meter.get_flop_counts()["Global"].values())
+    tokens = spec.batch * spec.seq_len
+    bill = 2 * assembled.model.macs_per_token(spec.seq_len)["total"]
+    assert abs(counted / tokens - bill) / bill < 0.05
 
 
 def test_three_cpu_steps_leave_every_enabled_mechanism_reported() -> None:

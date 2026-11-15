@@ -98,3 +98,17 @@ def low_rank(
     if counters is not None:
         counters.count("tsct_fwd", x.shape[0])
     return y + linear.bias if linear.bias is not None else y
+
+
+def matrix_macs(in_features: int, out_features: int, rank: int) -> int:
+    """Multiplies one token costs through a matrix, as `low_rank` runs it.
+
+    `rank < 1` calls the matrix: `in·out`. Otherwise `factors` truncates to
+    `min(rank, in, out)` and the read is `in·r + r·out` — including the identity
+    basis at `r = min(in, out)`, which is still two matmuls and not the dense one.
+    The `·s` scale is one multiply per output and is not in this count.
+    """
+    if rank < 1:
+        return in_features * out_features
+    r = min(rank, in_features, out_features)
+    return in_features * r + r * out_features

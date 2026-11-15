@@ -196,7 +196,11 @@ def test_plan_json_is_the_panel_numbers(capsys: pytest.CaptureFixture[str]) -> N
     panel = capsys.readouterr().out
     assert f"{data['params']['stored']:,}" in panel
     assert f"{data['params']['active']:,}" in panel
-    assert str(data["plan"]["human"]) in panel
+    assert str(data["time"]["human"]) in panel
+    assert f"{data['compute']['forward_flops_per_token'] / 1e6:.1f}" in panel
+    assert f"{data['compute']['train_flops_per_token'] / 1e6:.1f}" in panel
+    assert f"{data['time']['sustained_tflops']}" in panel
+    assert "assumed" in panel
     assert all(
         f"{name}" in panel and f"{counter}" in panel for name, counter in data["mechanisms"].items()
     )

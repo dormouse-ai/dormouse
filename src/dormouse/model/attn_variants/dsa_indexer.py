@@ -107,6 +107,10 @@ class LightningIndexer(nn.Module):
         """Print the bottleneck, not the matrix."""
         return f"d_model={self.d_model}, d_idx={self.d_idx}, chunk={self.chunk}"
 
+    def macs_per_token(self) -> int:
+        """Return the indexer's multiplies per token: the key projection and one dot."""
+        return self.key.in_features * self.key.out_features + self.d_idx
+
     # ------------------------------------------------------------------ scoring
     def scores(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d]` → one score per cached token, `[batch, seq]`.

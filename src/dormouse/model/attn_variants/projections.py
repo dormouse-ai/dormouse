@@ -120,6 +120,10 @@ class LatentProjections(nn.Module):
             f"n_kv_heads={self.n_kv_heads}, head_dim={self.head_dim}, c_lat={self.c_lat}"
         )
 
+    def macs_per_token(self, _seq_len: int) -> int:
+        """Return the block's multiplies per token, from `bill()` — not a second formula."""
+        return bill(self.d_model, self.n_heads, self.head_dim, self.n_kv_heads, self.c_lat)["macs"]
+
 
 def bill(
     d_model: int,

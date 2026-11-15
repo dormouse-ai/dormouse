@@ -198,7 +198,9 @@ def _plan(args: argparse.Namespace, ui: tui.UI) -> int:
     spec = _spec(args.config)
     with ui.progress(spec.n_layers, f"pricing {args.config} on the meta device") as bar:
         data = plan_data(
-            spec, on_layer=lambda done, total, kind: bar.advance(f"{kind} {done}/{total}")
+            spec,
+            on_layer=lambda done, total, kind: bar.advance(f"{kind} {done}/{total}"),
+            measured_tflops=_measured_tflops(),
         )
     data["config"] = args.config
     if args.json:
@@ -206,6 +208,28 @@ def _plan(args: argparse.Namespace, ui: tui.UI) -> int:
     else:
         ui.plan(data)
     return 0
+
+
+def _measured_tflops(pattern: str = "runs/*/run.jsonl") -> float | None:
+    """Return the newest run's recorded sustained rate, if a journal carries one.
+
+    A step that measures its own rate writes `sustained_tflops` into its record; until
+    one does, this returns None and the plan falls back to the documented profile
+    number, printing which source it used. Reading the journal (not a log) is the
+    project's contract for a number a run produced.
+    """
+    paths = sorted(
+        (Path(found) for found in glob.glob(pattern, recursive=True)),  # noqa: PTH207
+        reverse=True,
+    )
+    for path in paths:
+        if not path.is_file():
+            continue
+        for record in reversed(Journal.open(path).records):
+            rate = record.get("sustained_tflops")
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate > 0:
+                return float(rate)
+    return None
 
 
 def _spec(config: str) -> StackSpec:

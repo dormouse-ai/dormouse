@@ -210,3 +210,7 @@ class Router(nn.Module):
     def extra_repr(self) -> str:
         """Print the routing width and the controller's state."""
         return f"d_model={self.d_model}, n_experts={self.n_experts}, topk={self.topk}, qb={self.qb}"
+
+    def macs_per_token(self) -> int:
+        """Return the router's multiplies per token: one `[E, d]` projection."""
+        return self.n_experts * self.d_model

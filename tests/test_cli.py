@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from dormouse_core.journal import Journal
 
+from dormouse import cli
 from dormouse.cli import PLANNED, main
 
 
@@ -58,6 +59,15 @@ def test_a_planned_command_refuses_with_an_escape(
     err = capsys.readouterr().err
     assert "not wired yet" in err
     assert "Escape" in err
+
+
+def test_measured_rate_comes_from_the_journal(tmp_path: Path) -> None:
+    path = tmp_path / "runs" / "run.jsonl"
+    journal = Journal.open(path)
+    journal.write("start", config="c.toml")
+    journal.write("step", step=1, loss=1.0, sustained_tflops=61.5)
+    assert cli._measured_tflops(str(path)) == 61.5
+    assert cli._measured_tflops(str(tmp_path / "none.jsonl")) is None
 
 
 def test_no_arguments_prints_help(capsys: pytest.CaptureFixture[str]) -> None:

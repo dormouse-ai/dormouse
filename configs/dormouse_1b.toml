@@ -43,4 +43,8 @@ seq_len = 1024
 batch = 24
 
 tokens = 10_000_000_000
-throughput_tflops = 1.0
+
+# The sustained rate is measured, not hoped for. Unset, the plan uses the newest
+# journal's recorded rate, else 47.8 TFLOP/s (52% of the card's bf16 peak, the
+# 2026-11-15 step profile); set it here to override either.
+# sustained_tflops = 47.8

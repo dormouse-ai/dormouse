@@ -71,11 +71,14 @@ COUNTERS (a zero must be a measurement, not a default):
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from .blocks import Billable
 from .ffn import PROJ_STD
 from .ffn_spec import FFNSpec
 from .router import Router
@@ -248,6 +251,11 @@ class MoEFFN(nn.Module):
         if counters is not None:
             counters.count("moe_fwd")
         return y
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the bank's multiplies per token: the active experts and the router."""
+        expert = cast(Billable, self.experts[0]).macs_per_token(seq_len)
+        return (self.topk + self.n_shared) * expert + self.router.macs_per_token()
 
     def _dispatch(
         self,

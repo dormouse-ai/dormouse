@@ -120,7 +120,10 @@ class StackSpec(Config):
 
     # -------------------------------------------------------------------- plan
     tokens: int = 10_000_000_000
-    throughput_tflops: float = 1.0
+    #: A measured sustained rate for this machine, when one is known. Unset means
+    #: "use what the newest journal recorded, else the documented profile default"
+    #: (`assemble.SUSTAINED_TFLOPS`); the plan prints which of the three it used.
+    sustained_tflops: float | None = None
 
     # ------------------------------------------------------------- validation
     def __post_init__(self) -> None:
@@ -194,6 +197,12 @@ class StackSpec(Config):
                 f"objective={self.objective!r}: no loss module computes it",
                 "this stack assembles ntp (train/step.py's chunked cross-entropy); a "
                 "tst or jepa term needs a second loss that no branch ships yet",
+            )
+        if self.sustained_tflops is not None and self.sustained_tflops <= 0.0:
+            raise LoudError(
+                f"sustained_tflops={self.sustained_tflops} is not a rate",
+                "pass a positive measured rate, or leave it unset to use the newest "
+                "journal's, else the 47.8 TFLOP/s profile default",
             )
         if self.act_quant == "int4" and self.torch_compile:
             raise LoudError(
