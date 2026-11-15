@@ -48,6 +48,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC, TESTS = ROOT / "src", ROOT / "tests"
 JOB = TESTS / "dist_job.py"
 TOKENS = ROWS * SEQ
+#: Relative, not absolute. A cross-process reduction reorders the fp32 sums, so two
+#: mathematically identical runs differ at the fp32 epsilon (~1.2e-7 relative). An
+#: absolute 1e-6 fails at loss ~10 on a different BLAS build; a relative bar of 1e-6
+#: is still 10x tighter than the drift it must tolerate, and it cannot hide a real bug
+#: (the per-micro-batch-mean control below drifts by 7.7e-3, four orders larger).
 TOL = 1e-6
 
 
@@ -286,7 +291,8 @@ def test_two_cards_are_one_card(single: Job, pair: Job) -> None:
     assert _worst(pair.weights[0], pair.weights[1]) == 0.0, "DDP let the ranks drift"
     assert _digest(_consumed(pair)) == _digest(_consumed(single))
     for step, (distributed, alone) in enumerate(zip(pair.losses, single.losses, strict=True)):
-        assert abs(distributed - alone) <= TOL, f"step {step}: {distributed} != {alone}"
+        drift = abs(distributed - alone) / max(abs(alone), 1e-6)
+        assert drift <= TOL, f"step {step}: {distributed} != {alone} ({drift:.2e} relative)"
 
 
 def test_per_microbatch_mean_fails_the_equivalence_gate(
@@ -301,7 +307,7 @@ def test_per_microbatch_mean_fails_the_equivalence_gate(
     """
     buggy = run_job(tmp_path_factory.mktemp("buggy"), world=2, bug=True)
     worst = _worst(buggy.weights[0], single.weights[0])
-    assert worst > TOL, "the per-micro-batch mean was not caught: the gate proves nothing"
+    assert worst > 1e-3, "the per-micro-batch mean was not caught: the gate proves nothing"
     assert buggy.losses[0] == pytest.approx(single.losses[0] * ACCUM, rel=1e-5)
 
 
