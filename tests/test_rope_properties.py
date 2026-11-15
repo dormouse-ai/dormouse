@@ -17,7 +17,7 @@ import math
 
 import torch
 
-from dormouse.model.attn import Attention
+from reference_attn import Attention
 
 HEAD_DIM = 8
 BASE = 10_000.0
