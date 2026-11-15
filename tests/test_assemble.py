@@ -24,7 +24,7 @@ import pytest
 import torch
 from dormouse_core.errors import LoudError
 
-from dormouse.model.assemble import assemble, plan_lines
+from dormouse.model.assemble import assemble, plan_data
 from dormouse.model.registry import pieces
 from dormouse.model.spec import StackSpec
 from dormouse.train.optim import MixOptimizer
@@ -109,23 +109,26 @@ def test_the_bank_is_one_module_shared_by_every_layer() -> None:
 
 
 def test_the_plan_names_the_stack_the_bill_and_the_mechanisms() -> None:
-    lines = plan_lines(StackSpec.from_toml(CONFIGS / "dormouse_1b.toml"))
-    text = "\n".join(lines)
-    print("\n" + text)
-    for expected in (
-        "hybrid 3:1 kda:dsa",
-        "kda, kda, kda, dsa",
-        "experts: moa",
-        "tsct rank 256",
-        "kv=2, c_lat=512",
-        "moe→moe_fwd",
-        "moa→moa_fwd",
-        "tsct→tsct_fwd",
-        "ntp→ntp_loss",
-        "attention=",
-        "of the active set",
-    ):
-        assert expected in text, expected
+    data = plan_data(StackSpec.from_toml(CONFIGS / "dormouse_1b.toml"))
+    assert data["stack"]["label"] == "hybrid 3:1 kda:dsa"
+    assert data["stack"]["pattern"] == ["kda", "kda", "kda", "dsa"] * 3
+    assert data["ffn"] == {
+        "kind": "moe",
+        "experts": "moa",
+        "routed": 64,
+        "shared": 1,
+        "topk": 2,
+        "tsct_rank": 256,
+    }
+    assert data["widths"]["n_kv_heads"] == 2
+    assert data["widths"]["c_lat"] == 512
+    assert data["params"]["stored"] > 1e9
+    assert data["params"]["attention"] > 0
+    assert data["mechanisms"]["moe"] == "moe_fwd"
+    assert data["mechanisms"]["moa"] == "moa_fwd"
+    assert data["mechanisms"]["tsct"] == "tsct_fwd"
+    assert data["mechanisms"]["ntp"] == "ntp_loss"
+    assert any("tokenizer" in warning for warning in data["warnings"])
 
 
 def test_three_cpu_steps_leave_every_enabled_mechanism_reported() -> None:
@@ -173,8 +176,9 @@ def test_dorm_plan_is_wired_and_train_is_still_refused(capsys: pytest.CaptureFix
 
     assert main(["plan", str(CONFIGS / "dormouse_1b.toml")]) == 0
     printed = capsys.readouterr().out
-    assert "params: stored=" in printed
-    assert "mechanisms:" in printed
+    # Rendering is the CLI's business (rich or plain); the numbers are the plan's.
+    assert "1,049,546,452" in printed
+    assert "kda_fwd" in printed
     assert main(["train", "configs/dormouse_1b.toml"]) == 2
     assert "not wired yet" in capsys.readouterr().err
 

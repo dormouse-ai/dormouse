@@ -26,11 +26,12 @@ exactly as the one `Block` would have built.
 
 from __future__ import annotations
 
-from typing import cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import torch
 from dormouse_core.counters import Counters
-from dormouse_core.plan import Plan
+from dormouse_core.plan import Phase, Plan
 from torch import nn
 
 from ..train.optim import MixOptimizer
@@ -140,22 +141,31 @@ def assemble(
     *,
     device: torch.device | str | None = None,
     smoke: bool = False,
+    on_layer: Callable[[int, int, str], None] | None = None,
 ) -> Assembled:
-    """Build the stack `spec` names, refusing a contradiction before allocating it."""
+    """Build the stack `spec` names, refusing a contradiction before allocating it.
+
+    `on_layer(done, total, kind)` is called after each block is built so a caller can
+    show a step counter while a 1B stack is priced; it is called after the block, so a
+    dropped counter can never look like a built layer.
+    """
     pieces = registry.pieces(spec)
     write_std = PROJ_STD / (2.0 * spec.n_layers) ** 0.5
     bank = _bank(spec, write_std, device, smoke)
-    blocks = [
-        Block(
-            spec.d_model,
-            spec.d_ffn,
-            n_layers=spec.n_layers,
-            ffn=FlatBank(bank),
-            attn=_attention(spec, kind, write_std, device),
-            device=device,
+    blocks: list[Block] = []
+    for index, kind in enumerate(spec.pattern, start=1):
+        blocks.append(
+            Block(
+                spec.d_model,
+                spec.d_ffn,
+                n_layers=spec.n_layers,
+                ffn=FlatBank(bank),
+                attn=_attention(spec, kind, write_std, device),
+                device=device,
+            )
         )
-        for kind in spec.pattern
-    ]
+        if on_layer is not None:
+            on_layer(index, len(spec.pattern), kind)
     model = Transformer(
         vocab=spec.vocab,
         d_model=spec.d_model,
@@ -237,40 +247,25 @@ def _quantize(model: Transformer, spec: StackSpec) -> None:
     model.blocks = nn.ModuleList(wrapped)
 
 
-def plan_lines(spec: StackSpec) -> list[str]:
-    """Everything `dorm plan` prints: the stack, the bill, the step, the mechanisms.
+def plan_data(
+    spec: StackSpec,
+    on_layer: Callable[[int, int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Everything `dorm plan` knows, as data: the stack, the bill, the step, the mechanisms.
 
     The model is built on the `meta` device, so the numbers are measured from the
     modules that would be allocated rather than from a formula that can drift — and
-    `dorm plan` on a 1B stack costs no memory.
+    `dorm plan` on a 1B stack costs no memory. This returns numbers, never prose: the
+    CLI renders it for a terminal and `--json` prints it unchanged, so the two views
+    cannot disagree.
     """
-    assembled = assemble(spec, device="meta")
+    assembled = assemble(spec, device="meta", on_layer=on_layer)
     report = assembled.report()
-    steps = max(spec.tokens // (spec.batch * spec.seq_len), 1)
     tokens_per_step = spec.batch * spec.seq_len
+    steps = max(spec.tokens // tokens_per_step, 1)
     seconds = steps * 6 * report["active"] * tokens_per_step / (spec.throughput_tflops * 1e12)
     bits = 0.25 if spec.weight_qat == "ternary" else 4.0
     attention_share = report["attention"] / report["active"] if report["active"] else 0.0
-
-    lines = [
-        f"stack: {'hybrid 3:1 kda:dsa' if spec.attn == 'hybrid' else spec.attn}"
-        f" (layers: {', '.join(spec.pattern)}), pos=none, unit={spec.unit}",
-        f"ffn: moe (experts: {spec.expert_arm}, {spec.n_experts} routed, topk "
-        f"{spec.topk}, tsct rank {spec.expert_tsct_rank})"
-        + f", optimizer={spec.optimizer}, objective={spec.objective}"
-        + f", weight_qat={spec.weight_qat}, act_quant={spec.act_quant}",
-        f"widths: d_model={spec.d_model} x {spec.n_layers} layers, "
-        f"d_ffn={spec.d_ffn}, heads={spec.n_heads}x{spec.head_dim} "
-        f"(kv={spec.n_kv_heads}, c_lat={spec.c_lat}), seq={spec.seq_len}",
-        f"params: stored={report['stored']:,} active={report['active']:,} "
-        f"(ffn active={report['active_ffn']:,}, {report['active'] / report['stored']:.1%} "
-        f"of stored), ffn={report['ffn']:,} attention={report['attention']:,} "
-        f"({attention_share:.1%} of the active set)",
-        f"step: {tokens_per_step:,} tokens/step, {steps:,} steps for {spec.tokens:,} tokens; "
-        f"flops/step={6 * report['active'] * tokens_per_step:,}",
-        f"bytes/step: state={STATE_BYTES * report['stored']:,} (weights+grad+2 moments), "
-        f"checkpoint={int(bits * report['stored']):,}",
-    ]
     plan = Plan().add(
         "train",
         seconds,
@@ -282,9 +277,73 @@ def plan_lines(spec: StackSpec) -> list[str]:
         f"the bank is shared by {spec.n_layers} layers: stored is "
         f"{report['stored']:,}, not {spec.n_layers} banks"
     )
-    lines.extend(plan.render())
-    lines.append(
-        "mechanisms: "
-        + ", ".join(dict.fromkeys(f"{p.mechanism}→{p.counter}" for p in assembled.pieces))
-    )
-    return lines
+    return {
+        "stack": {
+            "attn": spec.attn,
+            "label": "hybrid 3:1 kda:dsa" if spec.attn == "hybrid" else spec.attn,
+            "pattern": list(spec.pattern),
+            "pos": "none",
+            "unit": spec.unit,
+        },
+        "ffn": {
+            "kind": "moe" if spec.is_moe else "gelu",
+            "experts": spec.expert_arm,
+            "routed": spec.n_experts,
+            "shared": spec.n_shared,
+            "topk": spec.topk,
+            "tsct_rank": spec.expert_tsct_rank,
+        },
+        "slots": {
+            "optimizer": spec.optimizer,
+            "objective": spec.objective,
+            "weight_qat": spec.weight_qat,
+            "act_quant": spec.act_quant,
+        },
+        "widths": {
+            "d_model": spec.d_model,
+            "n_layers": spec.n_layers,
+            "d_ffn": spec.d_ffn,
+            "n_heads": spec.n_heads,
+            "head_dim": spec.head_dim,
+            "n_kv_heads": spec.n_kv_heads,
+            "c_lat": spec.c_lat,
+            "seq_len": spec.seq_len,
+            "batch": spec.batch,
+        },
+        "params": {
+            "stored": report["stored"],
+            "active": report["active"],
+            "active_ffn": report["active_ffn"],
+            "ffn": report["ffn"],
+            "attention": report["attention"],
+            "attention_share": attention_share,
+            "active_share": report["active"] / report["stored"] if report["stored"] else 0.0,
+        },
+        "step": {
+            "tokens": spec.tokens,
+            "tokens_per_step": tokens_per_step,
+            "steps": steps,
+            "flops_per_step": 6 * report["active"] * tokens_per_step,
+            "flops_per_token": 6 * report["active"],
+        },
+        "bytes": {
+            "state": STATE_BYTES * report["stored"],
+            "checkpoint": int(bits * report["stored"]),
+        },
+        "plan": {
+            "total_seconds": plan.seconds,
+            "human": Phase("", plan.seconds).human(),
+            "throughput_tflops": spec.throughput_tflops,
+            "phases": [
+                {
+                    "name": phase.name,
+                    "seconds": phase.seconds,
+                    "human": phase.human(),
+                    "note": phase.note,
+                }
+                for phase in plan.phases
+            ],
+        },
+        "mechanisms": assembled.mechanisms(),
+        "warnings": list(plan.warnings),
+    }

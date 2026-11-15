@@ -17,7 +17,7 @@ from dormouse.cli import PLANNED, main
 
 
 def test_doctor_reports_what_the_machine_has(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["doctor"]) == 0
+    assert main(["doctor", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert "python" in report and "disk_free_gb" in report
     assert isinstance(report["disk_free_gb"], float)
@@ -30,7 +30,17 @@ def test_status_reads_a_journal(tmp_path: Path, capsys: pytest.CaptureFixture[st
     j.write("step", step=7)
     assert main(["status", str(path)]) == 0
     out = capsys.readouterr().out
-    assert "running step=7" in out
+    assert "running" in out
+    assert "7" in out
+
+
+def test_status_accepts_an_absolute_glob(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "a3f2" / "run.jsonl"
+    Journal.open(path).write("step", step=7)
+    assert main(["status", str(tmp_path / "*" / "run.jsonl")]) == 0
+    assert "a3f2" in capsys.readouterr().out
 
 
 def test_status_with_nothing_to_read_names_the_escape(

@@ -26,7 +26,7 @@ The literals that remain, and the refusal each one carries:
   use, which is the refusal that makes this a value.
 
 Widths live here too because a plan has to price them without allocating: the same
-object answers "what will this cost" (`assemble.plan_lines`) and "what will this
+object answers "what will this cost" (`assemble.plan_data`) and "what will this
 build" (`assemble.assemble`).
 """
 
