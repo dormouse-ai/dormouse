@@ -1,278 +1,80 @@
-"""Muon on matrices, AdamW on everything that is not a matrix, one router.
+"""The router: which parameter obeys which update rule, and the two arms as one.
 
-Two update rules, and the router that decides which parameter is under which. The
-formulas, as implemented:
-
-    MUON (Jordan 2024, arXiv:2409.16986 §3; Keller Jordan's reference `muon`)
-        m_t = μ·m_{t-1} + (1-μ)·g_t
-        Q_t = polar(m_t)                    # Newton-Schulz, 5 iterations
-        R_t = ColRow(Q_t)                   # columns to unit norm, then rows
-        W_t = W_{t-1}·(1 - η·λ) - η·max(1, m/n)^½·R_t
-
-    ADAMW (Loshchilov & Hutter 2019, arXiv:1711.05101 Alg. 2, decoupled decay)
-        m_t = β₁·m_{t-1} + (1-β₁)·g_t
-        v_t = β₂·v_{t-1} + (1-β₂)·g_t²
-        m̂_t = m_t/(1-β₁^t),  v̂_t = v_t/(1-β₂^t)
-        W_t = W_{t-1}·(1 - η·λ) - η·m̂_t/(√v̂_t + ε)
-
-§1. WHY THE 5TH-ORDER POLAR ITERATION AND NOT MUON'S `(3.4445, -4.7750, 2.0315)`.
-The Jordan triple is a *minimax* polynomial for the interval the Muon reference
-normalises into, and it is not the polar factor: `x ↦ 3.4445x - 4.775x³ + 2.0315x⁵`
-has no stable fixed point at 1. Measured here on a seeded `[64, 64]`, Frobenius-
-normalised as the reference does: singular values in `[0.68, 1.13]` and
-`‖QQᵀ - I‖∞ = 3.2e-1` — a direction, not an orthogonalisation, and the anchor this
-module is accepted against is 1e-5. So the chain is the 5th-order Newton–Schulz
-`p(x) = x(15 - 10x² + 3x⁴)/8` (Bernstein & Newhouse; Higham 1986; the triple Muon+'s
-`col_row` arm and `burn-spectral`'s retraction use), whose fixed point at 1 is
-superattracting: an error of ε becomes ≈ε³, so five iterations cross from 0.1 to 1e-9.
-
-§2. WHY A POWER-ITERATION PRESCALE AND NOT `X/‖X‖_F`. The quintic is stable on
-`(0, 1.53)`, and the reference's Frobenius normalisation puts the *mean* singular value
-at `1/√min(m,n)` — 0.125 at 64×64, six iterations from 1 — while at square shapes it
-puts σ_max at 2.0, outside the interval, where the chain diverges. It needs σ_max
-*inside* the basin, so `spectral_bound` estimates it: worst ratio 0.914, so ≤ 1.09.
-
-§3. WHAT FIVE ITERATIONS CANNOT DO, with the number, because the 1e-5 anchor is not a
-promise. The chain lifts singular values up to 1 and cannot rescue a σ_min far below
-it: a random 832×832 gaussian has σ_min/σ_max ≈ 0.006 and ends at `‖QQᵀ - I‖∞ ≈ 0.09`,
-while the live rectangles (`[64, 832]`, `[832, 2048]`, `[2048, 832]`) end at ≈4e-7
-because their spectra are conditioned to 0.2–0.6. The tests pin both facts.
-
-§4. WHY ColRow IS HERE AT ALL. `Q_t` is orthogonal, so `‖Q_t‖_F = √min(m,n)` varies
-with shape; ColRow makes every row unit-norm, so `‖R_t‖_F = √m` exactly and the step's
-magnitude is a function of the parameter's shape, not its spectrum — which is what lets
-one learning rate serve a `[64, 832]` and a `[2048, 832]`. Measured on the old stack at
-−0.0428 BPB against per-slice Frobenius normalisation.
-
-§5. THE PER-HEAD ARM, AND ITS ONE HONEST PROPERTY. Kimi K3 §2.5 and DeepSeek V4.1
-apply the preconditioner per head to Q and K. Splitting a `[3d, d]` packed qkv weight
-into `2·n_heads` slices of `[head_dim, d]` and running the chain on each changes the
-*direction* (the Gram is `[head_dim, head_dim]` instead of `[d, d]`) and, because
-ColRow is applied per slice, leaves `‖R_t‖_F = √(3d)` — exactly what the whole-matrix
-path gives. So it is a direction change at fixed step magnitude, which is why it needs
-no learning-rate retune. V and the output projection stay whole: neither reference
-splits them, and a per-head split of `proj` is a column split, a different mechanism.
-
-The compressed layers have no packed matrix: their Q is written by `q_up`
-`[n_heads·head_dim, c_lat]` and their K/V by `kv_up` `[2·n_kv_heads·head_dim, c_lat]`.
-`q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
-remainder — whole, so the arm is the same one applied to the same tensors, and the
-router reads it off the modules rather than off a shape heuristic.
+Two update rules live in `muon.py` (matrices) and `adamw.py` (everything else);
+`sf.py` is the third mode, the same two rules wrapped in an iterate average. This
+module decides which parameter is under which, refuses a shape neither rule claims, and
+presents the pair as one object: `step`, `zero_grad`, `set_lr`, `state_dict`.
 
 §6. ROUTING. A parameter goes to Muon iff it is a 2-D matrix that is not the token
 table; to AdamW iff it is 1-D (norms' gains, mixture coefficients, biases) or the token
 table. Anything else — a 3-D table, a convolution — routes to neither, and that is a
 refusal, not a default: a fallback is how a table is trained by the wrong rule for
 3000 steps and nobody sees it.
+
+§7. THE THREE SCHEDULES, AND WHAT EACH ONE IS. `cosine` and `wsd` differ only in the
+closed form the loop writes through `set_lr` (`schedule.py`); the arms do not know what
+step it is, so a run that stops at `total` and a run that continues use the same code.
+`sf` builds `sf.py`'s schedule-free pair instead, and then `set_lr` is a **refusal**: the
+SF arms compute their own rate from their own counter, and a schedule written on top of
+that applies the decay twice — once inside the average's weight and once on the step.
+`sizes` and the counter names `step.py` reports are the same in all three, because the
+routing is.
+
+§8. THE SWAP, IN ONE PLACE. Under `sf` the parameters hold `Y_t` and the model worth
+evaluating is `X_t`, so an eval that forgets to swap reports a loss for a model that is
+not the one being trained — silently, because the discrepancy starts at zero. So the
+context manager is here, one call for all three modes, and it owns both halves: the
+weights and `model.train()`/`eval()`. `with optimizer.eval_weights():` is the whole
+contract; under `cosine` and `wsd` it only flips the module's mode.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any
 
 import torch
 from dormouse_core.errors import LoudError
 from torch import nn
-from torch.optim import Optimizer
 
-__concepts__ = ("AdamW", "MixOptimizer", "Muon")
+from .adamw import ADAMW_LR, AdamW
+from .muon import (
+    COLROW_EPS,
+    MUON_LR,
+    NS_COEFFS,
+    NS_EPS,
+    NS_POWER_ITERS,
+    NS_STEPS,
+    Muon,
+    colrow,
+    muon_direction,
+    polar,
+    spectral_bound,
+)
+from .sf import SF_LR, SF_WEIGHT_DECAY, SFAdamW, SFNorMuon
 
-#: Newton–Schulz iterations; five is what the architecture decision fixes, and §3
-#: states what five reaches.
-NS_STEPS = 5
+__all__ = [
+    "COLROW_EPS",
+    "MUON_LR",
+    "NS_COEFFS",
+    "NS_EPS",
+    "NS_POWER_ITERS",
+    "NS_STEPS",
+    "AdamW",
+    "MixOptimizer",
+    "Muon",
+    "colrow",
+    "muon_direction",
+    "polar",
+    "route",
+    "route_all",
+    "spectral_bound",
+]
 
-#: `p(x) = x(15 - 10x² + 3x⁴)/8`, the 5th-order polar iteration, as `(a, b, c)` in
-#: `p(x) = ax + bx³ + cx⁵`. §1 says why it is not the Jordan triple.
-NS_COEFFS = (1.875, -1.25, 0.375)
-
-#: Power iterations used to place σ_max inside the polynomial's stable interval (§2).
-NS_POWER_ITERS = 3
-
-#: Floor inside the two ColRow divisions; `norm + eps` never divides by a zero row.
-COLROW_EPS = 1e-7
-
-#: Floor under the spectral prescale. A parameter whose gradient is exactly zero (a
-#: saturated gain, a zero-initialised coefficient) has σ_max = 0, and `x/0` is not a
-#: direction; with the floor the chain returns zero and the step is a no-op.
-NS_EPS = 1e-7
-
-#: Muon's rate for the live 275M recipe. Shipped as a default, not a verdict.
-MUON_LR = 0.02
-
-#: AdamW's rate on the embedding table and the norms (the recipe's `×0.15`).
-ADAMW_LR = 3e-3
-
-
-def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """`mm` for one matrix, `bmm` for a `[N, m, n]` batch — the same kernel each."""
-    return torch.bmm(x, y) if x.ndim == 3 else torch.mm(x, y)
-
-
-def spectral_bound(x: torch.Tensor, iters: int = NS_POWER_ITERS) -> torch.Tensor:
-    """Return a lower bound on `σ_max`, by `iters` power iterations on the Gram.
-
-    The floor inside the estimate is the dtype's `tiny`, never `1e-7`: `‖Gv‖` for a real
-    momentum is ~1e-8, and an absolute floor at 1e-7 does not guard the division — it
-    *rescales the iteration*, which measured a 1000× under-estimate on a qkv slice and
-    ran the quintic to `inf`.
-
-    Started from the **row of largest norm**, not a constant vector, which can be
-    nearly orthogonal to the top right-singular vector. On that slice the constant
-    start recovered 0.604 of σ_max after five iterations — enough to leave the quintic's
-    basin — where the max-row start recovered 0.999 after three. Worst ratio over ten
-    tensors of the shapes this model has: 0.914, so `σ_max ≤ 1.09`, inside §2's basin.
-    """
-    rows = x.norm(dim=-1).argmax(dim=-1)
-    index = rows[..., None, None].expand(*rows.shape, 1, x.shape[-1])
-    v = torch.gather(x, -2, index).transpose(-2, -1)
-    floor = torch.finfo(x.dtype).tiny
-    v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
-    for _ in range(iters):
-        v = _matmul(x.transpose(-2, -1), _matmul(x, v))
-        v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
-    bound: torch.Tensor = _matmul(x, v).norm(dim=(-2, -1), keepdim=True)
-    return bound
-
-
-def polar(x: torch.Tensor, steps: int = NS_STEPS) -> torch.Tensor:
-    """Return the orthogonal factor of `x` for `[m, n]` or a batch `[N, m, n]`.
-
-    Runs on the **short side**: a tall matrix is transposed first, so the Gram is
-    `[min, min]` and a `[128, 832]` costs a `128×128` product per iteration. Exact
-    orthogonality holds to the conditioning of `x` — §3 states the ceiling.
-    """
-    if x.ndim not in (2, 3):
-        raise LoudError(
-            f"polar takes a matrix or a batch of matrices, got shape {tuple(x.shape)}",
-            "a 3-D optimizer state is a batch: view it as [N, m, n] before the chain",
-        )
-    a, b, c = NS_COEFFS
-    work = x.to(torch.float32)
-    work = work / spectral_bound(work).clamp_min(NS_EPS)
-    transposed = work.shape[-2] > work.shape[-1]
-    if transposed:
-        work = work.transpose(-2, -1)
-    for _ in range(steps):
-        gram = _matmul(work, work.transpose(-2, -1))
-        work = a * work + _matmul(b * gram + c * _matmul(gram, gram), work)
-    if transposed:
-        work = work.transpose(-2, -1)
-    return work.contiguous()
-
-
-def colrow(x: torch.Tensor, eps: float = COLROW_EPS) -> torch.Tensor:
-    """Scale columns to unit norm, then rows — in place, per slice if batched.
-
-    `ColRow` from Muon+ (§4): the output has every row at unit norm, so
-    `‖ColRow(z)‖_F = √rows` whatever the input.
-    """
-    if x.ndim == 3:
-        x.div_(x.norm(dim=-2, keepdim=True) + eps)
-        return x.div_(x.norm(dim=-1, keepdim=True) + eps)
-    x.div_(x.norm(dim=0, keepdim=True) + eps)
-    return x.div_(x.norm(dim=1, keepdim=True) + eps)
-
-
-def muon_direction(
-    momentum: torch.Tensor,
-    *,
-    head_split: tuple[int, int] | None = None,
-    steps: int = NS_STEPS,
-) -> torch.Tensor:
-    """`ColRow(polar(momentum))`, per head when the parameter is a packed qkv weight.
-
-    `head_split=(groups, rows)` means the first `rows` rows are `groups` equal
-    per-head slices and the rest is one matrix: Q and K of a packed `[3d, d]`
-    projection, with V as the remainder (§5).
-    """
-    if head_split is None:
-        return colrow(polar(momentum, steps))
-    groups, rows = head_split
-    if rows % groups or rows > momentum.shape[0] or momentum.ndim != 2:
-        raise LoudError(
-            f"head_split=(groups={groups}, rows={rows}) does not cut a "
-            f"{tuple(momentum.shape)} parameter into equal slices",
-            "pass (2·n_heads, 2·d_model) for a [3d, d] packed qkv weight",
-        )
-    lead = momentum[:rows].view(groups, rows // groups, momentum.shape[1])
-    headwise = colrow(polar(lead, steps)).view(rows, -1)
-    rest = momentum[rows:]
-    if rest.shape[0] == 0:
-        #: Every row is a head (`q_up`): there is no remainder to run whole.
-        return headwise
-    return torch.cat((headwise, colrow(polar(rest, steps))), dim=0)
-
-
-class Muon(Optimizer):
-    """Momentum, then the polar factor, then ColRow, then one step of `η·√(m/n)`."""
-
-    def __init__(
-        self,
-        params: Any,
-        *,
-        lr: float = MUON_LR,
-        momentum: float = 0.95,
-        steps: int = NS_STEPS,
-        weight_decay: float = 0.0,
-    ) -> None:
-        """Bind the four numbers every group inherits unless it overrides them."""
-        if not 0.0 <= momentum < 1.0:
-            raise LoudError(
-                f"muon momentum={momentum} is not in [0, 1)",
-                "0.95 is the reference's; 1.0 never forgets the first gradient",
-            )
-        if steps < 1:
-            raise LoudError(
-                f"muon ns steps={steps} runs no iteration",
-                "5 is the recipe's, and §3 of the module docstring prices fewer",
-            )
-        super().__init__(
-            params,
-            {"lr": lr, "momentum": momentum, "steps": steps, "weight_decay": weight_decay},
-        )
-
-    @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
-        """Advance every parameter that carries a gradient; return the closure's loss."""
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for group in self.param_groups:
-            momentum = group["momentum"]
-            steps = group["steps"]
-            lr = group["lr"]
-            decay = group["weight_decay"]
-            head_split = group.get("head_split")
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                state = self.state[param]
-                if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(param)
-                buffer = state["momentum"]
-                buffer.mul_(momentum).add_(param.grad, alpha=1.0 - momentum)
-                direction = muon_direction(buffer, head_split=head_split, steps=steps)
-                if decay:
-                    param.mul_(1.0 - lr * decay)
-                rows, cols = param.shape
-                param.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
-        return loss
-
-
-class AdamW(torch.optim.AdamW):
-    """AdamW with §-6's formula in this docstring and one knob for the schedule.
-
-    Torch's implementation is the formula: decoupled decay, bias-corrected moments.
-    Its first step with `λ=0` is `-η·g/(|g|+ε)`, i.e. `η·sign(g)` to within ε, and
-    `tests/test_optim.py` pins that as the anchor.
-    """
-
-    def set_lr(self, lr: float) -> None:
-        """Set one rate on every group, which is what a schedule produces."""
-        for group in self.param_groups:
-            group["lr"] = lr
+#: The three modes §7 names. `cosine` is the default and the current recipe.
+SCHEDULES: tuple[str, ...] = ("cosine", "wsd", "sf")
 
 
 class MixOptimizer:
@@ -282,18 +84,46 @@ class MixOptimizer:
         self,
         model: nn.Module,
         *,
-        lr_muon: float = MUON_LR,
-        lr_adamw: float = ADAMW_LR,
+        schedule: str = "cosine",
+        lr_muon: float | None = None,
+        lr_adamw: float | None = None,
         momentum: float = 0.95,
         steps: int = NS_STEPS,
         betas: tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.1,
         muon_weight_decay: float = 0.0,
         eps: float = 1e-8,
+        sf_beta: float = 0.9,
+        sf_warmup: int = 0,
+        sf_weight_decay: float = SF_WEIGHT_DECAY,
+        sf_final_decay_frac: float = 0.05,
     ) -> None:
-        """Route `model`'s parameters, then build the two optimizers that own them."""
+        """Route `model`'s parameters, then build the arm pair `schedule` names.
+
+        Under `cosine`/`wsd` a rate of `None` keeps the recipe's `muon_lr=0.02` and
+        `lr_adamw=0.003`; under `sf` it keeps the paper's single `η = 0.01` for both,
+        because a schedule-free run at the scheduled rate is 6× the tuned one and
+        reports the divergence as a property of the method.
+        """
+        if schedule not in SCHEDULES:
+            raise LoudError(
+                f"schedule={schedule!r} is not a mode this stack has",
+                f"use one of: {', '.join(SCHEDULES)}",
+            )
+        self.schedule = schedule
+        self.model = model
         self.table = route_all(model)
-        self.base_lr = (lr_muon, lr_adamw)
+        schedule_free = schedule == "sf"
+        #: A rate of `None` is the mode's default: the recipe's per-arm pair, or the
+        #: paper's single η for a schedule-free run (both arms, §7).
+        self.base_lr = (
+            (_sf_lr(lr_muon), _sf_lr(lr_adamw))
+            if schedule_free
+            else (
+                MUON_LR if lr_muon is None else lr_muon,
+                ADAMW_LR if lr_adamw is None else lr_adamw,
+            )
+        )
         matmuls = [(name, p) for name, p in model.named_parameters() if self.table[name] == "muon"]
         vectors = [(name, p) for name, p in model.named_parameters() if self.table[name] == "adamw"]
         if not matmuls:
@@ -310,6 +140,27 @@ class MixOptimizer:
                     break
             else:
                 groups.append({"params": [param], "head_split": split})
+        lr_muon, lr_adamw = self.base_lr
+        if schedule_free:
+            self.muon: Muon | SFNorMuon = SFNorMuon(
+                groups,
+                lr=lr_muon,
+                betas=(sf_beta, betas[1]),
+                weight_decay=sf_weight_decay,
+                steps=steps,
+                warmup=sf_warmup,
+                final_decay_frac=sf_final_decay_frac,
+            )
+            self.adamw: AdamW | SFAdamW = SFAdamW(
+                [p for _, p in vectors],
+                lr=lr_adamw,
+                betas=(sf_beta, betas[1]),
+                eps=eps,
+                weight_decay=sf_weight_decay,
+                warmup=sf_warmup,
+                final_decay_frac=sf_final_decay_frac,
+            )
+            return
         self.muon = Muon(
             groups,
             lr=lr_muon,
@@ -339,8 +190,21 @@ class MixOptimizer:
         self.muon.step()
         self.adamw.step()
 
+    @property
+    def _schedule_free(self) -> tuple[SFNorMuon, SFAdamW] | None:
+        """The two SF arms, or None when this is a scheduled optimizer (§8)."""
+        if isinstance(self.muon, SFNorMuon) and isinstance(self.adamw, SFAdamW):
+            return self.muon, self.adamw
+        return None
+
     def set_lr(self, fraction: float) -> None:
         """Scale both peak rates by the schedule's `fraction` (1.0 is the peak)."""
+        if isinstance(self.muon, SFNorMuon) or isinstance(self.adamw, SFAdamW):
+            raise LoudError(
+                f"set_lr({fraction}) on a schedule-free optimizer",
+                "the sf arms derive their rate from their own counter; a schedule on "
+                "top of them applies the decay twice — anneal with begin_final_decay()",
+            )
         if fraction < 0.0:
             raise LoudError(
                 f"learning-rate fraction={fraction} is negative",
@@ -350,22 +214,70 @@ class MixOptimizer:
             group["lr"] = self.base_lr[0] * fraction
         self.adamw.set_lr(self.base_lr[1] * fraction)
 
+    def begin_final_decay(self, total: int) -> None:
+        """Anneals the last `sf_final_decay_frac` of a `total`-step run to zero (§7).
+
+        The only call in this class that knows a horizon, and the reason a corpus can
+        grow: not calling it leaves the rate flat, and calling it later only changes
+        which steps are the last ones.
+        """
+        if not isinstance(self.muon, SFNorMuon) or not isinstance(self.adamw, SFAdamW):
+            raise LoudError(
+                "begin_final_decay() on a scheduled optimizer",
+                "cosine and wsd anneal through their own closed form; only sf needs this",
+            )
+        self.muon.begin_final_decay(total)
+        self.adamw.begin_final_decay(total)
+
+    @contextmanager
+    def eval_weights(self) -> Iterator[None]:
+        """Evaluate at the model that is being trained, then put the run back (§8)."""
+        training = self.model.training
+        arms = self._schedule_free
+        self.model.eval()
+        if arms is not None:
+            arms[0].eval_weights()
+            arms[1].eval_weights()
+        try:
+            yield
+        finally:
+            if arms is not None:
+                arms[0].train_weights()
+                arms[1].train_weights()
+            self.model.train(training)
+
     def state_dict(self) -> dict[str, Any]:
         """Both arms' state, keyed by arm, as a snapshot rather than a view.
 
         `torch.optim`'s `load_state_dict` copies the dict shallowly, so a state dict
         holding the live momentum buffers would be mutated by the run it resumed
-        from — two optimizers sharing one momentum, and a resume that diverges.
+        from — two optimizers sharing one momentum, and a resume that diverges. The
+        mode is part of the snapshot: an `sf` checkpoint has three buffers per
+        parameter where a cosine one has one, and loading one as the other would
+        silently restore nothing.
         """
         return {
+            "schedule": self.schedule,
             "muon": deepcopy(self.muon.state_dict()),
             "adamw": deepcopy(self.adamw.state_dict()),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore both arms from `state_dict`'s layout."""
+        """Restore both arms from `state_dict`'s layout, refusing a mode mismatch."""
+        if state["schedule"] != self.schedule:
+            raise LoudError(
+                f"this optimizer is schedule={self.schedule!r} and the checkpoint is "
+                f"{state['schedule']!r}",
+                "resume with the mode that wrote the checkpoint, or start a new run: "
+                "the sf arms hold z, m and v where the scheduled ones hold momentum",
+            )
         self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
+
+
+def _sf_lr(lr: float | None) -> float:
+    """Return the SF base rate: the caller's, or the paper's single η for both arms."""
+    return SF_LR if lr is None else lr
 
 
 def route_all(model: nn.Module) -> dict[str, str]:
@@ -399,7 +311,7 @@ def route(name: str, param: torch.Tensor) -> str:
 
 
 def _head_split(model: nn.Module, name: str, param: torch.Tensor) -> tuple[int, int] | None:
-    """Return `(groups, rows)` for a per-head projection, or None when it is whole (§5).
+    """Return `(groups, rows)` for a per-head projection, or None when it is whole.
 
     Three names carry heads in this stack: the packed `qkv` of an uncompressed layer
     (`2·n_heads` slices of Q and K, V as the remainder), the latent `q_up` (every row
