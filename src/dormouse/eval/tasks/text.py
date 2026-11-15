@@ -15,12 +15,8 @@ from __future__ import annotations
 
 import random
 
+from ...data.tokenizer import END, format_turn, role_marker
 from .base import Example, Task
-
-#: The chat format this project's SFT uses. Kept here, in one place, so the prompt
-#: and the stop sequence cannot drift apart.
-END = "<|end|>"
-ROLES = ("system", "user", "assistant")
 
 #: No `l`, `o`, `0` or `1`: a transcription error in the prompt is visible.
 ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
@@ -153,16 +149,11 @@ def needle(seed: int, n: int = 3, *, context_words: int = 4000) -> Task:
     )
 
 
-def _turn(role: str, text: str) -> str:
-    """One message in the chat format, closed by the marker generation must stop at."""
-    return f"<|{role}|>{text}{END}"
-
-
 def _stops_at_end(example: Example, output: str) -> bool:
     """Return whether the answer is exact and nothing follows the end marker.
 
-    A model that emits `answer<|end|>and then rambled` is scored failed, which is
-    the check the old project never had. Text after the marker is the ramble.
+    A model that answers, emits the end marker and keeps talking is scored failed, which
+    is the check the old project never had. Text after the marker is the ramble.
     """
     answer, _, rest = output.partition(END)
     return not rest.strip() and answer.strip() == example.expected
@@ -181,9 +172,9 @@ def format_following(seed: int, n: int = 6) -> Task:
     examples: list[Example] = []
     for answer in answers[:n]:
         prompt = (
-            _turn("system", "Answer with a single word and stop.")
-            + _turn("user", f"Reply with exactly: {answer}")
-            + "<|assistant|>"
+            format_turn("system", "Answer with a single word and stop.")
+            + format_turn("user", f"Reply with exactly: {answer}")
+            + role_marker("assistant")
         )
         examples.append(Example(prompt, answer))
     return Task(
