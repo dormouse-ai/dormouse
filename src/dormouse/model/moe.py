@@ -1,25 +1,25 @@
 """The MoE FFN: 64 routed MoA experts plus one always-on shared expert.
 
-THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert):
+THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert, each
+stored as its rank-256 factors `d·r + r·f`):
 
-    per expert      3·832·6144            =  15 335 424
-    routed stored   64 · per              = 981 467 136
-    shared stored   1 · per               =  15 335 424
+    per expert      3·(832·256 + 256·6144) =   5 357 568
+    routed stored   64 · per               = 342 884 352
+    shared stored   1 · per                =   5 357 568
     router          64 · 832               =      53 248
-    stored total                          = 996 855 808   (~1B)
-    active (top-2 + shared)               = 46 059 520    (~46M)
+    stored total                           = 348 295 168
+    active (top-2 + shared)                =  16 072 704
 
-`3·d·f` is the gated SwiGLU's own bill: (gate, up, down), no bias, so an expert
-IS an FFN arm (`GatedFFN` or, as the one architecture names it, `MoaFFN` over the
+`3·(d·r + r·f)` is the gated SwiGLU's bill at rank `r`: (gate, up, down), no bias, so an
+expert IS an FFN arm (`GatedFFN` or, as the one architecture names it, `MoaFFN` over the
 six-entry dictionary) and the bank reuses that class instead of re-implementing the
-formula. The expert's `expert_tsct_rank` is a COMPUTE path (`tsct.py`): the three
-matrices are read through their rank-`r` spectrum in the forward while the masters
-stay the dense `3·d·f`, so the stored and active bills below are unchanged and only
-the multiplies drop. One number in the brief does not survive the arithmetic: `3·832·6144`
-is 15.34M, not 15.7M — at this width an expert would need `f=6291` to bill 15.7M,
-and the brief itself fixes `f=6144`. The refused configuration is the one that
-would make an expert a rounding error: below 10M parameters, or below 1% of the
-active set (`topk + n_shared > 100`), and both refusals name the escape.
+formula. The dense bill it replaces is `3·d·f = 15 335 424` per expert; `rank=0` builds
+that arm (`tsct.project`), it is the control, and `param_report` bills whichever one was
+built. One number in the brief does not survive the arithmetic: the dense `3·832·6144`
+is 15.34M, not 15.7M — at this width an expert would need `f=6291` to bill 15.7M, and the
+brief itself fixes `f=6144`. The refused configuration is the one that would make an
+expert a rounding error: below 10M dense parameters, or below 1% of the active set
+(`topk + n_shared > 100`), and both refusals name the escape.
 
 DROPLESS, SO THERE IS NOTHING FOR A CAPACITY TO PAD. The old arm multiplied a
 fixed capacity of `2.0` into the per-expert bank; at b24 it executed 2.52x the
@@ -82,17 +82,22 @@ from .router import Router
 from .tsct import TSCT_RANK
 
 #: An expert below this is not an expert at this project's scale; see the
-#: module docstring for why 10M and the live config that satisfies it.
+#: module docstring for why 10M and the live config that satisfies it. Measured against
+#: the DENSE bill `3·d·f` even when the expert is factorised: TSCT changes what an
+#: expert stores, not the width the design chose, so a rank-256 expert storing 5.36M is
+#: still the 15.34M expert the architecture is priced at.
 MIN_EXPERT_PARAMS = 10_000_000
 
 #: An expert must be at least this share of the active set. The design's
-#: headline pair is 15.34M stored against 46.06M active: 33% per expert, not 1%.
+#: headline pair is 5.36M stored against 16.07M active: 33% per expert, not 1%.
 MIN_EXPERT_SHARE = 0.01
 
 
-def expert_parameters(d_model: int, d_ffn: int) -> int:
-    """`3·d·f` — the gated SwiGLU's bill: gate, up and down, no bias."""
-    return 3 * d_model * d_ffn
+def expert_parameters(d_model: int, d_ffn: int, rank: int = 0) -> int:
+    """Return the expert's stored bill: `3·d·f` dense, `3·(d·r + r·f)` factorised."""
+    if rank < 1:
+        return 3 * d_model * d_ffn
+    return 3 * rank * (d_model + d_ffn)
 
 
 def bank_bill(
@@ -102,6 +107,7 @@ def bank_bill(
     n_experts: int,
     topk: int,
     n_shared: int,
+    rank: int = 0,
     extra_per_expert: int = 0,
 ) -> dict[str, int]:
     """Return the stored and active bill by formula, before a single tensor exists.
@@ -110,7 +116,7 @@ def bank_bill(
     the router (a `[E, d]` projection) reported separately. A caller that wants
     the number with the router adds `router`.
     """
-    per = expert_parameters(d_model, d_ffn) + extra_per_expert
+    per = expert_parameters(d_model, d_ffn, rank) + extra_per_expert
     router = n_experts * d_model
     return {
         "per_expert": per,
@@ -188,12 +194,15 @@ class MoEFFN(nn.Module):
         self.expert_spec = FFNSpec(
             d_model, d_ffn, act=act, d_ffn_gelu=d_ffn_gelu, tsct_rank=expert_tsct_rank
         )
-        per = expert_parameters(d_model, d_ffn) + self.expert_spec.added_parameters()
+        per = expert_parameters(d_model, d_ffn, expert_tsct_rank) + (
+            self.expert_spec.added_parameters()
+        )
         active = per * (topk + n_shared)
-        if per < min_expert_params:
+        dense = expert_parameters(d_model, d_ffn) + self.expert_spec.added_parameters()
+        if dense < min_expert_params:
             raise LoudError(
-                f"an expert bills 3·{d_model}·{d_ffn}={per:,} parameters, below the "
-                f"{min_expert_params:,} floor",
+                f"an expert bills 3·{d_model}·{d_ffn}={dense:,} parameters dense, below "
+                f"the {min_expert_params:,} floor",
                 "a routed expert at this project's scale is 3·832·6144=15,335,424; "
                 "raise d_ffn, or pass min_expert_params only for a smoke arm and "
                 "say so in the report",
@@ -301,9 +310,9 @@ class MoEFFN(nn.Module):
     def param_report(self) -> dict[str, int]:
         """Return stored and active counts measured from the tree and asserted by formula.
 
-        The formula side is `bank_bill` (`3·d·f` per expert, `topk·per + shared`
-        active); the measured side is `parameters()`. A disagreement is a LOUD
-        failure, not a table with two numbers in it.
+        The formula side is `bank_bill` (`3·(d·r + r·f)` per expert at rank `r`,
+        `topk·per + shared` active); the measured side is `parameters()`. A disagreement
+        is a LOUD failure, not a table with two numbers in it.
         """
         bill = bank_bill(
             self.d_model,
@@ -311,6 +320,7 @@ class MoEFFN(nn.Module):
             n_experts=self.n_experts,
             topk=self.topk,
             n_shared=self.n_shared,
+            rank=self.expert_tsct_rank,
             extra_per_expert=self.expert_spec.added_parameters(),
         )
         routed = sum(p.numel() for p in self.experts.parameters())
@@ -320,7 +330,7 @@ class MoEFFN(nn.Module):
             raise LoudError(
                 f"the tree bills routed={routed:,} shared={shared:,}, the formula "
                 f"routed={bill['routed_stored']:,} shared={bill['shared_stored']:,}",
-                f"an expert must be 3·{self.d_model}·{self.d_ffn}="
+                f"an expert must store 3·(d·r + r·f)="
                 f"{bill['per_expert']:,} parameters; a biased or extra matrix is a "
                 f"different expert than the one the bill quotes",
             )

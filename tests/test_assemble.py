@@ -2,9 +2,9 @@
 
 Three contracts live here, and each one is a number rather than an opinion:
 
-* the model stores about a billion parameters and runs an FFN active set of 46.07M —
-  the pair the whole design is priced at — measured from the module tree, with the
-  attention share of the active set printed next to it;
+* the model stores its experts as rank-256 factors — 400.3M stored, an FFN active set of
+  16.07M — measured from the module tree, with the attention share of the active set
+  printed next to it;
 * every attention layer is one of the two mechanisms, in the 3:1 pattern, with GQA and
   the bottleneck on both — and the DSA layers are where the plan says they are;
 * three CPU steps run with a finite loss and every enabled mechanism moved its
@@ -55,7 +55,7 @@ def _smoke() -> StackSpec:
     return replace(StackSpec.from_toml(CONFIGS / "dormouse_1b.toml"), **SMOKE)
 
 
-def test_the_model_stores_a_billion_and_runs_the_ffn_at_forty_six_million() -> None:
+def test_the_model_stores_the_factors_and_runs_the_ffn_at_sixteen_million() -> None:
     spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
     report = assemble(spec, device="meta").report()
     print(
@@ -63,12 +63,13 @@ def test_the_model_stores_a_billion_and_runs_the_ffn_at_forty_six_million() -> N
         f"ffn_active={report['active_ffn']:,} attention={report['attention']:,} "
         f"embedding={report['embedding']:,}"
     )
-    assert 0.99e9 <= report["stored"] <= 1.10e9
-    per_expert = 3 * 832 * 6144 + 832 * 6 + 2 * 6
+    per_expert = 3 * (832 * 256 + 256 * 6144) + 832 * 6 + 2 * 6
     assert report["active_ffn"] == 3 * per_expert + 64 * 832
+    assert report["ffn"] == per_expert * 65 + 64 * 832
+    #: 400M and not the dense bank's 1.0B: the `[832, 6144]` masters are not stored.
+    assert 0.35e9 <= report["stored"] <= 0.45e9, report["stored"]
     assert report["active_ffn"] < report["stored"] / 20
     assert report["head"] == 0  # tied: a nonzero here is a second matrix
-    assert report["ffn"] == per_expert * 65 + 64 * 832
 
 
 def test_the_attention_share_of_the_step_is_printed_and_is_the_minority() -> None:
@@ -187,9 +188,9 @@ def test_dorm_plan_is_wired_and_train_refuses_a_config_with_no_data(
     assert "no [[source]] table" in capsys.readouterr().err
 
 
-def test_plan_needs_no_allocation_so_a_billion_parameter_stack_is_cheap() -> None:
-    """The plan builds on `meta`: the same numbers, no 4 GiB of weights."""
+def test_plan_needs_no_allocation_so_the_real_stack_is_cheap() -> None:
+    """The plan builds on `meta`: the same numbers, no 1.6 GiB of weights."""
     spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
     measured = assemble(spec, device="meta").report()
-    assert measured["stored"] > 1e9
+    assert measured["stored"] > 3.9e8
     assert all(isinstance(value, int) for value in measured.values())

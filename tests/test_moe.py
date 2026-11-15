@@ -27,6 +27,7 @@ from dormouse_core.errors import LoudError
 
 from dormouse.model.ffn import MoaFFN
 from dormouse.model.moe import MoEFFN, bank_bill, check_row_budget, expert_parameters
+from dormouse.model.tsct import TSCT_RANK
 
 D, F = 16, 12
 E, K = 4, 2
@@ -202,19 +203,21 @@ def test_the_parameter_report_refuses_a_tree_that_disagrees() -> None:
         bank.param_report()
 
 
-def test_the_live_bank_is_a_billion_stored_and_46m_active() -> None:
-    """The design's headline pair, by arithmetic — no 1B parameters are built here."""
-    bill = bank_bill(832, 6144, n_experts=64, topk=2, n_shared=1)
-    assert bill["per_expert"] == 3 * 832 * 6144 == 15_335_424
-    assert bill["per_expert"] >= 10_000_000
-    assert bill["routed_stored"] == 981_467_136
-    assert bill["shared_stored"] == 15_335_424
+def test_the_live_bank_stores_the_factors_and_runs_the_ffn_at_sixteen_million() -> None:
+    """The design's bill, by arithmetic — no 1B parameters are built here."""
+    bill = bank_bill(832, 6144, n_experts=64, topk=2, n_shared=1, rank=TSCT_RANK)
+    per = 3 * (832 * TSCT_RANK + TSCT_RANK * 6144)
+    assert bill["per_expert"] == per == 5_357_568
+    assert expert_parameters(832, 6144, TSCT_RANK) == per
+    assert bill["routed_stored"] == 342_884_352
+    assert bill["shared_stored"] == 5_357_568
     assert bill["router"] == 53_248
-    assert bill["stored"] == 996_855_808
-    assert bill["active"] == 46_006_272
+    assert bill["stored"] == 348_295_168
+    assert bill["active"] == 16_072_704
     assert bill["active"] == 2 * bill["per_expert"] + bill["shared_stored"]
-    assert 0.99e9 < bill["stored"] < 1.0e9
     assert bill["active"] / bill["stored"] < 0.05
+    dense = bank_bill(832, 6144, n_experts=64, topk=2, n_shared=1)
+    assert dense["per_expert"] == 3 * 832 * 6144 == 15_335_424, "rank=0 is the dense arm"
 
 
 # --- refusals --------------------------------------------------------------

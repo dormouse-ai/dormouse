@@ -95,14 +95,15 @@ DICTIONARY = Piece(
     "an enabled dictionary entry must contribute",
 )
 
-#: The experts' rank-`r` read: a compute path, so it has a counter like any other.
+#: The experts' rank-`r` storage: the factors are the parameters, and the read counts like
+#: any other mechanism (`tsct_fwd` moves once per factorised matrix per row).
 TSCT = Piece(
     "tsct",
     "tsct",
     "tsct",
     "tsct_fwd",
     Coeffects(),
-    "the expert's matrices are read through their rank-256 spectrum",
+    "the expert's matrices ARE their rank-256 factors",
 )
 
 OPTIMIZER: dict[str, Piece] = {

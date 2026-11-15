@@ -11,18 +11,19 @@ The assertion is a BAND, not bit-equality: the gate exists to catch a large chan
 bit. A one-line change to the model still moves the number, so when a change is
 intended, re-record the baseline in the same commit and say why.
 
-Baseline: final loss 2.452850 over 200 steps.
+Baseline: final loss 2.714696 over 200 steps.
 Measured on the one-architecture stack (3 KDA + 1 DSA per period, GQA + c_lat=512
-projections, a four-expert MoA bank read at rank 32) with:
+projections, a four-expert MoA bank whose three matrices store their rank-32 factors)
+with:
 
     uv run python tools/regression.py --steps 200
 
-It replaced 2.621932, which was recorded on the dense-rope-and-two-block stack the
-model no longer builds: the number belongs to the architecture, and re-recording it
-is the point at which a change to that architecture is declared rather than absorbed.
-
-The band is +/-0.10 (3.8% of the baseline). Every seed and shape below is part of
-the measurement, not a preference: changing one changes the number.
+It replaced 2.452850, which was recorded while the experts kept a dense `d·f` master and
+ran a per-forward SVD of it. The factors are the parameters now: the bank stores
+`3·(64·32 + 32·128)` per expert instead of `3·64·128`, so the stack is 190,200
+parameters rather than 220,920, and the number moved with the storage. The band is
++/-0.10 (3.7% of the baseline). Every seed and shape below is part of the measurement,
+not a preference: changing one changes the number.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from dormouse.model.assemble import assemble
 from dormouse.model.spec import StackSpec
 
 #: The recorded final loss. Re-record only with the command in the module docstring.
-BASELINE = 2.452850
+BASELINE = 2.714696
 
 #: Half-width of the acceptance band, in loss units.
 BAND = 0.10
