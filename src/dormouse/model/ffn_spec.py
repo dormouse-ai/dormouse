@@ -52,6 +52,7 @@ class FFNSpec:
     dictionary: tuple[str, ...] | None = None
     sides: str | None = None
     d_ffn_gelu: int | None = None
+    tsct_rank: int = 0
 
     def __post_init__(self) -> None:
         """Validate the arm, freeze the dictionary, and check the bill."""
@@ -64,6 +65,11 @@ class FFNSpec:
             raise LoudError(
                 f"d_ffn={self.d_ffn} is not a width",
                 "use a positive width; 2048 is the parameter-neutral one at d_model=832",
+            )
+        if self.tsct_rank < 0:
+            raise LoudError(
+                f"tsct_rank={self.tsct_rank} is negative",
+                "0 is the dense read; 256 is the recipe's factorisation",
             )
         if self.act not in FFN_ACTS:
             raise LoudError(
@@ -129,6 +135,7 @@ class FFNSpec:
                 dictionary=self.entries,
                 write_std=write_std,
                 device=device,
+                tsct_rank=self.tsct_rank,
             )
         if self.act == "moa":
             return MoaFFN(
@@ -138,5 +145,13 @@ class FFNSpec:
                 sides=self.sides or "bi",
                 write_std=write_std,
                 device=device,
+                tsct_rank=self.tsct_rank,
             )
-        return GatedFFN(self.d_model, self.d_ffn, act=self.act, write_std=write_std, device=device)
+        return GatedFFN(
+            self.d_model,
+            self.d_ffn,
+            act=self.act,
+            write_std=write_std,
+            device=device,
+            tsct_rank=self.tsct_rank,
+        )

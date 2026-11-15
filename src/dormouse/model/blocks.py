@@ -39,13 +39,17 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from .attn import PROJ_STD, Attention
 from .ffn_spec import FFNSpec
 
 __concepts__ = ("RMSNorm", "Block")
 
 #: One ε for every norm in the stack; see the module docstring for why 1e-6.
 EPS = 1e-6
+
+#: Std of the position-independent projections. 0.02 is GPT-2's; at d=832 a
+#: pre-activation has variance `d·0.02² ≈ 0.33`, a third of the unit-RMS stream it
+#: is added to. The residual-writing projection takes the block's `write_std`.
+PROJ_STD = 0.02
 
 
 class RMSNorm(nn.Module):
@@ -84,18 +88,19 @@ class Block(nn.Module):
     def __init__(
         self,
         d_model: int,
-        n_heads: int,
-        head_dim: int,
         d_ffn: int,
         *,
         n_layers: int,
-        rope: bool = True,
-        max_seq_len: int = 1024,
+        attn: nn.Module,
         eps: float = EPS,
-        ffn: FFNSpec | None = None,
+        ffn: FFNSpec | nn.Module | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         """Build both pre-norms and both sublayers.
+
+        `attn` is required: the stack has exactly two attention mechanisms and both
+        live in `attn_variants/`, so a block cannot invent a third default. `ffn` is
+        one dense arm or a prebuilt bank; `None` is the parameter-neutral SwiGLU.
 
         `n_layers` is the depth of the STACK and is here for one reason: the two
         projections that write the residual stream (`attn.proj`, `ffn.down`) draw
@@ -113,6 +118,22 @@ class Block(nn.Module):
                 "pass the depth of the stack this block belongs to",
             )
         write_std = PROJ_STD / (2.0 * n_layers) ** 0.5
+        self.norm1 = RMSNorm(d_model, eps, device=device)
+        self.attn = attn
+        self.norm2 = RMSNorm(d_model, eps, device=device)
+        self.ffn = self._build_ffn(d_model, d_ffn, ffn, write_std, device)
+
+    @staticmethod
+    def _build_ffn(
+        d_model: int,
+        d_ffn: int,
+        ffn: FFNSpec | nn.Module | None,
+        write_std: float,
+        device: torch.device | str | None,
+    ) -> nn.Module:
+        """Build the arm the spec names, or take the module the caller built."""
+        if isinstance(ffn, nn.Module):
+            return ffn
         spec = ffn or FFNSpec(d_model, d_ffn)
         if spec.d_model != d_model or spec.d_ffn != d_ffn:
             raise LoudError(
@@ -120,18 +141,7 @@ class Block(nn.Module):
                 f"but the block is d_model={d_model}, d_ffn={d_ffn}",
                 "build the spec from the block's own widths; a spec is not a default",
             )
-        self.norm1 = RMSNorm(d_model, eps, device=device)
-        self.attn = Attention(
-            d_model,
-            n_heads,
-            head_dim,
-            rope=rope,
-            max_seq_len=max_seq_len,
-            write_std=write_std,
-            device=device,
-        )
-        self.norm2 = RMSNorm(d_model, eps, device=device)
-        self.ffn = spec.build(write_std=write_std, device=device)
+        return spec.build(write_std=write_std, device=device)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` in, the residual stream out, same shape."""
@@ -143,4 +153,4 @@ class Block(nn.Module):
 
     def extra_repr(self) -> str:
         """Print what one layer costs, without materialising it."""
-        return f"d_model={self.attn.d_model}, d_ffn={self.ffn.d_ffn}, rope={self.attn.rope}"
+        return f"d_model={self.attn.d_model}, d_ffn={self.ffn.d_ffn}"

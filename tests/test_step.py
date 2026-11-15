@@ -17,8 +17,8 @@ import pytest
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError, MissingReport
+from stacks import reference_stack
 
-from dormouse.model import Transformer
 from dormouse.train import MixOptimizer, train_step
 from dormouse.train.optim import MUON_LR
 from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy
@@ -26,10 +26,10 @@ from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy
 SMALL = {"vocab": 16, "d_model": 32, "n_layers": 2, "n_heads": 2, "head_dim": 16, "d_ffn": 64}
 
 
-def _build(vocab: int = 16) -> tuple[Transformer, MixOptimizer, torch.Tensor]:
+def _build(vocab: int = 16) -> tuple[torch.nn.Module, MixOptimizer, torch.Tensor]:
     """A fixed tiny stack, its optimizer, and one fixed batch — seeded, not random."""
     torch.manual_seed(23)
-    model = Transformer(**{**SMALL, "vocab": vocab})
+    model = reference_stack(**{**SMALL, "vocab": vocab})
     ids = torch.randint(0, vocab, (3, 17), generator=torch.Generator().manual_seed(7))
     return model, MixOptimizer(model), ids
 
@@ -161,9 +161,9 @@ def test_a_firewalled_step_leaves_no_gradient_behind() -> None:
 def test_grad_accumulation_equals_one_pass_over_the_same_rows() -> None:
     """Two micro-batches of three rows must equal one batch of six, weight for weight."""
     torch.manual_seed(23)
-    model = Transformer(**SMALL)
+    model = reference_stack(**SMALL)
     ids = torch.randint(0, 16, (6, 17), generator=torch.Generator().manual_seed(7))
-    twin = Transformer(**SMALL)
+    twin = reference_stack(**SMALL)
     twin.load_state_dict(model.state_dict())
     train_step(model, ids, optimizer=MixOptimizer(model), accum=2)
     train_step(twin, ids, optimizer=MixOptimizer(twin), accum=1)

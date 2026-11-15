@@ -11,11 +11,15 @@ The assertion is a BAND, not bit-equality: the gate exists to catch a large chan
 bit. A one-line change to the model still moves the number, so when a change is
 intended, re-record the baseline in the same commit and say why.
 
-Baseline: final loss 2.621932 over 200 steps.
-Measured on base commit cc7baee ("ffn: learnable-activation (la) and
-mixture-of-activations (moa) arms (#9)") with:
+Baseline: final loss 2.452850 over 200 steps.
+Measured on the one-architecture stack (3 KDA + 1 DSA per period, GQA + c_lat=512
+projections, a four-expert MoA bank read at rank 32) with:
 
     uv run python tools/regression.py --steps 200
+
+It replaced 2.621932, which was recorded on the dense-rope-and-two-block stack the
+model no longer builds: the number belongs to the architecture, and re-recording it
+is the point at which a change to that architecture is declared rather than absorbed.
 
 The band is +/-0.10 (3.8% of the baseline). Every seed and shape below is part of
 the measurement, not a preference: changing one changes the number.
@@ -32,10 +36,11 @@ import numpy as np
 import torch
 from torch.nn import functional
 
-from dormouse.model.model import Transformer
+from dormouse.model.assemble import assemble
+from dormouse.model.spec import StackSpec
 
 #: The recorded final loss. Re-record only with the command in the module docstring.
-BASELINE = 2.621932
+BASELINE = 2.452850
 
 #: Half-width of the acceptance band, in loss units.
 BAND = 0.10
@@ -50,17 +55,28 @@ SEQ_LEN = 128
 LR = 3e-3
 VOCAB = 256
 
-#: The model: 98 624 parameters, small enough to run on one CPU core in seconds and
-#: deep enough (2 blocks, gated FFN, RoPE) that the live wiring is under test.
-MODEL = {
-    "vocab": VOCAB,
-    "d_model": 64,
-    "n_layers": 2,
-    "n_heads": 4,
-    "head_dim": 16,
-    "d_ffn": 128,
-    "max_seq_len": SEQ_LEN,
-}
+#: The stack, at widths one CPU core can run in seconds: one full attention period
+#: (3 KDA + 1 DSA), the GQA/latent projection block, and a four-expert bank of MoA
+#: experts read through rank-32 factors. Every slot of the live model is here, so a
+#: wiring defect in any of them moves this number. `unit="byte"` because the fixture
+#: is raw bytes: the BPE table has no tokenizer in this repo.
+SPEC = StackSpec(
+    unit="byte",
+    d_model=64,
+    n_layers=4,
+    n_heads=4,
+    n_kv_heads=2,
+    head_dim=16,
+    c_lat=32,
+    d_ffn=128,
+    n_experts=4,
+    topk=1,
+    expert_tsct_rank=32,
+    attn_k=64,
+    attn_window=32,
+    seq_len=SEQ_LEN,
+    batch=BATCH,
+)
 
 
 def run(steps: int, data: bytes) -> tuple[float, float, int]:
@@ -69,7 +85,7 @@ def run(steps: int, data: bytes) -> tuple[float, float, int]:
     torch.use_deterministic_algorithms(True)
     torch.manual_seed(SEED)
     tokens = np.frombuffer(data, dtype=np.uint8)
-    model = Transformer(**MODEL)
+    model = assemble(SPEC, smoke=True).model
     params = sum(p.numel() for p in model.parameters())
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.1)
     span = BATCH * (SEQ_LEN + 1)

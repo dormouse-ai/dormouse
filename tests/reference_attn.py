@@ -1,4 +1,10 @@
-"""Causal scaled dot-product attention, with rotary positions written out.
+"""THE REFERENCE: causal scaled dot-product attention, with rotary positions written out.
+
+This is not part of the model. The stack's attention is KDA and DSA
+(`dormouse/model/attn_variants/`), and neither is a full-attention block. This class
+stays in the tests because it is the ANCHOR: a ten-line formula nobody claims is fast,
+against which every kernel's causality, masking and projection order is compared. It is
+deliberately not importable from `dormouse.model`.
 
 The formula, as implemented (Vaswani et al. 2017 eq. 1; Su et al. 2021 eq. 1-3):
 

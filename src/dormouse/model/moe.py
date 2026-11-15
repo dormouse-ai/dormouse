@@ -1,4 +1,4 @@
-"""The MoE FFN: 64 routed gated-SwiGLU experts plus one always-on shared expert.
+"""The MoE FFN: 64 routed MoA experts plus one always-on shared expert.
 
 THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert):
 
@@ -10,8 +10,12 @@ THE BILL, BY ARITHMETIC (d=832, f=6144, three bias-free matrices per expert):
     active (top-2 + shared)               = 46 059 520    (~46M)
 
 `3·d·f` is the gated SwiGLU's own bill: (gate, up, down), no bias, so an expert
-IS a `GatedFFN` and the bank reuses that class instead of re-implementing the
-formula. One number in the brief does not survive the arithmetic: `3·832·6144`
+IS an FFN arm (`GatedFFN` or, as the one architecture names it, `MoaFFN` over the
+six-entry dictionary) and the bank reuses that class instead of re-implementing the
+formula. The expert's `expert_tsct_rank` is a COMPUTE path (`tsct.py`): the three
+matrices are read through their rank-`r` spectrum in the forward while the masters
+stay the dense `3·d·f`, so the stored and active bills below are unchanged and only
+the multiplies drop. One number in the brief does not survive the arithmetic: `3·832·6144`
 is 15.34M, not 15.7M — at this width an expert would need `f=6291` to bill 15.7M,
 and the brief itself fixes `f=6144`. The refused configuration is the one that
 would make an expert a rounding error: below 10M parameters, or below 1% of the
@@ -72,8 +76,10 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from .ffn import PROJ_STD, GatedFFN
+from .ffn import PROJ_STD
+from .ffn_spec import FFNSpec
 from .router import Router
+from .tsct import TSCT_RANK
 
 #: An expert below this is not an expert at this project's scale; see the
 #: module docstring for why 10M and the live config that satisfies it.
@@ -90,7 +96,13 @@ def expert_parameters(d_model: int, d_ffn: int) -> int:
 
 
 def bank_bill(
-    d_model: int, d_ffn: int, *, n_experts: int, topk: int, n_shared: int
+    d_model: int,
+    d_ffn: int,
+    *,
+    n_experts: int,
+    topk: int,
+    n_shared: int,
+    extra_per_expert: int = 0,
 ) -> dict[str, int]:
     """Return the stored and active bill by formula, before a single tensor exists.
 
@@ -98,7 +110,7 @@ def bank_bill(
     the router (a `[E, d]` projection) reported separately. A caller that wants
     the number with the router adds `router`.
     """
-    per = expert_parameters(d_model, d_ffn)
+    per = expert_parameters(d_model, d_ffn) + extra_per_expert
     router = n_experts * d_model
     return {
         "per_expert": per,
@@ -147,7 +159,9 @@ class MoEFFN(nn.Module):
         n_experts: int = 64,
         topk: int = 2,
         n_shared: int = 1,
-        act: str = "silu",
+        act: str = "moa",
+        d_ffn_gelu: int | None = None,
+        expert_tsct_rank: int = TSCT_RANK,
         write_std: float = PROJ_STD,
         qb: bool = True,
         min_expert_params: int = MIN_EXPERT_PARAMS,
@@ -171,7 +185,10 @@ class MoEFFN(nn.Module):
                 "use 0 (the parity control) or 1; a bank of shared experts is a "
                 "second dense path wearing the shared expert's name",
             )
-        per = expert_parameters(d_model, d_ffn)
+        self.expert_spec = FFNSpec(
+            d_model, d_ffn, act=act, d_ffn_gelu=d_ffn_gelu, tsct_rank=expert_tsct_rank
+        )
+        per = expert_parameters(d_model, d_ffn) + self.expert_spec.added_parameters()
         active = per * (topk + n_shared)
         if per < min_expert_params:
             raise LoudError(
@@ -194,15 +211,13 @@ class MoEFFN(nn.Module):
         self.n_experts = n_experts
         self.topk = topk
         self.n_shared = n_shared
+        self.expert_tsct_rank = expert_tsct_rank
         self.router = Router(d_model, n_experts, topk, qb=qb, device=device)
         self.experts = nn.ModuleList(
-            GatedFFN(d_model, d_ffn, act=act, write_std=write_std, device=device)
-            for _ in range(n_experts)
+            self.expert_spec.build(write_std=write_std, device=device) for _ in range(n_experts)
         )
-        self.shared: GatedFFN | None = (
-            GatedFFN(d_model, d_ffn, act=act, write_std=write_std, device=device)
-            if n_shared
-            else None
+        self.shared = (
+            self.expert_spec.build(write_std=write_std, device=device) if n_shared else None
         )
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
@@ -227,7 +242,7 @@ class MoEFFN(nn.Module):
         index, weight, counts = self.router(x, counters)
         y = self._dispatch(x, index, weight, counts, counters)
         if self.shared is not None:
-            y = y + self.shared(x)
+            y = y + self.shared(x, counters)
             if counters is not None:
                 counters.count("moe_shared")
         if counters is not None:
@@ -257,7 +272,7 @@ class MoEFFN(nn.Module):
             if size == 0:
                 continue
             tok = tokens[pos : pos + size]
-            out = expert(x.index_select(0, tok))
+            out = expert(x.index_select(0, tok), counters)
             y.index_add_(0, tok, out * gates[pos : pos + size, None])
             pos += size
             used += 1
@@ -296,6 +311,7 @@ class MoEFFN(nn.Module):
             n_experts=self.n_experts,
             topk=self.topk,
             n_shared=self.n_shared,
+            extra_per_expert=self.expert_spec.added_parameters(),
         )
         routed = sum(p.numel() for p in self.experts.parameters())
         shared = sum(p.numel() for p in self.shared.parameters()) if self.shared else 0

@@ -25,6 +25,7 @@ import pytest
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
+from stacks import REFERENCE, arm_declarations, reference_stack
 
 from dormouse.model.activations import SITU_BETA, activation
 from dormouse.model.ffn import (
@@ -35,23 +36,30 @@ from dormouse.model.ffn import (
     neutral_width,
 )
 from dormouse.model.ffn_spec import FFNSpec
-from dormouse.model.model import Transformer
 
 D, F = 12, 8
 #: 3·12·8 = 288 = 2·12·12: the neutral pair the `la`/`moa` width rule wants.
 GELU_F = 12
-SMALL = {
-    "vocab": 16,
-    "d_model": D,
-    "n_layers": 2,
-    "n_heads": 2,
-    "head_dim": 6,
-    "d_ffn": F,
-    "max_seq_len": 8,
-}
+#: The mechanism name and the counter each mixture arm reports itself with.
+ARMS = {"la": ("ffn_la", "ffn_la"), "moa": ("moa", "moa_fwd")}
 #: The dictionary the "all entries learn" tests exercise: the paper's five plus
 #: the one bounded member this project adds.
 SIX = ("gelu", "silu", "relu2", "leaky", "tanh", "situ")
+
+
+def _model(act: str | None = None, dictionary: list[str] | None = None) -> torch.nn.Module:
+    """A two-layer reference stack whose FFN is the arm under test."""
+    ffn = None if act is None else FFNSpec(D, F, act=act, dictionary=dictionary, d_ffn_gelu=GELU_F)
+    return reference_stack(
+        d_model=D,
+        n_layers=2,
+        n_heads=2,
+        head_dim=6,
+        d_ffn=F,
+        max_seq_len=8,
+        ffn=ffn,
+        declarations=REFERENCE + arm_declarations(act or "silu"),
+    )
 
 
 def _copy(target: torch.nn.Module, source: torch.nn.Module) -> None:
@@ -164,7 +172,7 @@ def test_a_zero_coefficient_is_not_an_enabled_entry() -> None:
 # --- counters ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("cls", "arm"), [(LaFFN, "ffn_la"), (MoaFFN, "ffn_moa")])
+@pytest.mark.parametrize(("cls", "arm"), [(LaFFN, "ffn_la"), (MoaFFN, "moa_fwd")])
 def test_the_arm_reports_itself_and_its_entries(cls: type[LaFFN] | type[MoaFFN], arm: str) -> None:
     counters = Counters()
     ffn = cls(D, F, dictionary=SIX)
@@ -175,20 +183,20 @@ def test_the_arm_reports_itself_and_its_entries(cls: type[LaFFN] | type[MoaFFN],
 @pytest.mark.parametrize("act", ["la", "moa"])
 def test_a_mixed_model_enables_its_arm_and_check_passes(act: str) -> None:
     """`Counters.check()` is the proof the configured arm ran, not the baseline."""
-    model = Transformer(**SMALL, ffn_act=act, ffn_dict=["silu"], d_ffn_gelu=GELU_F)
+    model = _model(act, ["silu"])
     counters = Counters()
     model(torch.zeros(1, 4, dtype=torch.long), counters)
-    arm = f"ffn_{act}"
-    assert {arm, "ffn_dictionary"} <= set(counters.enabled)
-    assert counters.counts[arm] == SMALL["n_layers"] * 4
-    assert counters.counts["ffn_dict_entries_used"] == SMALL["n_layers"]
+    mechanism, counter = ARMS[act]
+    assert {mechanism, "ffn_dictionary"} <= set(counters.enabled)
+    assert counters.counts[counter] == 2 * 4
+    assert counters.counts["ffn_dict_entries_used"] == 2
     counters.check()
 
 
 def test_the_plain_model_does_not_enable_a_mixture() -> None:
     counters = Counters()
-    Transformer(**SMALL)(torch.zeros(1, 2, dtype=torch.long), counters)
-    assert not {"ffn_la", "ffn_moa", "ffn_dictionary"} & set(counters.enabled)
+    _model()(torch.zeros(1, 2, dtype=torch.long), counters)
+    assert not {"ffn_la", "moa_fwd", "ffn_dictionary"} & set(counters.enabled)
 
 
 # --- init and config --------------------------------------------------------

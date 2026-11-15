@@ -53,6 +53,12 @@ path gives. So it is a direction change at fixed step magnitude, which is why it
 no learning-rate retune. V and the output projection stay whole: neither reference
 splits them, and a per-head split of `proj` is a column split, a different mechanism.
 
+The compressed layers have no packed matrix: their Q is written by `q_up`
+`[n_heads·head_dim, c_lat]` and their K/V by `kv_up` `[2·n_kv_heads·head_dim, c_lat]`.
+`q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
+remainder — whole, so the arm is the same one applied to the same tensors, and the
+router reads it off the modules rather than off a shape heuristic.
+
 §6. ROUTING. A parameter goes to Muon iff it is a 2-D matrix that is not the token
 table; to AdamW iff it is 1-D (norms' gains, mixture coefficients, biases) or the token
 table. Anything else — a 3-D table, a convolution — routes to neither, and that is a
@@ -191,7 +197,11 @@ def muon_direction(
         )
     lead = momentum[:rows].view(groups, rows // groups, momentum.shape[1])
     headwise = colrow(polar(lead, steps)).view(rows, -1)
-    return torch.cat((headwise, colrow(polar(momentum[rows:], steps))), dim=0)
+    rest = momentum[rows:]
+    if rest.shape[0] == 0:
+        #: Every row is a head (`q_up`): there is no remainder to run whole.
+        return headwise
+    return torch.cat((headwise, colrow(polar(rest, steps))), dim=0)
 
 
 class Muon(Optimizer):
@@ -372,6 +382,12 @@ def route(name: str, param: torch.Tensor) -> str:
         return "adamw"
     if param.ndim == 2:
         return "muon"
+    if param.ndim == 3 and param.shape[1] == 1:
+        #: A depthwise convolution: `[channels, 1, taps]`. KDA's short conv is this
+        #: shape, and Muon has no chain to orthogonalise across taps — the update is
+        #: a per-channel filter, which is AdamW's arm. A grouped conv of real width
+        #: (axis 1 > 1) is still refused below rather than guessed.
+        return "adamw"
     if param.ndim <= 1:
         return "adamw"
     raise LoudError(
@@ -383,18 +399,32 @@ def route(name: str, param: torch.Tensor) -> str:
 
 
 def _head_split(model: nn.Module, name: str, param: torch.Tensor) -> tuple[int, int] | None:
-    """`(2·n_heads, 2·d_model)` for a packed qkv weight, else None (§5).
+    """Return `(groups, rows)` for a per-head projection, or None when it is whole (§5).
 
-    The head count comes from the module that owns the projection; a qkv outside an
-    attention block is refused rather than quietly given the whole-matrix chain.
+    Three names carry heads in this stack: the packed `qkv` of an uncompressed layer
+    (`2·n_heads` slices of Q and K, V as the remainder), the latent `q_up` (every row
+    is a query head) and the latent `kv_up` (the K half is per key/value head, the V
+    half stays whole). The head count comes from the module that owns the projection;
+    a name that looks like one of these without an `n_heads` is refused rather than
+    quietly given the whole-matrix chain.
     """
-    if not name.endswith(".attn.qkv.weight"):
-        return None
-    n_heads = getattr(model.get_submodule(name.rsplit(".", 2)[0]), "n_heads", None)
-    if not isinstance(n_heads, int):
-        raise LoudError(
-            f"{name} looks like a packed qkv weight but its owner has no n_heads",
-            "either pass a real attention block, or rename the parameter so the "
-            "router stops reading it as q/k/v",
-        )
-    return 2 * n_heads, 2 * param.shape[0] // 3
+    heads = getattr(model.get_submodule(name.rsplit(".", 2)[0]), "n_heads", None)
+    if name.endswith(".attn.qkv.weight"):
+        if not isinstance(heads, int):
+            raise LoudError(
+                f"{name} looks like a packed qkv weight but its owner has no n_heads",
+                "either pass a real attention block, or rename the parameter so the "
+                "router stops reading it as q/k/v",
+            )
+        return 2 * heads, 2 * param.shape[0] // 3
+    if name.endswith(".attn.q_up.weight"):
+        return (heads, param.shape[0]) if isinstance(heads, int) else None
+    if name.endswith(".attn.kv_up.weight"):
+        owner = model.get_submodule(name.rsplit(".", 2)[0])
+        kv_heads = getattr(owner, "n_kv_heads", None)
+        head_dim = getattr(owner, "head_dim", 0)
+        if not isinstance(kv_heads, int) or not isinstance(head_dim, int):
+            return None
+        #: The first `n_kv·head_dim` rows are K; V is the remainder and stays whole.
+        return kv_heads, kv_heads * head_dim
+    return None
