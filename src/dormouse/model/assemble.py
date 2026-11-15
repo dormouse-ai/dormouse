@@ -42,6 +42,7 @@ from .attn_variants.kda import KDA
 from .blocks import PROJ_STD, Block
 from .model import Transformer
 from .moe import MoEFFN
+from .residual import MHC, AttnResFull, Residual
 from .spec import StackSpec
 
 __concepts__ = ("Assembled", "FlatBank")
@@ -173,6 +174,7 @@ def assemble(
         max_seq_len=spec.seq_len,
         blocks=blocks,
         declarations=registry.declarations(pieces),
+        mixer=_mixer(spec, device),
         device=device,
     )
     _quantize(model, spec)
@@ -204,6 +206,18 @@ def _attention(
         write_std=write_std,
         device=device,
     )
+
+
+def _mixer(spec: StackSpec, device: torch.device | str | None) -> Residual | None:
+    """Build the residual mechanism the spec names; `None` is the block's own add."""
+    if spec.residual == "attnres":
+        #: One source per SUBLAYER, not per block: the paper counts each self-attention
+        #: and each MLP as a layer, and `N = L` is that count. The per-sublayer form is
+        #: also the only one whose identity init is the block's own `x + u` bit for bit.
+        return AttnResFull(spec.d_model, 2 * spec.n_layers, device=device)
+    if spec.residual == "mhc":
+        return MHC(spec.d_model, spec.mhc_streams, device=device)
+    return None
 
 
 def _bank(
@@ -296,6 +310,7 @@ def plan_data(
         "slots": {
             "optimizer": spec.optimizer,
             "objective": spec.objective,
+            "residual": spec.residual,
             "weight_qat": spec.weight_qat,
             "act_quant": spec.act_quant,
         },

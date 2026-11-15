@@ -46,6 +46,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .blocks import EPS, RMSNorm
+from .residual import Residual
 
 
 class Transformer(nn.Module):
@@ -62,8 +63,16 @@ class Transformer(nn.Module):
         device: torch.device | str | None = None,
         blocks: Sequence[nn.Module],
         declarations: Sequence[tuple[str, str, str]],
+        mixer: Residual | None = None,
     ) -> None:
-        """Build the table, the stack, the final norm and the (tied) head."""
+        """Build the table, the stack, the final norm and the (tied) head.
+
+        `mixer` is the residual mechanism when the spec names one (`residual.py`); it
+        is `None` on the plain arm, and then the forward is the loop below and nothing
+        else. When it is set, the mixer owns the stream: it is seeded from the
+        embedding once per forward, every block writes through it, and its read-out is
+        what the final norm sees.
+        """
         super().__init__()
         if vocab < 2:
             raise LoudError(
@@ -92,6 +101,7 @@ class Transformer(nn.Module):
         #: forward cannot count is a mechanism nobody can see was skipped.
         self.declarations = tuple(declarations)
         self.blocks = nn.ModuleList(blocks)
+        self.mixer = mixer
         self.norm = RMSNorm(d_model, eps, device=device)
 
     # ------------------------------------------------------------------ forward
@@ -112,8 +122,18 @@ class Transformer(nn.Module):
         h = self.embed(ids)
         if counters is not None:
             counters.count("embed_fwd", ids.numel())
-        for block in self.blocks:
-            h = block(h, counters)
+        if self.mixer is None:
+            for block in self.blocks:
+                h = block(h, counters)
+        else:
+            # The mixer owns the stream for the whole stack: seeded once here, written
+            # through by every sublayer, and read once for the final norm. Its counters
+            # (attnres_sources / mhc_mix) are on the same `Counters.line()` as every
+            # other mechanism's, and stay at zero when the arm is off.
+            self.mixer.begin(h)
+            for block in self.blocks:
+                block(h, counters, self.mixer)
+            h = self.mixer.read()
         logits = self.head(self.norm(h, counters), counters)
         if counters is not None:
             counters.check()
@@ -157,12 +177,14 @@ class Transformer(nn.Module):
         printing it), and `total`. `total` is summed from `parameters()`, so a group
         that forgets a parameter shows up as a disagreement instead of a lost number.
         """
-        groups = dict.fromkeys(("embedding", "attention", "ffn", "norms", "head"), 0)
+        groups = dict.fromkeys(("embedding", "attention", "ffn", "norms", "residual", "head"), 0)
         for name, param in self.named_parameters():
             if name.startswith("embed."):
                 key = "embedding"
             elif name == "norm.weight" or ".norm" in name:
                 key = "norms"
+            elif name.startswith("mixer."):
+                key = "residual"
             elif ".attn." in name:
                 key = "attention"
             elif ".ffn." in name:

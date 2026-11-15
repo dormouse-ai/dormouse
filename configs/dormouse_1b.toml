@@ -26,6 +26,11 @@ act_quant = "none"
 torch_compile = false
 sources = "corpus"
 
+# The residual write: "plain" is `x + w` and the arm every number on record was
+# measured on. "attnres" / "mhc" are the two mechanisms whose pre-registered A/B is in
+# docs/RESIDUAL.md; both are the identity at init, so their A/B measures the mechanism.
+residual = "plain"
+
 d_model = 832
 n_layers = 12
 n_heads = 8

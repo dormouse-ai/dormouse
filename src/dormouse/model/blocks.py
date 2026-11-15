@@ -40,6 +40,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .ffn_spec import FFNSpec
+from .residual import Residual
 
 __concepts__ = ("RMSNorm", "Block")
 
@@ -143,10 +144,30 @@ class Block(nn.Module):
             )
         return spec.build(write_std=write_std, device=device)
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` in, the residual stream out, same shape."""
-        x = x + self.attn(self.norm1(x, counters), counters)
-        x = x + self.ffn(self.norm2(x, counters), counters)
+    def forward(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None = None,
+        residual: Residual | None = None,
+    ) -> torch.Tensor:
+        """`x [batch, seq, d_model]` in, the residual stream out, same shape.
+
+        `residual` is a stack-level mixer (`residual.AttnResFull` or `residual.MHC`)
+        that owns the stream instead of the block's own `+`. It is `None` on the plain
+        arm, which is then the two statements above and nothing else — the same ops, in
+        the same order, as every measurement on record. With a mixer the block writes
+        its two sublayer outputs THROUGH it, one write per sublayer, which is the
+        paper's layer count (`N = L`, attention and MLP each a layer) and the only
+        formulation in which the mixer's identity init can be the plain add bit for
+        bit: the add is `x + u`, and the mixer at init returns exactly `u`.
+        """
+        if residual is None:
+            x = x + self.attn(self.norm1(x, counters), counters)
+            x = x + self.ffn(self.norm2(x, counters), counters)
+        else:
+            x = residual.enter(x)
+            x = residual.write(self.attn(self.norm1(x, counters), counters), counters)
+            x = residual.write(self.ffn(self.norm2(x, counters), counters), counters)
         if counters is not None:
             counters.count("block_fwd")
         return x

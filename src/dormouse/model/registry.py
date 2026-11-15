@@ -31,7 +31,9 @@ from .spec import StackSpec
 #: Slots whose counter the model's forward produces. The rest (optimizer,
 #: objective) are counted by the step, which is why they are not declared on the
 #: stack: a mechanism the forward cannot count would raise `MissingReport` there.
-MODEL_SLOTS = frozenset({"attn", "ffn", "expert", "tsct", "dictionary", "weight_qat", "act_quant"})
+MODEL_SLOTS = frozenset(
+    {"attn", "ffn", "expert", "tsct", "dictionary", "weight_qat", "act_quant", "residual"}
+)
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,27 @@ QUANT: dict[str, Piece] = {
     "int4": Piece("act_quant", "int4", "act_quant", "act_int4", Coeffects(), "int4 activations"),
 }
 
+#: The residual write. `plain` is not a piece: it is the block's own line, and a piece
+#: for it would declare a mechanism whose counter nobody could move.
+RESIDUAL: dict[str, Piece] = {
+    "attnres": Piece(
+        "residual",
+        "attnres",
+        "attnres",
+        "attnres_sources",
+        Coeffects(),
+        "full-depth attention over every earlier sublayer's write",
+    ),
+    "mhc": Piece(
+        "residual",
+        "mhc",
+        "mhc",
+        "mhc_mix",
+        Coeffects(),
+        "n residual lanes mixed by a Sinkhorn-Knopp matrix",
+    ),
+}
+
 
 def pieces(spec: StackSpec, *, ctx: dict[str, str] | None = None) -> tuple[Piece, ...]:
     """Return the arms this spec enables, refusing any whose coeffects do not fit.
@@ -155,6 +178,8 @@ def pieces(spec: StackSpec, *, ctx: dict[str, str] | None = None) -> tuple[Piece
         chosen.append(QAT[spec.weight_qat])
     if spec.act_quant != "none":
         chosen.append(QUANT[spec.act_quant])
+    if spec.residual != "plain":
+        chosen.append(RESIDUAL[spec.residual])
     _check(chosen, declared)
     return tuple(chosen)
 

@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import torch
 from reference_attn import Attention
+from torch import nn
 
 from dormouse.model.blocks import Block
 from dormouse.model.ffn_spec import FFNSpec
@@ -51,8 +53,17 @@ def reference_stack(
     max_seq_len: int = 32,
     ffn: FFNSpec | None = None,
     declarations: Sequence[tuple[str, str, str]] | None = None,
+    mixer: nn.Module | None = None,
+    seed: int | None = None,
 ) -> Transformer:
-    """A `Transformer` whose blocks use the reference attention and `ffn`."""
+    """A `Transformer` whose blocks use the reference attention and `ffn`.
+
+    `mixer` is the residual mechanism to thread through the stack (`residual.py`);
+    `None` is the plain arm. `seed` draws the whole stack — and the mixer, when it is
+    built here — from one generator, so two arms are the same weights.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
     blocks = [
         Block(
             d_model,
@@ -71,4 +82,5 @@ def reference_stack(
         max_seq_len=max_seq_len,
         blocks=blocks,
         declarations=declared,
+        mixer=mixer,
     )

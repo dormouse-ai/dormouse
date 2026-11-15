@@ -85,12 +85,19 @@ class QuantBlock(nn.Module):
         self.matrices = matrices
         self.act_int4 = act_int4
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """Quantize what the block reads, then run it."""
+    def forward(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None = None,
+        residual: nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Quantize what the block reads, then run it (and its residual mixer, if any)."""
         if self.act_int4:
             x = int4(x)
             if counters is not None:
                 counters.count("act_int4", x.shape[0] * x.shape[1])
         if counters is not None and self.matrices:
             counters.count("weight_ternary", self.matrices)
-        return cast(torch.Tensor, self.inner(x, counters))
+        if residual is None:
+            return cast(torch.Tensor, self.inner(x, counters))
+        return cast(torch.Tensor, self.inner(x, counters, residual))

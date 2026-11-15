@@ -22,6 +22,11 @@ The literals that remain, and the refusal each one carries:
 * `weight_qat`, `act_quant`, `torch_compile` — the quantization slots and the compile
   flag, which contradicts `act_quant=int4` (a graph break at every fake-quant
   boundary, measured) and is refused as that pair.
+* `residual` — the residual write. `plain` is `x + w` and is the arm every number on
+  record was measured on; `attnres` is full-depth Attention Residuals (one source per
+  sublayer, arXiv:2603.15031) and `mhc` is manifold-constrained hyper-connections
+  (arXiv:2512.24880). Both are identity at init by construction, so an A/B measures
+  the mechanism rather than a perturbation (`model/residual.py` states the proof).
 * `sources` — the data streams. One name is one stream; a mix is what `+tst` cannot
   use, which is the refusal that makes this a value.
 
@@ -49,6 +54,8 @@ OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
+#: The residual write. `plain` is the block's own `+`; the other two are mixers.
+RESIDUALS: tuple[str, ...] = ("plain", "attnres", "mhc")
 
 #: The vocab each unit prices the token table at.
 VOCAB: dict[str, int] = {"byte": 256, "bpe": 32768}
@@ -96,6 +103,7 @@ class StackSpec(Config):
     objective: str = "ntp"
     weight_qat: str = "none"
     act_quant: str = "none"
+    residual: str = "plain"
 
     # ------------------------------------------------------------------ wiring
     torch_compile: bool = False
@@ -117,6 +125,8 @@ class StackSpec(Config):
     attn_window: int = 128
     seq_len: int = 1024
     batch: int = 24
+    #: mHC's expansion rate: the number of full-width lanes `residual="mhc"` carries.
+    mhc_streams: int = 2
 
     # -------------------------------------------------------------------- plan
     tokens: int = 10_000_000_000
@@ -140,6 +150,14 @@ class StackSpec(Config):
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
+        _literal("residual", self.residual, RESIDUALS)
+        if self.mhc_streams < 2 and self.residual == "mhc":
+            raise LoudError(
+                f"mhc_streams={self.mhc_streams}: one lane is the plain residual with a "
+                "hyper-network bolted on",
+                "use mhc_streams >= 2 (the paper's K = 2 and the measured arm), or "
+                "residual='plain'",
+            )
         if self.attn == "hybrid" and self.n_layers % len(HYBRID):
             raise LoudError(
                 f"n_layers={self.n_layers} is not a multiple of the "
