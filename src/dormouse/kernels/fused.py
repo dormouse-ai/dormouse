@@ -120,7 +120,7 @@ def available() -> bool:
     return torch.cuda.is_available() and _build() is not None
 
 
-def _build() -> dict[str, Any] | None:
+def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a device
     """Compile-once Triton kernels; `None` when Triton is not installed."""
     if _KERNELS:
         return _KERNELS
@@ -130,7 +130,7 @@ def _build() -> dict[str, Any] | None:
     except ImportError:
         return None
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
     def residual_norm_kernel(X, D, R, Y, W, eps, n_cols: tl.constexpr, BLOCK: tl.constexpr):  # type: ignore[no-untyped-def]
         """One residual row: sum, write it, normalise from the same registers."""
         row = tl.program_id(0)
@@ -149,7 +149,7 @@ def _build() -> dict[str, Any] | None:
         normed = rf * tl.rsqrt(var + eps) * gain
         tl.store(Y + base + cols, normed.to(Y.dtype.element_ty), mask=mask)
 
-    @triton.jit  # type: ignore[untyped-decorator]
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
     def glu_kernel(G, U, OUT, n, BLOCK: tl.constexpr):  # type: ignore[no-untyped-def]
         """`silu(gate) * up` over one block of the flattened buffer."""
         off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -199,9 +199,9 @@ class _ResidualNorm(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
+    def forward(  # pragma: no cover - device only
         ctx: Any, x: torch.Tensor, delta: torch.Tensor, weight: torch.Tensor, eps: float
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover - device kernels
         """Return `(x + delta, rmsnorm(x + delta))`."""
         built = _require("residual_norm")
         width = x.shape[-1]
@@ -219,7 +219,7 @@ class _ResidualNorm(torch.autograd.Function):
         return residual.view(x.shape), normed.view(x.shape)
 
     @staticmethod
-    def backward(
+    def backward(  # pragma: no cover - device only
         ctx: Any, d_residual: torch.Tensor | None, d_normed: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
         """Gradients of `x`, `delta` and the gain.
@@ -253,7 +253,7 @@ class _Glu(torch.autograd.Function):
     """`silu(gate) * up` in one kernel; the backward is the two chain rules."""
 
     @staticmethod
-    def forward(ctx: Any, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    def forward(ctx: Any, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:  # pragma: no cover - device only
         """Return `silu(gate) * up`, elementwise."""
         built = _require("glu")
         width = gate.shape[-1]
@@ -268,7 +268,7 @@ class _Glu(torch.autograd.Function):
         return out.view(gate.shape)
 
     @staticmethod
-    def backward(
+    def backward(  # pragma: no cover - device only
         ctx: Any, d_out: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """`dg = dout·u·sigma(g)(1 + g(1-sigma(g)))`, `du = dout·silu(g)`."""

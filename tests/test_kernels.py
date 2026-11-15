@@ -220,3 +220,26 @@ def test_residual_norm_gradient_matches_the_eager_norm() -> None:
         )
     finally:
         fused.set_fused(False)
+
+
+def test_the_module_reports_its_state_without_a_device() -> None:
+    """The flag and the counter are readable on a CPU wheel; the kernels are not built.
+
+    A fused path that silently runs eager under the flag is the defect this pins: on a
+    machine without Triton `available()` must say so, and the tally must stay zero.
+    """
+    from dormouse.kernels import fused as k
+
+    assert isinstance(k.available(), bool)
+    assert k.next_pow2(1) == 1
+    assert k.next_pow2(3) == 4
+    assert k.next_pow2(1024) == 1024
+    k.reset_fused_ops()
+    assert k.fused_ops() == 0
+    was = k.fused()
+    try:
+        k.set_fused(True)
+        assert k.fused() is True
+        assert k.fused_ops() == 0, "the flag alone must not claim a launch"
+    finally:
+        k.set_fused(was)
