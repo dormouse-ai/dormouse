@@ -39,6 +39,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from ..kernels import fused
 from .ffn_spec import FFNSpec
 
 __concepts__ = ("RMSNorm", "Block")
@@ -144,9 +145,17 @@ class Block(nn.Module):
         return spec.build(write_std=write_std, device=device)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` in, the residual stream out, same shape."""
-        x = x + self.attn(self.norm1(x, counters), counters)
-        x = x + self.ffn(self.norm2(x, counters), counters)
+        """`x [batch, seq, d_model]` in, the residual stream out, same shape.
+
+        The attention write and the FFN's pre-norm are one call: `residual_norm` adds the
+        attention output to the stream and normalises the sum out of the same registers,
+        which is the pair `x = x + attn(...)` then `norm2(x)` written once. With the
+        fused flag off it IS those two statements, op for op (`kernels/fused.py`).
+        """
+        x, h = fused.residual_norm(
+            x, self.attn(self.norm1(x, counters), counters), self.norm2, counters
+        )
+        x = x + self.ffn(h, counters)
         if counters is not None:
             counters.count("block_fwd")
         return x
