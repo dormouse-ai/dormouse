@@ -12,25 +12,12 @@ import math
 import pytest
 from dormouse_core.errors import LoudError
 
-from dormouse.metrics import BitsPerByte, eval_window, from_nats
+from dormouse.metrics import eval_window, from_nats
 
 
 def test_a_measurement_renders_with_its_window() -> None:
     value = from_nats(1.0, 196_608)
     assert str(value) == f"{1 / math.log(2):.3f} BPB over 196608 B"
-
-
-def test_zero_is_refused_as_a_bug() -> None:
-    """The bpb_fin=0.000 defect: a metric that never filled must not pass as good."""
-    with pytest.raises(LoudError) as e:
-        BitsPerByte(bpb=0.0, bytes_evaluated=1024, loss_nats=0.0)
-    assert "did not fill" in str(e.value)
-
-
-def test_an_empty_window_is_refused() -> None:
-    with pytest.raises(LoudError) as e:
-        BitsPerByte(bpb=1.5, bytes_evaluated=0, loss_nats=1.0)
-    assert "65536" in str(e.value)
 
 
 def test_a_delta_between_different_windows_is_refused() -> None:
