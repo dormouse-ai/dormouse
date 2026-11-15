@@ -20,8 +20,16 @@ The literals that remain, and the refusal each one carries:
 * `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. `+tst`
   and `+jepa` have no loss module, so they are refused with that reason.
 * `weight_qat`, `act_quant`, `torch_compile` — the quantization slots and the compile
-  flag, which contradicts `act_quant=int4` (a graph break at every fake-quant
-  boundary, measured) and is refused as that pair.
+  flag, which contradicts every quantized activation (a graph break at every
+  fake-quant boundary, measured) and is refused as that pair.
+* `weight_qat=fp4`, `act_quant=fp4` — NVFP4 (`fp4.py`). Weights: e2m1 codes, an e4m3
+  scale per 16 values, an fp32 tensor scale, straight-through. Activations: the same
+  format at each block boundary — which is the WHOLE claim. The attention arms read
+  the quantized residual but compute their interiors (KDA's decay and triangular
+  solve, DSA's selector and softmax) in fp32, so nothing here claims fp4 attention;
+  refusing that pair would be inventing a limit. What IS refused is the format
+  without its shape: a width that is not 16-tiled, and `torch_compile` (the
+  kernel-or-reference decision is a graph break, and `fp4.verdict` is read once).
 * `sources` — the data streams. One name is one stream; a mix is what `+tst` cannot
   use, which is the refusal that makes this a value.
 
@@ -38,6 +46,7 @@ from dataclasses import dataclass
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
 
+from . import fp4
 from .attn_variants.hybrid import HYBRID_3_TO_1
 from .tsct import TSCT_RANK
 
@@ -47,8 +56,8 @@ UNITS: tuple[str, ...] = ("bpe", "byte")
 ATTN: tuple[str, ...] = ("hybrid", "kda", "dsa")
 OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
-WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
-ACT_QUANT: tuple[str, ...] = ("none", "int4")
+WEIGHT_QAT: tuple[str, ...] = ("none", "ternary", "fp4")
+ACT_QUANT: tuple[str, ...] = ("none", "int4", "fp4")
 
 #: The vocab each unit prices the token table at.
 VOCAB: dict[str, int] = {"byte": 256, "bpe": 32768}
@@ -63,8 +72,9 @@ COMPUTABLE = frozenset({"ntp"})
 #: Values a slot knows but does not assemble, with the reason said out loud.
 KNOWN_UNBUILT: dict[str, dict[str, str]] = {
     "weight_qat": {
-        "fp8": "weights are quantized once here: ternary (1.58 bit) or not at all; "
-        "fp8 would be a second scheme on the same matrix",
+        "fp8": "weights carry one scheme here: ternary (1.58 bit), fp4 (4.5 bit, an e4m3 "
+        "scale per 16) or none; e4m3 as a third scheme on the same matrix is the file "
+        "format's business, not the forward's",
     },
 }
 
@@ -205,6 +215,36 @@ class StackSpec(Config):
                 "every fake-quant boundary runs the eager path under a compiled name, "
                 "so the plan would price a kernel that never ran",
             )
+        if self.act_quant == "fp4" and self.torch_compile:
+            raise LoudError(
+                "act_quant=fp4 with torch_compile=true: the fp4 forward is a Python "
+                "branch on whether the kernel can run (11 breaks with int4 against 10 "
+                "without on the 4-layer stack, plus one per `_scaled_mm` decision)",
+                "set torch_compile=false, or act_quant=none; a quantized boundary "
+                "compiles to one graph per decision, not to one kernel",
+            )
+        if self.weight_qat == "fp4" and self.torch_compile:
+            raise LoudError(
+                "weight_qat=fp4 with torch_compile=true: the weight path chooses between "
+                "`_scaled_mm` and the reference fake-quant inside the forward, which is a "
+                "Python-level decision torch._dynamo must graph-break on",
+                "set torch_compile=false, or weight_qat=none; the kernel verdict is a "
+                "property of the build and is read once, not per graph",
+            )
+        if "fp4" in (self.weight_qat, self.act_quant):
+            for width, name in (
+                (self.d_model, "d_model"),
+                (self.d_ffn, "d_ffn"),
+                (self.c_lat, "c_lat"),
+            ):
+                if width % fp4.BLOCK:
+                    raise LoudError(
+                        f"fp4 with {name}={width}: a block scale covers {fp4.BLOCK} contiguous "
+                        f"elements of the contraction axis, and {width} leaves "
+                        f"{width % fp4.BLOCK} over",
+                        f"use a {name} that is a multiple of {fp4.BLOCK} (d_model=832 is 52 "
+                        "blocks exactly), or drop the fp4 rung",
+                    )
 
     # ---------------------------------------------------------------- derived
     @property

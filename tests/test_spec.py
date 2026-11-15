@@ -99,6 +99,19 @@ def test_int4_with_compile_names_the_measured_graph_break() -> None:
     assert "11 breaks with int4 against 10 without" in message
 
 
+def test_fp4_with_compile_names_the_graph_break_in_both_slots() -> None:
+    for slots in ({"act_quant": "fp4"}, {"weight_qat": "fp4"}):
+        message = _refused(torch_compile=True, **slots)
+        assert "torch_compile=true" in message
+        assert "act_quant=fp4" in message or "weight_qat=fp4" in message
+    assert "_scaled_mm" in _refused(weight_qat="fp4", torch_compile=True)
+
+
+def test_fp4_refuses_a_width_the_sixteen_element_block_cannot_tile() -> None:
+    message = _refused(weight_qat="fp4", act_quant="fp4", d_model=72, c_lat=64)
+    assert "d_model=72" in message and "16" in message and "8 over" in message
+
+
 def test_a_layer_count_the_period_cannot_tile_is_refused_with_the_remainder() -> None:
     with pytest.raises(LoudError) as caught:
         StackSpec(attn="hybrid", n_layers=6)
