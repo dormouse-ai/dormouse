@@ -4,7 +4,7 @@ The order is the contract, and it is the order because each item exists to make 
 next one safe:
 
     zero_grad → (forward → chunked CE → backward) × accum → global norm → clip
-              → optimizer.step()
+              → pre_step (the loop's policy) → optimizer.step()
 
 CHUNKED CROSS-ENTROPY. `F.cross_entropy` over a `[batch, seq, vocab]` fp32-upcast
 copy is `4·B·T·V` bytes in one allocation: 3.2 GiB at the live 24×1024×32768, which
@@ -37,6 +37,7 @@ the step; an enabled mechanism with a zero counter raises `MissingReport`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -47,7 +48,7 @@ from torch.nn import functional
 
 from .optim import MixOptimizer
 
-__all__ = ["StepResult", "chunked_cross_entropy", "train_step"]
+__all__ = ["PreStep", "StepResult", "chunked_cross_entropy", "train_step"]
 
 _LOG = logging.getLogger(__name__)
 
@@ -58,6 +59,12 @@ CHUNK_TOKENS = 2048
 #: Global gradient-norm ceiling. 1.0 is the recipe's; a step that exceeds it is
 #: scaled down, never skipped.
 CLIP = 1.0
+
+#: The seam between the backward pass and `optimizer.step()`. `pre_step(loss)` may scale
+#: gradients and returns whether the step may be taken at all; the loop owns both
+#: policies (per-tensor clipping and the spike skip) because they need state that lives
+#: across steps, and a policy applied after the step is a rollback, not a skip.
+PreStep = Callable[[float], bool]
 
 
 @dataclass(frozen=True)
@@ -120,8 +127,15 @@ def train_step(
     accum: int = 1,
     clip: float = CLIP,
     counters: Counters | None = None,
+    pre_step: PreStep | None = None,
 ) -> StepResult:
-    """One optimizer step over `ids [accum·batch, seq+1]`, as the docstring orders it."""
+    """One optimizer step over `ids [accum·batch, seq+1]`, as the docstring orders it.
+
+    `pre_step(loss)` is the loop's last word between the backward pass and
+    `optimizer.step()`: it may scale the gradients in place (the loop's per-tensor clip)
+    and returns `False` to refuse the step, which clears the gradients and leaves every
+    parameter and moment untouched — a skip, not a rollback.
+    """
     if ids.dim() != 2:
         raise LoudError(
             f"a step takes ids [batch, seq+1], got shape {tuple(ids.shape)}",
@@ -175,6 +189,10 @@ def train_step(
     if not torch.isfinite(torch.tensor(norm)):
         optimizer.zero_grad(set_to_none=True)
         return _skip(counters, loss_total, f"the gradient norm is {norm}")
+    if pre_step is not None and not pre_step(loss_total):
+        # The policy refused the step: the gradients go, the weights and the moments stay.
+        optimizer.zero_grad(set_to_none=True)
+        return StepResult(loss=loss_total, grad_norm=norm, skipped=True)
     sizes = optimizer.sizes
     if counters is not None:
         if sizes["muon"]:
