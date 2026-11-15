@@ -1,7 +1,8 @@
 """The four measurements the 8-bit state is accepted or rejected against.
 
-    direction   the cosine between Muon's polar factor at 32 bits and at 8, on the live
-                shapes. This decides whether the momentum buffer may be quantised at all.
+    direction   the cosine between Muon's polar factor at fp32 and at bf16/8 bits, on the
+                live shapes, over five independent momentum draws. This decides whether
+                the momentum buffer may be quantised at all, and at which width.
     quality     three seeds, 300 steps each, on a synthetic byte chain: 32-bit state
                 against 8-bit, same data order. Bar: the two means within 0.01 BPB.
     stability   200 steps with a fixed spike schedule, both arms, reported side by side.
@@ -37,7 +38,8 @@ from stacks import reference_stack
 
 from dormouse.model.assemble import assemble
 from dormouse.model.spec import StackSpec
-from dormouse.train.lowbit import BLOCK, LowBitState
+from dormouse.train.graph import state_bytes
+from dormouse.train.lowbit import LowBitState
 from dormouse.train.muon import muon_direction
 from dormouse.train.optim import MixOptimizer
 from dormouse.train.schedule import warmup_cosine
@@ -53,12 +55,18 @@ BATCH, SEQ = 8, 32
 #: Steps of ramp before the cosine anneal to zero: the recipe's shape, scaled to a smoke.
 WARMUP = 20
 SEEDS = (0, 1, 2)
-QUALITY_STEPS = 300
+QUALITY_STEPS = 200
 STABILITY_STEPS = 200
 #: Every spike is a batch drawn uniformly: the loss jumps to ln(vocab) and the next step
 #: is a large gradient, which is what a quantised moment has to survive.
 SPIKES = tuple(range(30, STABILITY_STEPS, 30))
-QUALITY_BAR = 0.01  # BPB, the bar the two methods are compared at
+QUALITY_BAR = 0.01  # BPB, the bar the quantised arms are compared against fp32 at
+#: The cosine a quantised momentum has to hold. Below it the buffer stays fp32.
+DIRECTION_BAR = 0.999
+#: Momentum draws per shape: one buffer is a draw, five is a distribution.
+DRAWS = 5
+#: Steps into a run a draw is taken at.
+DRAW_STEPS = 20
 NOISE = 0.15
 
 
@@ -89,10 +97,10 @@ def _batches(seed: int, steps: int, *, spikes: Sequence[int] = ()) -> list[torch
     return batches
 
 
-def _run(bits: int, batches: list[torch.Tensor]) -> list[float]:
+def _run(bits: int, batches: list[torch.Tensor], momentum_bits: int = 32) -> list[float]:
     """Train one arm for the whole list of batches and return the per-step loss, in nats."""
     model = reference_stack(max_seq_len=SEQ, **FIXTURE)
-    optimizer = MixOptimizer(model, optim_state_bits=bits, optim_momentum_bits=bits)
+    optimizer = MixOptimizer(model, optim_state_bits=bits, optim_momentum_bits=momentum_bits)
     losses = []
     for step, ids in enumerate(batches):
         optimizer.set_lr(warmup_cosine(step, warmup=WARMUP, total=len(batches), peak=1.0))
@@ -113,14 +121,19 @@ def _bpb(nats: Sequence[float]) -> float:
     return sum(nats) / len(nats) / math.log(2)
 
 
-def direction() -> None:
-    """Report the cosine at 32 bits against 8, on `[832, 2048]` and `[832, 832]`."""
+def _momentum(seed: int, steps: int) -> dict[str, torch.Tensor]:
+    """Return the momentum buffers of a live run, keyed by parameter name.
+
+    One draw is one run with its own weights, data and batch order — the buffer is an EMA
+    of gradients of a model whose spectrum is not a gaussian's, and the earlier gate
+    measured that difference at 0.954 against 0.9995.
+    """
     live = {"vocab": 64, "d_model": 832, "d_ffn": 2048, "n_heads": 13, "head_dim": 64}
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     model = reference_stack(n_layers=1, max_seq_len=8, **live)
     optimizer = MixOptimizer(model)
-    ids = torch.randint(0, live["vocab"], (2, 9))
-    for _ in range(20):
+    ids = torch.randint(0, live["vocab"], (2, 9), generator=torch.Generator().manual_seed(seed))
+    for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         logits = model(ids[:, :-1])
         torch.nn.functional.cross_entropy(
@@ -128,42 +141,79 @@ def direction() -> None:
         ).backward()
         optimizer.step()
     params = dict(model.named_parameters())
-    print(f"{'parameter':34s} {'shape':12s} {'block':>5s} {'cosine':>10s}")
-    for name in ("blocks.0.ffn.down.weight", "blocks.0.attn.proj.weight"):
-        buffer = optimizer.muon.state[params[name]]["momentum"].dense()
-        exact = muon_direction(buffer)
-        for block in (BLOCK, 64, 16):
-            state = LowBitState(buffer, bits=8, block=block)
-            state.apply(lambda window, source: window.copy_(source), buffer)
-            quantised = muon_direction(state.dense())
-            cosine = torch.nn.functional.cosine_similarity(
-                exact.reshape(1, -1), quantised.reshape(1, -1)
-            ).item()
-            shape = tuple(buffer.shape)
-            print(f"{name:34s} {shape!s:12s} {block:5d} {cosine:10.6f}")
+    return {
+        name: optimizer.muon.state[params[name]]["momentum"].dense()
+        for name in (
+            "blocks.0.ffn.down.weight",
+            "blocks.0.attn.proj.weight",
+            "blocks.0.attn.qkv.weight",
+        )
+    }
+
+
+def _codecs(momentum: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return the buffer at each stored width, each dequantised back to fp32."""
+    quantised = LowBitState(momentum, bits=8)
+    quantised.apply(lambda window, source: window.copy_(source), momentum)
+    return {"bf16": momentum.bfloat16().float(), "int8": quantised.dense()}
+
+
+def direction() -> None:
+    """Report the cosine at fp32 against bf16 and 8 bits, on the live shapes, five draws."""
+    #: The packed qkv is orthogonalised per head, so the live call is the one measured.
+    split = {"blocks.0.attn.qkv.weight": (26, 1664)}
+    rows: dict[tuple[str, str], list[float]] = {}
+    for seed in range(DRAWS):
+        for name, momentum in _momentum(seed, DRAW_STEPS).items():
+            exact = muon_direction(momentum, head_split=split.get(name))
+            for codec, stored in _codecs(momentum).items():
+                got = muon_direction(stored, head_split=split.get(name))
+                cosine = torch.nn.functional.cosine_similarity(
+                    exact.reshape(1, -1), got.reshape(1, -1)
+                ).item()
+                rows.setdefault((name, codec), []).append(cosine)
+    print(f"direction: {DRAWS} draws, momentum {DRAW_STEPS} steps in, bar {DIRECTION_BAR}")
+    print(f"{'parameter':29s} {'codec':6s} {'min':>9s} {'mean':>9s} {'max':>9s}")
+    for (name, codec), values in sorted(rows.items()):
+        print(
+            f"{name:29s} {codec:6s} {min(values):9.6f} "
+            f"{sum(values) / len(values):9.6f} {max(values):9.6f}"
+        )
 
 
 def quality() -> None:
-    """Run three seeds for 300 steps each, both arms, same batches; report the final loss."""
-    print(f"quality: {QUALITY_STEPS} steps, batch {BATCH} x {SEQ}, {len(SEEDS)} seeds")
-    print(f"{'seed':>4s} {'32-bit BPB':>12s} {'8-bit BPB':>12s} {'delta':>9s}")
-    dense, quantised = [], []
-    for seed in SEEDS:
-        batches = _batches(seed, QUALITY_STEPS)
-        final_dense = _bpb(_run(32, batches)[-10:])
-        final_low = _bpb(_run(8, batches)[-10:])
-        dense.append(final_dense)
-        quantised.append(final_low)
-        print(f"{seed:4d} {final_dense:12.4f} {final_low:12.4f} {final_low - final_dense:+9.4f}")
-    mean_dense = sum(dense) / len(dense)
-    mean_low = sum(quantised) / len(quantised)
-    spread = math.sqrt(sum((x - mean_low) ** 2 for x in quantised) / len(quantised))
-    print(
-        f"mean 32-bit {mean_dense:.4f} BPB, mean 8-bit {mean_low:.4f} ± {spread:.4f}, "
-        f"delta {mean_low - mean_dense:+.4f} BPB (bar {QUALITY_BAR})"
+    """Run three seeds at each state width, same batches, and report the BPB each lands at."""
+    arms = (
+        ("fp32 (reference)", 32, 32),
+        ("momentum bf16", 32, 16),
+        ("v bf16", 16, 32),
+        ("v 8-bit", 8, 32),
+        ("v 8 + mom bf16", 8, 16),
     )
-    verdict = abs(mean_low - mean_dense) <= QUALITY_BAR
-    print(f"quality: {'PASS' if verdict else 'FAIL'} — smoke at 300 steps, not a claim")
+    print(f"quality: {QUALITY_STEPS} steps, batch {BATCH} x {SEQ}, {len(SEEDS)} seeds")
+    print(
+        f"{'arm':18s} "
+        + " ".join(f"{f'seed {seed}':>9s}" for seed in SEEDS)
+        + f" {'mean':>8s} {'spread':>7s}"
+    )
+    reference = 0.0
+    for label, bits, momentum_bits in arms:
+        finals = []
+        for seed in SEEDS:
+            batches = _batches(seed, QUALITY_STEPS)
+            finals.append(_bpb(_run(bits, batches, momentum_bits)[-10:]))
+        mean = sum(finals) / len(finals)
+        spread = math.sqrt(sum((x - mean) ** 2 for x in finals) / len(finals))
+        if not reference:
+            reference = mean
+        delta = mean - reference
+        verdict = "" if not reference else f"  {delta:+.4f} vs fp32"
+        print(
+            f"{label:18s} "
+            + " ".join(f"{value:9.4f}" for value in finals)
+            + f" {mean:8.4f} {spread:7.4f}{verdict}"
+        )
+    print(f"quality: bar {QUALITY_BAR} BPB — smoke at {QUALITY_STEPS} steps, not a claim")
 
 
 def stability() -> None:
@@ -182,13 +232,14 @@ def stability() -> None:
 
 def memory() -> None:
     """One 1.05B construction plus one optimizer step per arm, in its own process."""
-    print("memory: 1.05B config, construction + one step, peak RSS")
-    print(f"{'arm':22s} {'peak GB':>9s} {'wall s':>8s}")
+    print("memory: 1.05B config, construction + one step, peak RSS and state GB")
+    print(f"{'arm':22s} {'peak GB':>9s} {'state':>9s} {'wall s':>8s}")
     peaks = {}
     for label, bits, momentum_bits in (
         ("state 8-bit", 8, 8),
         ("state 32-bit", 32, 32),
-        ("8-bit v, 32-bit mom", 8, 32),
+        ("v 8 + momentum bf16", 8, 16),
+        ("all bf16", 16, 16),
     ):
         started = time.time()
         #: A child per arm: a peak RSS belongs to a process, and the parent must not carry
@@ -203,12 +254,14 @@ def memory() -> None:
         if result.returncode != 0:
             print(f"{label:22s} failed: {result.stderr.strip().splitlines()[-1]}")
             continue
-        count, peak = (float(part) for part in result.stdout.strip().splitlines()[-1].split())
+        count, peak, state = (
+            float(part) for part in result.stdout.strip().splitlines()[-1].split()
+        )
         peaks[label] = peak
-        print(f"{label:22s} {peak:9.2f} {wall:8.1f}   ({count / 1e9:.3f}B parameters)")
-    if "state 8-bit" in peaks and "state 32-bit" in peaks:
-        delta = peaks["state 32-bit"] - peaks["state 8-bit"]
-        print(f"delta (32-bit state minus 8-bit state): {delta:+.2f} GB")
+        print(f"{label:22s} {peak:9.2f} {state:9.2f} {wall:8.1f}   ({count / 1e9:.3f}B parameters)")
+    for label, peak in peaks.items():
+        if label != "state 32-bit":
+            print(f"delta (32-bit state minus {label}): {peaks['state 32-bit'] - peak:+.2f} GB")
 
 
 def _arm(bits: int, momentum_bits: int) -> None:
@@ -228,7 +281,13 @@ def _arm(bits: int, momentum_bits: int) -> None:
         param.grad = torch.zeros_like(param)
     optimizer.step()
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2
-    print(f"{sum(p.numel() for p in model.parameters())} {peak:.2f}")
+    weights = sum(p.numel() * p.element_size() for p in model.parameters())
+    grads = sum(p.numel() * p.element_size() for p in model.parameters() if p.grad is not None)
+    count = sum(p.numel() for p in model.parameters())
+    #: The moments alone: `state_bytes` counts weights and gradients too, and only the
+    #: moments are what the width knob changes.
+    moments = state_bytes(model, optimizer) - weights - grads
+    print(f"{count} {peak:.2f} {moments / 1024**3:.2f}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

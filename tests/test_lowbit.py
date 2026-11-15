@@ -119,6 +119,18 @@ def test_a_constant_magnitude_block_round_trips_bit_for_bit() -> None:
             assert torch.equal(round_trip(values), values), (sign, magnitude)
 
 
+def test_a_bf16_state_is_the_cast_and_its_error_is_relative() -> None:
+    """16 bits is a codec with one exponent per value: `bf16(x)`, never a block scale (§6)."""
+    torch.manual_seed(8)
+    values = torch.cat([torch.randn(2048), torch.randn(512) * 1e-6, torch.randn(512) * 1e6])
+    state = LowBitState(values, bits=16)
+    assert state.data["dense"].dtype == torch.bfloat16
+    state.apply(lambda window, source: window.copy_(source), values)
+    assert torch.equal(state.dense(), values.bfloat16().float())
+    relative = ((state.dense() - values).abs() / values.abs()).max()
+    assert relative.item() <= 2**-8, relative.item()
+
+
 def test_a_zero_block_quantises_to_its_own_code_and_dequantises_to_zero() -> None:
     """The smallest nonzero code is `1e-37·N`, not `0`, so a zero must have code 0 (§3)."""
     values = torch.cat([torch.zeros(300), torch.ones(300)])
@@ -238,7 +250,52 @@ def test_the_momentum_does_not_hold_muons_direction_at_eight_bits() -> None:
         assert measured[name, 64] > measured[name, 256], name
 
 
+def test_the_momentum_holds_muons_direction_at_bf16() -> None:
+    """§6 of `muon.py`, measured five draws at the three live shapes: `≥ 0.999`.
+
+    The gate the `optim_momentum_bits=16` rung is accepted on. Five draws because one
+    buffer is a sample and the result depends on its spectrum; a run 3 steps in is a
+    *younger*, flatter buffer than one 20 steps in, which is the harder draw.
+    """
+    split = {"blocks.0.attn.qkv.weight": (26, 1664)}
+    measured = {}
+    for seed in range(5):
+        for name, momentum in _live_momentum(seed).items():
+            exact = muon_direction(momentum, head_split=split.get(name))
+            stored = muon_direction(momentum.bfloat16().float(), head_split=split.get(name))
+            measured[name] = torch.nn.functional.cosine_similarity(
+                exact.reshape(1, -1), stored.reshape(1, -1)
+            ).item()
+    assert set(measured) == set(LIVE_NAMES) | {"blocks.0.attn.qkv.weight"}
+    for name, cosine in measured.items():
+        assert cosine >= DIRECTION_BAR, f"{name}: {cosine:.6f}"
+
+
 # ------------------------------------------------------------------------ the wiring
+
+
+def test_a_bf16_momentum_is_two_bytes_and_the_state_dict_still_loads() -> None:
+    """The plumbing at 16 bits: one bf16 tensor, and `weights_only=True` can read it."""
+    torch.manual_seed(9)
+    model = reference_stack(**SMALL)
+    mix = MixOptimizer(model, optim_momentum_bits=16)
+    ids = torch.randint(0, SMALL["vocab"], (2, 9))
+    _backward(model, ids)
+    mix.step()
+    matrix = dict(model.named_parameters())["blocks.0.attn.proj.weight"]
+    momentum = mix.muon.state[matrix]["momentum"]
+    assert momentum.bits == 16
+    assert momentum.data["dense"].dtype == torch.bfloat16
+    assert momentum.data["dense"].numel() == matrix.numel()
+    saved = io.BytesIO()
+    torch.save(mix.state_dict(), saved)
+    saved.seek(0)
+    loaded = torch.load(saved, map_location="cpu", weights_only=True)
+    assert loaded["state_bits"][2] == 16
+    twin = reference_stack(**SMALL)
+    MixOptimizer(twin, optim_momentum_bits=16).load_state_dict(loaded)
+    with pytest.raises(LoudError, match="16"):
+        MixOptimizer(reference_stack(**SMALL)).load_state_dict(loaded)
 
 
 def test_the_token_table_keeps_32_bit_state_whatever_is_asked() -> None:
@@ -334,13 +391,13 @@ def test_plain_and_revive_are_inverse_without_the_container() -> None:
 
 
 def test_a_width_the_module_cannot_keep_is_refused() -> None:
-    for bits in (16, 4, 0):
+    for bits in (12, 4, 0):
         with pytest.raises(LoudError, match="bits"):
             check(bits, BLOCK)
     with pytest.raises(LoudError, match="block"):
         check(8, 0)
     with pytest.raises(LoudError, match="bits"):
-        MixOptimizer(reference_stack(**SMALL), optim_state_bits=16)
+        MixOptimizer(reference_stack(**SMALL), optim_state_bits=12)
 
 
 def test_a_schedule_free_run_refuses_the_knob_it_does_not_read() -> None:
@@ -380,6 +437,27 @@ def test_the_memory_price_of_a_step_sees_the_codes_and_not_only_tensors() -> Non
     counted = state_bytes(quantised_model, quantised)
     assert counted > weights + gradients, "the 8-bit moment was not counted at all"
     assert counted < state_bytes(dense_model, dense), "8-bit state is not cheaper than 32"
+
+
+def _live_momentum(seed: int) -> dict[str, torch.Tensor]:
+    """Return the momentum of a live run 3 steps in, keyed by the live parameter names."""
+    live = {"vocab": 64, "d_model": 832, "d_ffn": 2048, "n_heads": 13, "head_dim": 64}
+    torch.manual_seed(seed)
+    model = reference_stack(n_layers=1, max_seq_len=8, **live)
+    optimizer = MixOptimizer(model)
+    ids = torch.randint(0, live["vocab"], (2, 9), generator=torch.Generator().manual_seed(seed))
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(ids[:, :-1])
+        torch.nn.functional.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1)
+        ).backward()
+        optimizer.step()
+    params = dict(model.named_parameters())
+    return {
+        name: optimizer.muon.state[params[name]]["momentum"].dense()
+        for name in (*LIVE_NAMES, "blocks.0.attn.qkv.weight")
+    }
 
 
 def _backward(model: torch.nn.Module, ids: torch.Tensor) -> None:

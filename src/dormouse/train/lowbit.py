@@ -77,6 +77,24 @@ which refuses to construct an arbitrary class. So `to_plain` writes `{"bits", "b
 "shape", "dense"}` or `{"codes", "scales", ...}`, and `plain_state_dict` is what both
 arms return from `state_dict()`: a saved moment is an int8 tensor, a float tensor, and
 the ints that say how to read them.
+
+§6. THE 16-BIT RUNG: BF16 IS A RELATIVE CODEC. A block code spends one scale on 256
+values; bf16 spends one exponent on *every* value, so its error is relative — at most
+`2^-8` = 0.4% of the value, whatever the tensor's spread — and there is no scale, no block
+and no lookup: the codec is a cast, and the state is one bf16 tensor with a list of one
+key. That is what a momentum needs and a block code cannot give. On the live shapes, five
+draws each, the cosine between `polar(m)` at fp32 and at the stored width is
+
+    [832, 2048]   bf16 0.99989-0.99995    8-bit 0.934-0.955
+    [832, 832]    bf16 0.99992-0.99995    8-bit 0.983-0.989
+    [2496, 832]   bf16 0.99987-0.99990    8-bit 0.963-0.967
+
+(`tools/lowbit_gates.py --only direction`, momentum 20 steps into a run, the packed qkv
+through its per-head split.) bf16 holds `muon.py` §6's 0.999 bar with 8.7e-4 at the worst
+draw; 8 bits holds it at none. It costs 2 bytes per value against 1.0156 for the block
+code, which is still half of the fp32 buffer — and the buffer is the whole memory question
+at 1B.
+
 """
 
 from __future__ import annotations
@@ -103,8 +121,8 @@ __all__ = [
 #: Values that share one scale: the paper's default block (§1).
 BLOCK = 256
 
-#: The two widths a moment can have: the dense tensor it always was, or 8 bits.
-BITS = (32, 8)
+#: The widths a moment can have: the dense tensor it always was, bf16, or 8-bit blocks.
+BITS = (32, 16, 8)
 
 #: Values per pass in `LowBitState.apply`. The transient is this many fp32 values, so a
 #: 1B-parameter moment is quantised 1M values at a time rather than allocated at 4 GB.
@@ -148,8 +166,9 @@ def check(bits: int, block: int) -> None:
     if bits not in BITS:
         raise LoudError(
             f"optimizer state bits={bits}",
-            "a moment is 32 bits (the dense tensor `torch.optim` keeps) or 8 (block-wise, "
-            "this module); a third width is a format no checkpoint here can load",
+            "a moment is 32 bits (the dense tensor `torch.optim` keeps), 16 (bf16, one "
+            "exponent per value) or 8 (block-wise codes, this module); a fourth width is "
+            "a format no checkpoint here can load",
         )
     if block < 1:
         raise LoudError(
@@ -160,12 +179,13 @@ def check(bits: int, block: int) -> None:
 
 
 class LowBitState:
-    """One optimizer moment, held as 8-bit blocks of `block` values or as a dense tensor.
+    """One optimizer moment: an 8-bit block code, a bf16 tensor, or the dense original.
 
     The 32-bit path is the tensor `torch.optim` would have allocated, and every operation
     over it is the same in-place call on the same values: a run at `bits=32` is the run
-    this module did not exist for. The 8-bit path dequantises a window, applies the same
-    in-place call in fp32, and re-quantises the blocks the window covers.
+    this module did not exist for. Both other widths dequantise a window, apply the same
+    in-place call in fp32, and write the window back in the stored format — codes and
+    scales at 8, a bf16 cast at 16 (`dense()` is the same rule: fp32 out unless 32).
     """
 
     def __init__(self, like: torch.Tensor, *, bits: int = 8, block: int = BLOCK) -> None:
@@ -180,6 +200,9 @@ class LowBitState:
         if bits == 32:
             #: `zeros_like`, not fp32: a 32-bit moment has always followed its parameter.
             self.data = {"dense": torch.zeros_like(like)}
+        elif bits == 16:
+            #: bf16 stores an exponent per value, so there is no scale and no block (§6).
+            self.data = {"dense": torch.zeros(like.shape, dtype=torch.bfloat16, device=like.device)}
         else:
             self.data = {
                 "codes": torch.zeros(padded, dtype=torch.int8, device=like.device),
@@ -196,13 +219,17 @@ class LowBitState:
             tensor.zero_()
 
     def dense(self) -> torch.Tensor:
-        """Return the state as a tensor: the stored one at 32 bits, a copy at 8.
+        """Return the state as a tensor: the stored one at 32 bits, an fp32 copy below it.
 
         At 32 bits this is the tensor itself, not a copy: `Muon` hands it to the polar
         chain, which allocates its own intermediates and does not write to its argument.
+        A quantised state comes back in fp32 because that is the width every caller does
+        its arithmetic in — the stored precision is what the width buys, not the step's.
         """
-        if "dense" in self.data:
+        if self.bits == 32:
             return self.data["dense"]
+        if self.bits == 16:
+            return self.data["dense"].float()
         return self._dequantise(0, self._padded())[: self.numel].view(self.shape)
 
     def apply(self, update: Callable[..., None], *others: torch.Tensor) -> None:
@@ -224,11 +251,16 @@ class LowBitState:
         for start in range(0, self.numel, step):
             stop = min(start + step, self.numel)
             parts = [other.reshape(-1)[start:stop] for other in others]
-            if "dense" in self.data:
+            if self.bits == 32:
                 update(self.data["dense"].reshape(-1)[start:stop], *parts)
                 continue
-            #: Whole blocks only, so the last window can overhang `numel` into the pad.
-            hi = min(-(-stop // self.block) * self.block, self._padded())
+            #: Whole blocks only, so an 8-bit window can overhang `numel` into the pad;
+            #: a bf16 state is dense and stops where the parameter does.
+            hi = (
+                self.numel
+                if self.bits == 16
+                else min(-(-stop // self.block) * self.block, self._padded())
+            )
             window = self._dequantise(start, hi)
             update(window[: stop - start], *parts)
             self._quantise(window, start)
@@ -240,7 +272,8 @@ class LowBitState:
         resumed run on a card would otherwise step a CPU moment against GPU gradients.
         """
         for name, tensor in self.data.items():
-            self.data[name] = tensor.to(device=device, dtype=dtype if name == "dense" else None)
+            follows = dtype if (name == "dense" and self.bits == 32) else None
+            self.data[name] = tensor.to(device=device, dtype=follows)
 
     def to_plain(self) -> dict[str, Any]:
         """Write the state as tensors and ints: what `torch.save` can keep (§5)."""
@@ -264,6 +297,10 @@ class LowBitState:
 
     def _quantise(self, window: torch.Tensor, start: int) -> None:
         """Write `window` (whole blocks from `start`) as one scale and one code per value."""
+        if self.bits == 16:
+            stored = self.data["dense"].reshape(-1)
+            stored[start : start + window.numel()].copy_(window)
+            return
         rows = window.numel() // self.block
         grid = window.view(rows, self.block)
         scale = grid.abs().amax(dim=1)
@@ -278,7 +315,9 @@ class LowBitState:
         ).reshape(-1)
 
     def _dequantise(self, start: int, stop: int) -> torch.Tensor:
-        """`sgn(q)·M[|q|]·N` for the whole blocks in `[start, stop)` (§2)."""
+        """`sgn(q)·M[|q|]·N` for the blocks in `[start, stop)` (§2), or the bf16 cast."""
+        if self.bits == 16:
+            return self.data["dense"].reshape(-1)[start:stop].float()
         rows = (stop - start) // self.block
         lo = start // self.block
         codes = self.data["codes"][start:stop].view(rows, self.block)

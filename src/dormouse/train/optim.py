@@ -30,8 +30,12 @@ contract; under `cosine` and `wsd` it only flips the module's mode.
 §9. THE STATE WIDTHS, AND WHERE THE DECISION LIVES. `optim_state_bits` is the second
 moment (`v`, and Muon's momentum buffer, which is the only moment that arm has);
 `optim_first_moment_bits` is `m`; both are 32 unless asked, so `MixOptimizer(model)` is
-the optimiser that was here. Two decisions are taken here rather than by the caller:
-the token table keeps 32-bit state whatever is asked — `lowbit.py` §3, the paper's
+the optimiser that was here. The widths are 32 (the dense tensor), 16 (bf16: a relative
+codec, one exponent per value) and 8 (block-wise codes, `lowbit.py` §2); `bf16` is what
+the momentum can afford and 8 bits is not — `muon.py` §6 has the cosines.
+
+Two decisions are taken here rather than by the caller: the token table keeps 32-bit
+state whatever is asked — `lowbit.py` §4, the paper's
 stable-embedding rule, because a rare token's row is where the second moment underflows
 — and the `sf` mode refuses an 8-bit knob outright, because its arms keep `z`, `m` and
 `v` per parameter and no quantiser is wired into them. `state_dict` carries the widths

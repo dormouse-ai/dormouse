@@ -73,10 +73,22 @@ steps in (`tools/lowbit_gates.py --only direction`):
 All six are below the 0.999 a direction has to hold to be worth quantising, and no block
 size reaches it: a young buffer is close to noise, its spectrum is nearly flat, and the
 small singular values sit on the quantisation floor — the polar factor turns with them,
-which is exactly the sensitivity §3 records for a badly conditioned matrix. So
-`optim_momentum_bits` defaults to 32 and is a separate knob from `optim_state_bits`, which
-is AdamW's second moment: a relative error in `v` is halved by the square root before it
-reaches a step, and a relative error in `m` is the step.
+which is exactly the sensitivity §3 records for a badly conditioned matrix.
+
+Sixteen bits is a different question, and the same measurement answers it: bf16 keeps an
+exponent per value, so its error is relative and 8-bit-block-shaped error is not. Five
+draws on three shapes (`tools/lowbit_gates.py --only direction`; the qkv through its
+per-head split):
+
+    [832, 2048]   bf16 0.99989-0.99995    8-bit 0.934-0.955
+    [832, 832]    bf16 0.99992-0.99995    8-bit 0.983-0.989
+    [2496, 832]   bf16 0.99987-0.99990    8-bit 0.963-0.967
+
+So `optim_momentum_bits` defaults to 32, `16` is the width the buffer can take — it holds
+the 0.999 bar at the worst of its fifteen draws — and `8` is not one, at any block size.
+The knob is separate from `optim_state_bits`, which is AdamW's second moment: a relative
+error in `v` is halved by the square root before it reaches a step, and a relative error
+in `m` *is* the step. `lowbit.py` §6 has the codec's own numbers.
 """
 
 from __future__ import annotations
