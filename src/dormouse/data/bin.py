@@ -26,6 +26,10 @@ from dormouse_core.errors import LoudError
 #: Item sizes we accept, with the name used in the manifest.
 DTYPES = {"uint8": np.uint8, "uint16": np.uint16, "uint32": np.uint32}
 
+#: Two concepts, declared: what the bytes on disk mean (`Manifest`), and the window
+#: that reads them (`Stream`). The reader is the only thing that needs both.
+__concepts__ = ("Manifest", "Stream")
+
 
 @dataclass(frozen=True)
 class Manifest:

@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
   "dormouse-core @ git+https://github.com/dormouse-ai/dormouse-core@master",
   "numpy>=1.26",
+  "torch>=2.5",
 ]
 
 [project.scripts]
@@ -14,6 +15,7 @@ dorm = "dormouse.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "hypothesis>=6", "mypy>=1.11", "ruff>=0.6"]
+model = ["torch>=2.13"]
 
 [build-system]
 requires = ["setuptools>=69"]
@@ -45,3 +47,7 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["torch", "torch.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["dormouse.model.*"]
+disallow_subclassing_any = false
