@@ -25,9 +25,20 @@ is `torch.equal` to the dense one, not merely close. A test pins that, because a
 wearing the same name.
 
 Ceiling: the SVD runs in the forward, per matrix, per call — `ponytail:`, the honest
-cost of masters that keep training. Make the factors parameters (or refresh them
-every N steps) when the projection becomes a training-time arm rather than a compute
-path; until then the numbers this module prints are FLOPs, not step time.
+cost of masters that keep training. MEASURED at the profiler's widths (2 layers, 2
+experts, batch 2 x 1024 tokens, 33 Muon matrices): the 12 expert factorisations are **46,865 of
+the step's 58,054 kernel launches (80.7%)** and the forward is 72% of the step's
+milliseconds. They are LAPACK's batched kernels — `gesvdbj_batch`, `svd_row_rotate_batch`,
+`geqr2_gmem` — a few thousand tiny launches per `[832, 6144]`.
+
+Make the factors parameters (or refresh them every N steps) when the projection becomes
+a training-time arm rather than a compute path; until then the numbers this module prints
+are FLOPs, not step time. A third option, cheaper than either and not yet taken: the
+truncated factors of the SHORT side, `eigh` of the `[832, 832]` Gram plus one
+`[r, 832] @ [832, 6144]` product, is the same truncation in exact arithmetic and would
+cut those launches from a few thousand to tens — but it moves the forward's values at
+~1e-5 (the Gram squares the condition number), so it is a decision about the arm, not a
+scheduling detail.
 """
 
 from __future__ import annotations
