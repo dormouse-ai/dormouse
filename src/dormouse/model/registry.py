@@ -118,10 +118,16 @@ QAT: dict[str, Piece] = {
     "ternary": Piece(
         "weight_qat", "ternary", "weight_qat", "weight_ternary", Coeffects(), "1.58-bit weights"
     ),
+    "fp4": Piece(
+        "weight_qat", "fp4", "weight_qat", "weight_fp4", Coeffects(), "e2m1 weights, e4m3 per 16"
+    ),
 }
 
 QUANT: dict[str, Piece] = {
     "int4": Piece("act_quant", "int4", "act_quant", "act_int4", Coeffects(), "int4 activations"),
+    "fp4": Piece(
+        "act_quant", "fp4", "act_quant", "act_fp4", Coeffects(), "NVFP4 at the block boundary"
+    ),
 }
 
 

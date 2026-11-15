@@ -34,6 +34,8 @@ against.
 
 from __future__ import annotations
 
+from typing import Any, Protocol, cast
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
@@ -42,7 +44,7 @@ from torch import nn
 from ..kernels import fused
 from .ffn_spec import FFNSpec
 
-__concepts__ = ("RMSNorm", "Block")
+__concepts__ = ("RMSNorm", "Block", "Billable")
 
 #: One ε for every norm in the stack; see the module docstring for why 1e-6.
 EPS = 1e-6
@@ -51,6 +53,20 @@ EPS = 1e-6
 #: pre-activation has variance `d·0.02² ≈ 0.33`, a third of the unit-RMS stream it
 #: is added to. The residual-writing projection takes the block's `write_std`.
 PROJ_STD = 0.02
+
+
+class Billable(Protocol):
+    """A sublayer that prices one token of its own forward in multiply-adds.
+
+    Structural on purpose: every attention arm and every FFN arm already has the
+    method, and a block that called a missing one would fail at the first `dorm plan`
+    rather than at import — the projection, MoE and TSCT bills are the source of the
+    number, not a table in the CLI.
+    """
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the multiply-adds one token costs through this sublayer."""
+        ...
 
 
 class RMSNorm(nn.Module):
@@ -120,9 +136,9 @@ class Block(nn.Module):
             )
         write_std = PROJ_STD / (2.0 * n_layers) ** 0.5
         self.norm1 = RMSNorm(d_model, eps, device=device)
-        self.attn = attn
+        self.attn: Billable = cast(Billable, attn)
         self.norm2 = RMSNorm(d_model, eps, device=device)
-        self.ffn = self._build_ffn(d_model, d_ffn, ffn, write_std, device)
+        self.ffn: Billable = cast(Billable, self._build_ffn(d_model, d_ffn, ffn, write_std, device))
 
     @staticmethod
     def _build_ffn(
@@ -162,4 +178,10 @@ class Block(nn.Module):
 
     def extra_repr(self) -> str:
         """Print what one layer costs, without materialising it."""
-        return f"d_model={self.attn.d_model}, d_ffn={self.ffn.d_ffn}"
+        attn = cast(Any, self.attn)
+        ffn = cast(Any, self.ffn)
+        return f"d_model={attn.d_model}, d_ffn={ffn.d_ffn}"
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the block's MACs per token: one attention pass plus one FFN pass."""
+        return self.attn.macs_per_token(seq_len) + self.ffn.macs_per_token(seq_len)

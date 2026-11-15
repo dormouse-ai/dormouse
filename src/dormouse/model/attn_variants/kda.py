@@ -169,6 +169,25 @@ class KDA(LatentProjections):
         """Print the kernel and the compression (the base class prints the widths)."""
         return f"chunk={self.chunk}, " + super().extra_repr()
 
+    def macs_per_token(self, _seq_len: int) -> int:
+        """Return the layer's multiplies per token: projections, gates, kernel.
+
+        The kernel is `_chunkwise`'s matmuls, per head per token at chunk `C` and
+        head width `d`: `3·C·d` for the ratio-weighted pair products (`gram`, `qk`,
+        `qk @ pseudo`), `C·d/2` for the triangular solve, and `3·d²` for the three
+        state products (`keyed @ S`, `out @ S`, the carry).
+        """
+        gate = self.gate.in_features * self.gate.out_features
+        decay = (
+            self.a_down.in_features * self.a_down.out_features
+            + self.a_up.in_features * self.a_up.out_features
+            + self.beta.in_features * self.beta.out_features
+        )
+        conv = self.conv.in_channels * self.conv.kernel_size[0]
+        chunk, width = self.chunk, self.head_dim
+        kernel = self.n_heads * (3 * chunk * width + chunk * width // 2 + 3 * width * width)
+        return super().macs_per_token() + gate + decay + conv + kernel
+
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the attention write, same shape."""

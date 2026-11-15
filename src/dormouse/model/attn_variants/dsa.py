@@ -283,3 +283,13 @@ class DSA(LatentProjections):
         out = torch.einsum("bhsk,bhskd->bhsd", weights, values).transpose(1, 2)
         y = self.proj(out.reshape(batch, seq, self.d_kv))
         return cast(torch.Tensor, y)
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the layer's multiplies per token: projections, indexer, kernel.
+
+        The kernel reads at most `k + window` positions per query (`_layout`), and
+        `_attend` multiplies each of them twice: q·k and the weighted sum of v.
+        """
+        keep = min(seq_len, self.k + self.window)
+        kernel = 2 * self.n_heads * self.head_dim * keep
+        return super().macs_per_token() + self.indexer.macs_per_token() + kernel

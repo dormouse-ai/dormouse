@@ -24,6 +24,12 @@ is `torch.equal` to the dense one, not merely close. A test pins that, because a
 "factorisation" that is only approximately the dense layer is a different model
 wearing the same name.
 
+THE WEIGHT IT FACTORISES IS THE MODULE'S EFFECTIVE ONE. `low_rank` never calls
+`linear.forward`, so a quantized weight applied only in `forward` would be skipped by
+every expert in the bank while the block still counted the matrix. `quant.QuantLinear`
+therefore publishes `effective_weight()` and this module reads that, which is what makes
+`weight_qat` a statement about the arithmetic rather than about a class name.
+
 Ceiling: the SVD runs in the forward, per matrix, per call — `ponytail:`, the honest
 cost of masters that keep training. Make the factors parameters (or refresh them
 every N steps) when the projection becomes a training-time arm rather than a compute
@@ -38,6 +44,8 @@ import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
+
+from .quant import QuantLinear
 
 #: The rank the one architecture's experts are factorised at.
 TSCT_RANK = 256
@@ -93,8 +101,23 @@ def low_rank(
     """`linear(x)` computed through the rank-`rank` factors of its current weight."""
     if rank < 1:
         return cast(torch.Tensor, linear(x))
-    u, s, v = factors(linear.weight, rank)
+    weight = linear.effective_weight() if isinstance(linear, QuantLinear) else linear.weight
+    u, s, v = factors(weight, rank)
     y: torch.Tensor = ((x @ u) * s) @ v
     if counters is not None:
         counters.count("tsct_fwd", x.shape[0])
     return y + linear.bias if linear.bias is not None else y
+
+
+def matrix_macs(in_features: int, out_features: int, rank: int) -> int:
+    """Multiplies one token costs through a matrix, as `low_rank` runs it.
+
+    `rank < 1` calls the matrix: `in·out`. Otherwise `factors` truncates to
+    `min(rank, in, out)` and the read is `in·r + r·out` — including the identity
+    basis at `r = min(in, out)`, which is still two matmuls and not the dense one.
+    The `·s` scale is one multiply per output and is not in this count.
+    """
+    if rank < 1:
+        return in_features * out_features
+    r = min(rank, in_features, out_features)
+    return in_features * r + r * out_features

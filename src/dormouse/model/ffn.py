@@ -55,7 +55,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .activations import DEFAULT_DICTIONARY, activation, resolve
-from .tsct import low_rank
+from .tsct import low_rank, matrix_macs
 
 __concepts__ = ("GatedFFN", "LaFFN", "MoaFFN")
 
@@ -128,6 +128,13 @@ class _Glu(nn.Module):
     def _read(self, linear: nn.Linear, x: torch.Tensor, counters: Counters | None) -> torch.Tensor:
         """One of the three matrices, dense or through its rank-`r` factors."""
         return low_rank(linear, x, self.tsct_rank, counters)
+
+    def macs_per_token(self, _seq_len: int) -> int:
+        """Return the arm's multiplies per token, through the same rank `_read` uses."""
+        return sum(
+            matrix_macs(linear.in_features, linear.out_features, self.tsct_rank)
+            for linear in (self.gate, self.up, self.down)
+        )
 
 
 class GatedFFN(_Glu):
@@ -329,3 +336,7 @@ class MoaFFN(_Glu):
             f"d_model={self.d_model}, d_ffn={self.d_ffn}, "
             f"dict={','.join(self.dictionary)}, sides={self.sides}"
         )
+
+    def macs_per_token(self, seq_len: int) -> int:
+        """Return the arm's multiplies per token, including the `d → K` mixture gate."""
+        return super().macs_per_token(seq_len) + self.mix.in_features * self.mix.out_features
