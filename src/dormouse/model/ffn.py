@@ -58,6 +58,7 @@ peak; the output and every gradient stay `torch.equal` to the chain
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import torch
 from dormouse_core.counters import Counters
@@ -66,7 +67,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from .activations import DEFAULT_DICTIONARY, activation, resolve
-from .tsct import low_rank
+from .tsct import FactorLinear, project
 
 __concepts__ = ("GatedFFN", "LaFFN", "MoaFFN")
 
@@ -177,10 +178,10 @@ class _Glu(nn.Module):
     `MoaFFN` differ only in what happens between `gate`/`up` and `down`, so the
     parameter-neutral width argument applies to all of them by construction.
 
-    `tsct_rank` is the compute path, not a second bill: above zero the three
-    matrices are read through their rank-`rank` spectrum (`tsct.py`) while the
-    parameters stay the dense `d·f` masters, so `state_dict()` and the parameter
-    count are the dense ones on both settings.
+    `tsct_rank` is a storage setting, not only a compute path: above zero each of the
+    three matrices is a `FactorLinear` holding `u [d, r]` and `v [r, f]`, so it stores
+    `d·r + r·f` and runs two matmuls (`tsct.py`). At zero they are the dense control
+    arm — `n·f` parameters, one matmul — and nothing else about the arm changes.
     """
 
     def __init__(
@@ -202,16 +203,17 @@ class _Glu(nn.Module):
         self.d_model = d_model
         self.d_ffn = d_ffn
         self.tsct_rank = tsct_rank
-        self.gate = nn.Linear(d_model, d_ffn, bias=False, device=device)
-        self.up = nn.Linear(d_model, d_ffn, bias=False, device=device)
-        self.down = nn.Linear(d_ffn, d_model, bias=False, device=device)
-        nn.init.normal_(self.gate.weight, std=PROJ_STD)
-        nn.init.normal_(self.up.weight, std=PROJ_STD)
-        nn.init.normal_(self.down.weight, std=write_std)
+        self.gate = project(d_model, d_ffn, tsct_rank, std=PROJ_STD, device=device)
+        self.up = project(d_model, d_ffn, tsct_rank, std=PROJ_STD, device=device)
+        self.down = project(d_ffn, d_model, tsct_rank, std=write_std, device=device)
 
-    def _read(self, linear: nn.Linear, x: torch.Tensor, counters: Counters | None) -> torch.Tensor:
-        """One of the three matrices, dense or through its rank-`r` factors."""
-        return low_rank(linear, x, self.tsct_rank, counters)
+    def _read(
+        self, matrix: nn.Linear | FactorLinear, x: torch.Tensor, counters: Counters | None
+    ) -> torch.Tensor:
+        """One of the three matrices, dense or through its stored rank-`r` factors."""
+        if counters is not None and isinstance(matrix, FactorLinear):
+            counters.count("tsct_fwd", x.shape[0])
+        return cast(torch.Tensor, matrix(x))
 
 
 class GatedFFN(_Glu):

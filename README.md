@@ -61,7 +61,7 @@ $ echo $?
 | `eval` | working: the five-task harness and BPB with its byte window |
 | `data/bin.py`, `data/mix.py` | working: memory-mapped streams, exact shares, resume by arithmetic |
 | `metrics.py` | working: BPB is a type that cannot exist without its evaluation window |
-| `model/` | the one 1B/46M stack, priced on the meta device and assembled from the spec |
+| `model/` | the one 348M-stored / 16M-FFN-active stack (rank-256 factorised experts), priced on the meta device and assembled from the spec |
 | `run`, `serve`, `export`, `tokenize` | refuse by design until the layer behind them moves |
 
 The old research stack lives in [sehaxe/dormouse](https://github.com/sehaxe/dormouse)

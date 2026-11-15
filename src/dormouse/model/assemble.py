@@ -10,11 +10,12 @@ next one safe:
 
 WHY THE BANK IS SHARED BY THE LAYERS. `ffn=moe` is one bank of `n_experts`, and every
 layer routes into it. That is the arithmetic the stack is designed to: at
-`d_model=832, d_ffn=6144, n_experts=64, topk=2, n_shared=1` the bank stores
-`65·3·832·6144 ≈ 1.0B` parameters and runs `3·3·832·6144 ≈ 46.1M` per token. One bank
-per layer would store twelve times that and run 553M per token, which is not the
-"1B stored / 46M active" the model is priced at — so the sharing is stated here, in
-one place, rather than discovered from a `param_report` that does not add up.
+`d_model=832, d_ffn=6144, n_experts=64, topk=2, n_shared=1, rank=256` the bank stores
+`65·3·(832·256 + 256·6144) ≈ 348.6M` parameters and runs `3·3·(832·256 + 256·6144) ≈
+16.1M` per token. One bank per layer would store twelve times that and run 193M per
+token, which is not the "348.6M stored / 16.1M active" the model is priced at — so the
+sharing is stated here, in one place, rather than discovered from a `param_report` that
+does not add up.
 
 WHY A WIDTH CANNOT BE QUIET. Every arm is built from `StackSpec`'s widths and every
 arm's own constructor validates them (`n_heads % n_kv_heads`, `3·d·d_ffn` against the
