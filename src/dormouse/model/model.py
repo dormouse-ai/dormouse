@@ -167,7 +167,28 @@ class Transformer(nn.Module):
 
     # ------------------------------------------------------------------ forward
     def forward(self, ids: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`ids [batch, seq]` token ids → `logits [batch, seq, vocab]`."""
+        """`ids [batch, seq]` token ids → `logits [batch, seq, vocab]`.
+
+        Numerically the same call sequence as `head(hidden(ids))`, which is what it
+        is: one path, so a representation read out of `hidden` is the one the logits
+        were computed from and not a second stack that drifts.
+        """
+        h = self.hidden(ids, counters)
+        logits = self.head(h, counters)
+        if counters is not None:
+            counters.check()
+        return logits
+
+    def hidden(self, ids: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
+        """`ids [batch, seq]` → the final normed stream `[batch, seq, d_model]`.
+
+        This is the encoder embedding a paired JEPA term compares: the last-layer
+        hidden state, which is what the paper reads out for probing (their `Enc`).
+        The head is not applied, so no `[B, T, V]` buffer is allocated for a batch
+        whose logits nobody reads. `head()` enables its own counters, so the
+        `Counters.check()` at the end of this call stays a statement about the part
+        that ran.
+        """
         if ids.dim() != 2:
             raise LoudError(
                 f"forward takes ids [batch, seq], got shape {tuple(ids.shape)}",
@@ -180,15 +201,15 @@ class Transformer(nn.Module):
             )
         if counters is not None:
             self._enable(counters)
-        h = self.embed(ids)
+        h: torch.Tensor = self.embed(ids)
         if counters is not None:
             counters.count("embed_fwd", ids.numel())
         for block in self.blocks:
             h = block(h, counters)
-        logits = self.head(self.norm(h, counters), counters)
+        h = self.norm(h, counters)
         if counters is not None:
             counters.check()
-        return logits
+        return h
 
     def head(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """Logits from the token table, transposed: no parameter of its own.
@@ -198,6 +219,8 @@ class Transformer(nn.Module):
         class `dormouse_core.counters` exists for.
         """
         if counters is not None:
+            counters.enable("head", counter="head_fwd", why="logits come from the tied head")
+            counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
             counters.count("head_fwd", x.shape[0] * x.shape[1])
             counters.count("tied_head")
         return nn.functional.linear(x, self.embed.weight)
@@ -205,17 +228,16 @@ class Transformer(nn.Module):
     def _enable(self, counters: Counters) -> None:
         """Declare the mechanisms this stack runs, so silence becomes an error.
 
-        Idempotent, and called at the top of every `forward`: `Counters.check()` at
-        the end of the same call is then a statement about THIS forward — a mechanism
+        Idempotent, and called at the top of every `hidden`: `Counters.check()` at
+        the end of the same call is then a statement about THIS call — a mechanism
         that was enabled and never counted raises `MissingReport` before the step's
         loss is ever returned. Only the parts every stack shares are declared here;
         the ones that depend on which arm a block holds come from `declarations`.
+        The head declares itself, in `head()`.
         """
         counters.enable("embedding", counter="embed_fwd", why="the token table is read")
         counters.enable("blocks", counter="block_fwd", why="the residual stack runs")
         counters.enable("norm", counter="norm_fwd", why="two pre-norms per block + final")
-        counters.enable("head", counter="head_fwd", why="logits come from the tied head")
-        counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
         for mechanism, counter, why in self.declarations:
             counters.enable(mechanism, counter=counter, why=why)
 
