@@ -39,13 +39,14 @@ position table to disagree with a checkpoint.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
-from .blocks import EPS, RMSNorm
+from .blocks import EPS, Billable, RMSNorm
 
 
 class Transformer(nn.Module):
@@ -87,6 +88,11 @@ class Transformer(nn.Module):
         self.max_seq_len = max_seq_len
         self.embed = nn.Embedding(vocab, d_model, device=device)
         nn.init.normal_(self.embed.weight, std=1.0)
+        #: μP's tied-head forward multiplier, `2605.21486` §17.15: the last layer's
+        #: multiplier is `n⁻¹` because one shared matrix cannot satisfy both the
+        #: first-layer variance and the last-layer init condition. `1.0` is SP's value
+        #: and the bit-identical path; `train/mup.py` sets `base_width/d_model`.
+        self.head_scale = 1.0
         #: `declarations` is the list of mechanisms whose counters prove this stack
         #: ran; the constructor cannot infer it from the modules, and a mechanism the
         #: forward cannot count is a mechanism nobody can see was skipped.
@@ -129,7 +135,7 @@ class Transformer(nn.Module):
         if counters is not None:
             counters.count("head_fwd", x.shape[0] * x.shape[1])
             counters.count("tied_head")
-        return nn.functional.linear(x, self.embed.weight)
+        return nn.functional.linear(x, self.embed.weight) * self.head_scale
 
     def _enable(self, counters: Counters) -> None:
         """Declare the mechanisms this stack runs, so silence becomes an error.
@@ -172,3 +178,14 @@ class Transformer(nn.Module):
             groups[key] += param.numel()
         groups["total"] = sum(p.numel() for p in self.parameters())
         return groups
+
+    def macs_per_token(self, seq_len: int) -> dict[str, int]:
+        """Return this stack's multiply-adds per token, by source.
+
+        `blocks` sums each layer's own bill (attention and FFN arms price themselves);
+        `head` is the tied token table read as a projection, `vocab·d` — the embedding
+        lookup adds nothing. Both are MACs; a FLOP is two of them.
+        """
+        blocks = sum(cast(Billable, block).macs_per_token(seq_len) for block in self.blocks)
+        head = self.vocab * self.d_model
+        return {"blocks": blocks, "head": head, "total": blocks + head}

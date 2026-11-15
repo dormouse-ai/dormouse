@@ -26,6 +26,21 @@ not the one being trained — silently, because the discrepancy starts at zero. 
 context manager is here, one call for all three modes, and it owns both halves: the
 weights and `model.train()`/`eval()`. `with optimizer.eval_weights():` is the whole
 contract; under `cosine` and `wsd` it only flips the module's mode.
+
+§9. THE STATE WIDTHS, AND WHERE THE DECISION LIVES. `optim_state_bits` is the second
+moment (`v`, and Muon's momentum buffer, which is the only moment that arm has);
+`optim_first_moment_bits` is `m`; both are 32 unless asked, so `MixOptimizer(model)` is
+the optimiser that was here. The widths are 32 (the dense tensor), 16 (bf16: a relative
+codec, one exponent per value) and 8 (block-wise codes, `lowbit.py` §2); `bf16` is what
+the momentum can afford and 8 bits is not — `muon.py` §6 has the cosines.
+
+Two decisions are taken here rather than by the caller: the token table keeps 32-bit
+state whatever is asked — `lowbit.py` §4, the paper's
+stable-embedding rule, because a rare token's row is where the second moment underflows
+— and the `sf` mode refuses an 8-bit knob outright, because its arms keep `z`, `m` and
+`v` per parameter and no quantiser is wired into them. `state_dict` carries the widths
+and the block, so a checkpoint cannot be restored into a run that would read 1 byte per
+value where 4 were written.
 """
 
 from __future__ import annotations
@@ -40,6 +55,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .adamw import ADAMW_LR, AdamW
+from .lowbit import BLOCK, check
 from .muon import (
     COLROW_EPS,
     MUON_LR,
@@ -53,6 +69,7 @@ from .muon import (
     polar,
     spectral_bound,
 )
+from .mup import Parametrisation
 from .sf import SF_LR, SF_WEIGHT_DECAY, SFAdamW, SFNorMuon
 
 __all__ = [
@@ -65,6 +82,7 @@ __all__ = [
     "AdamW",
     "MixOptimizer",
     "Muon",
+    "Parametrisation",
     "colrow",
     "muon_direction",
     "polar",
@@ -76,6 +94,9 @@ __all__ = [
 #: The three modes §7 names. `cosine` is the default and the current recipe.
 SCHEDULES: tuple[str, ...] = ("cosine", "wsd", "sf")
 
+#: The state widths of a run that predates the knob: both moments dense (§9).
+_ALL_32: tuple[int, int, int] = (32, 32, 32)
+
 
 class MixOptimizer:
     """One `step()` over two arms, routed by §6 and refusing anything unrouted."""
@@ -85,6 +106,7 @@ class MixOptimizer:
         model: nn.Module,
         *,
         schedule: str = "cosine",
+        parametrisation: Parametrisation | None = None,
         lr_muon: float | None = None,
         lr_adamw: float | None = None,
         momentum: float = 0.95,
@@ -97,6 +119,10 @@ class MixOptimizer:
         sf_warmup: int = 0,
         sf_weight_decay: float = SF_WEIGHT_DECAY,
         sf_final_decay_frac: float = 0.05,
+        optim_state_bits: int = 32,
+        optim_first_moment_bits: int = 32,
+        optim_momentum_bits: int | None = None,
+        optim_block: int = BLOCK,
     ) -> None:
         """Route `model`'s parameters, then build the arm pair `schedule` names.
 
@@ -104,14 +130,62 @@ class MixOptimizer:
         `lr_adamw=0.003`; under `sf` it keeps the paper's single `η = 0.01` for both,
         because a schedule-free run at the scheduled rate is 6× the tuned one and
         reports the divergence as a property of the method.
+
+        `parametrisation=None` reads the model's own attribute, which `assemble` sets
+        only under `parametrisation="mup"`. That keeps the μP table on the object that
+        owns the geometry and makes a plain `MixOptimizer(model)` correct, rather than
+        a second argument every caller must remember. Under μP the rate multipliers are
+        per group and the decay coefficient is `λ / lr_mult`, so `lr · weight_decay`
+        stays the base-rate λ (`2605.21486` eq. 17.9).
+
+        `optim_state_bits=8` quantises the second moment and Muon's momentum;
+        `optim_momentum_bits` overrides the momentum alone, which is the knob §9 exists
+        for — the two are not equally safe and the gates measure which is which.
         """
         if schedule not in SCHEDULES:
             raise LoudError(
                 f"schedule={schedule!r} is not a mode this stack has",
                 f"use one of: {', '.join(SCHEDULES)}",
             )
+        detected = getattr(model, "parametrisation", None)
+        parametrisation = (
+            parametrisation
+            if parametrisation is not None
+            else detected
+            if isinstance(detected, Parametrisation)
+            else None
+        )
+        if parametrisation is not None and schedule == "sf":
+            raise LoudError(
+                "a schedule-free optimizer with parametrisation='mup'",
+                "the sf arms derive one rate from their own counter; μP's per-group "
+                "multipliers belong to the scheduled pair (cosine/wsd)",
+            )
+        self.parametrisation = parametrisation
         self.schedule = schedule
         self.model = model
+        self.optim_state_bits = optim_state_bits
+        self.optim_first_moment_bits = optim_first_moment_bits
+        self.optim_momentum_bits = (
+            optim_state_bits if optim_momentum_bits is None else optim_momentum_bits
+        )
+        self.optim_block = optim_block
+        for bits in (
+            optim_state_bits,
+            optim_first_moment_bits,
+            self.optim_momentum_bits,
+        ):
+            check(bits, optim_block)
+        if schedule == "sf" and 8 in (
+            optim_state_bits,
+            optim_first_moment_bits,
+            self.optim_momentum_bits,
+        ):
+            raise LoudError(
+                f"schedule='sf' with optim_state_bits={optim_state_bits}",
+                "the sf arms keep z, m and v per parameter and none of them is quantised; "
+                "an 8-bit knob here would be a number nothing reads — use cosine or wsd",
+            )
         self.table = route_all(model)
         schedule_free = schedule == "sf"
         #: A rate of `None` is the mode's default: the recipe's per-arm pair, or the
@@ -134,13 +208,34 @@ class MixOptimizer:
         groups: list[dict[str, Any]] = []
         for name, param in matmuls:
             split = _head_split(model, name, param)
+            rule = parametrisation.rule(model, name, param) if parametrisation else None
+            lr_mult = rule.lr_mult if rule else 1.0
+            wd_mult = rule.wd_mult if rule else 1.0
             for group in groups:
-                if group["head_split"] == split:
+                same = (
+                    group["head_split"] == split
+                    and group["lr_mult"] == lr_mult
+                    and group["wd_mult"] == wd_mult
+                )
+                if same:
                     group["params"].append(param)
                     break
             else:
-                groups.append({"params": [param], "head_split": split})
+                groups.append(
+                    {
+                        "params": [param],
+                        "head_split": split,
+                        "lr_mult": lr_mult,
+                        "wd_mult": wd_mult,
+                    }
+                )
         lr_muon, lr_adamw = self.base_lr
+        #: Under μP the paper's λ is the coefficient at the BASE rate; the group's
+        #: `lr · weight_decay` product is then `lr_muon · λ` for every group, which is
+        #: `2605.21486` eq. (17.9)'s `η_l λ_l = η λ`. Under `sp` the two existing
+        #: defaults (Muon 0, AdamW 0.1) are untouched.
+        muon_decay = parametrisation.weight_decay if parametrisation else muon_weight_decay
+        adamw_decay = parametrisation.weight_decay if parametrisation else weight_decay
         if schedule_free:
             self.muon: Muon | SFNorMuon = SFNorMuon(
                 groups,
@@ -161,15 +256,57 @@ class MixOptimizer:
                 final_decay_frac=sf_final_decay_frac,
             )
             return
+        for group in groups:
+            group["lr"] = lr_muon * group["lr_mult"]
+            group["weight_decay"] = muon_decay * group["wd_mult"]
         self.muon = Muon(
             groups,
             lr=lr_muon,
             momentum=momentum,
             steps=steps,
             weight_decay=muon_weight_decay,
+            state_bits=self.optim_momentum_bits,
+            block=optim_block,
         )
+        vector_groups: list[dict[str, Any]] = []
+        for name, param in vectors:
+            rule = parametrisation.rule(model, name, param) if parametrisation else None
+            lr_mult = rule.lr_mult if rule else 1.0
+            wd_mult = rule.wd_mult if rule else 1.0
+            #: `lowbit.py` §3: the token table is the one parameter that keeps 32-bit
+            #: state, whichever width was asked for.
+            stable = _is_table(name)
+            for group in vector_groups:
+                if (
+                    group["lr_mult"] == lr_mult
+                    and group["wd_mult"] == wd_mult
+                    and group["state_bits"] == (32 if stable else optim_state_bits)
+                    and group["first_bits"] == (32 if stable else optim_first_moment_bits)
+                ):
+                    group["params"].append(param)
+                    break
+            else:
+                vector_groups.append(
+                    {
+                        "params": [param],
+                        "lr_mult": lr_mult,
+                        "wd_mult": wd_mult,
+                        "lr": lr_adamw * lr_mult,
+                        "weight_decay": adamw_decay * wd_mult,
+                        "state_bits": 32 if stable else optim_state_bits,
+                        "first_bits": 32 if stable else optim_first_moment_bits,
+                        "block": optim_block,
+                    }
+                )
         self.adamw = AdamW(
-            [p for _, p in vectors], lr=lr_adamw, betas=betas, eps=eps, weight_decay=weight_decay
+            vector_groups,
+            lr=lr_adamw,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            state_bits=optim_state_bits,
+            first_bits=optim_first_moment_bits,
+            block=optim_block,
         )
 
     @property
@@ -211,7 +348,7 @@ class MixOptimizer:
                 "a schedule produces [0, 1]; a negative rate climbs the loss",
             )
         for group in self.muon.param_groups:
-            group["lr"] = self.base_lr[0] * fraction
+            group["lr"] = self.base_lr[0] * group.get("lr_mult", 1.0) * fraction
         self.adamw.set_lr(self.base_lr[1] * fraction)
 
     def begin_final_decay(self, total: int) -> None:
@@ -254,10 +391,12 @@ class MixOptimizer:
         from — two optimizers sharing one momentum, and a resume that diverges. The
         mode is part of the snapshot: an `sf` checkpoint has three buffers per
         parameter where a cosine one has one, and loading one as the other would
-        silently restore nothing.
+        silently restore nothing. So are the state widths (§9): 8-bit `v` is a code
+        tensor and a scale tensor where 32-bit `v` is one float tensor.
         """
         return {
             "schedule": self.schedule,
+            "state_bits": self._state_mode,
             "muon": deepcopy(self.muon.state_dict()),
             "adamw": deepcopy(self.adamw.state_dict()),
         }
@@ -271,8 +410,35 @@ class MixOptimizer:
                 "resume with the mode that wrote the checkpoint, or start a new run: "
                 "the sf arms hold z, m and v where the scheduled ones hold momentum",
             )
+        #: A checkpoint from before the knob existed holds 32-bit moments and nothing
+        #: else, so that is what its missing key means — not a guess, the only layout
+        #: that file can contain.
+        saved = tuple(state.get("state_bits", (*_ALL_32, 0)))
+        if saved != self._state_mode:
+            raise LoudError(
+                f"this optimizer keeps state {self._state_mode} and the checkpoint is {saved}",
+                "(second moment, first moment, momentum, block) — resume at the widths "
+                "it was written with; 8-bit `v` is a code tensor where 32-bit `v` is a "
+                "float, and a scale tensor read as a moment is a silently wrong run",
+            )
         self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
+
+    @property
+    def _state_mode(self) -> tuple[int, int, int, int]:
+        """The widths and block this optimizer allocates, normalised (§9).
+
+        The block is part of the mode only when a moment is quantised: at 32 bits it
+        changes nothing a checkpoint holds, so a resume at a different block is the
+        same state and must not be refused.
+        """
+        bits = (self.optim_state_bits, self.optim_first_moment_bits, self.optim_momentum_bits)
+        return (*bits, self.optim_block if 8 in bits else 0)
+
+
+def _is_table(name: str) -> bool:
+    """Return True for the token table: the one parameter whose state stays 32-bit (§9)."""
+    return name.endswith("embed.weight")
 
 
 def _sf_lr(lr: float | None) -> float:
@@ -290,7 +456,7 @@ def route_all(model: nn.Module) -> dict[str, str]:
 
 def route(name: str, param: torch.Tensor) -> str:
     """Which arm owns this parameter, by §6; a shape neither rule claims is refused."""
-    if name.endswith("embed.weight"):
+    if _is_table(name):
         return "adamw"
     if param.ndim == 2:
         return "muon"

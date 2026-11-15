@@ -60,15 +60,47 @@ The compressed layers have no packed matrix: their Q is written by `q_up`
 `q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
 remainder — whole, so the arm is the same one applied to the same tensors, and the
 router reads it off the modules rather than off a shape heuristic.
+
+§6. THE MOMENTUM AT 8 BITS, MEASURED, AND WHY THE DEFAULT IS 32. Muon orthogonalises, so
+an error in the buffer is not an error in a scale — it is an error in the *direction*, and
+§1 makes the direction the whole update. The gate is therefore the cosine between
+`polar(m)` at 32 bits and at 8, on the two live shapes, with the momentum of a run 20
+steps in (`tools/lowbit_gates.py --only direction`):
+
+    [832, 2048]   block 256: 0.954    block 64: 0.964    block 16: 0.976
+    [832, 832]    block 256: 0.985    block 64: 0.990    block 16: 0.993
+
+All six are below the 0.999 a direction has to hold to be worth quantising, and no block
+size reaches it: a young buffer is close to noise, its spectrum is nearly flat, and the
+small singular values sit on the quantisation floor — the polar factor turns with them,
+which is exactly the sensitivity §3 records for a badly conditioned matrix.
+
+Sixteen bits is a different question, and the same measurement answers it: bf16 keeps an
+exponent per value, so its error is relative and 8-bit-block-shaped error is not. Five
+draws on three shapes (`tools/lowbit_gates.py --only direction`; the qkv through its
+per-head split):
+
+    [832, 2048]   bf16 0.99989-0.99995    8-bit 0.934-0.955
+    [832, 832]    bf16 0.99992-0.99995    8-bit 0.983-0.989
+    [2496, 832]   bf16 0.99987-0.99990    8-bit 0.963-0.967
+
+So `optim_momentum_bits` defaults to 32, `16` is the width the buffer can take — it holds
+the 0.999 bar at the worst of its fifteen draws — and `8` is not one, at any block size.
+The knob is separate from `optim_state_bits`, which is AdamW's second moment: a relative
+error in `v` is halved by the square root before it reaches a step, and a relative error
+in `m` *is* the step. `lowbit.py` §6 has the codec's own numbers.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import torch
 from dormouse_core.errors import LoudError
 from torch.optim import Optimizer
+
+from .lowbit import BLOCK, LowBitState, adopt, check, plain_state_dict, revive_state_dict
 
 __all__ = [
     "COLROW_EPS",
@@ -243,8 +275,14 @@ class Muon(Optimizer):
         momentum: float = 0.95,
         steps: int = NS_STEPS,
         weight_decay: float = 0.0,
+        state_bits: int = 32,
+        block: int = BLOCK,
     ) -> None:
-        """Bind the four numbers every group inherits unless it overrides them."""
+        """Bind the four numbers every group inherits unless it overrides them.
+
+        `state_bits=32` is the momentum buffer `torch.empty_like` always allocated;
+        `8` is the same buffer in blocks of `block` values (see §6).
+        """
         if not 0.0 <= momentum < 1.0:
             raise LoudError(
                 f"muon momentum={momentum} is not in [0, 1)",
@@ -255,9 +293,17 @@ class Muon(Optimizer):
                 f"muon ns steps={steps} runs no iteration",
                 "5 is the recipe's, and §3 of the module docstring prices fewer",
             )
+        check(state_bits, block)
         super().__init__(
             params,
-            {"lr": lr, "momentum": momentum, "steps": steps, "weight_decay": weight_decay},
+            {
+                "lr": lr,
+                "momentum": momentum,
+                "steps": steps,
+                "weight_decay": weight_decay,
+                "state_bits": state_bits,
+                "block": block,
+            },
         )
 
     @torch.no_grad()
@@ -273,17 +319,35 @@ class Muon(Optimizer):
             lr = group["lr"]
             decay = group["weight_decay"]
             head_split = group.get("head_split")
+            #: `get`, not `[]`: a checkpoint written before this knob existed restores
+            #: its own `param_groups`, and a 32-bit state is what that checkpoint holds.
+            state_bits = group.get("state_bits", 32)
+            block = group.get("block", BLOCK)
             for param in group["params"]:
                 if param.grad is None:
                     continue
                 state = self.state[param]
                 if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(param)
+                    state["momentum"] = LowBitState(param, bits=state_bits, block=block)
                 buffer = state["momentum"]
-                buffer.mul_(momentum).add_(param.grad, alpha=1.0 - momentum)
-                direction = muon_direction(buffer, head_split=head_split, steps=steps)
+                buffer.apply(partial(_ema, momentum=momentum), param.grad)
+                direction = muon_direction(buffer.dense(), head_split=head_split, steps=steps)
                 if decay:
                     param.mul_(1.0 - lr * decay)
                 rows, cols = param.shape
                 param.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
         return loss
+
+    def state_dict(self) -> dict[str, Any]:
+        """Write the momentum as plain tensors, so `weights_only=True` can read it back (§5)."""
+        return plain_state_dict(super().state_dict())
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore a checkpoint into the container, on each parameter's own device."""
+        super().load_state_dict(revive_state_dict(state_dict))
+        adopt(self.state)
+
+
+def _ema(buffer: torch.Tensor, grad: torch.Tensor, *, momentum: float) -> None:
+    """`m ← μ·m + (1-μ)·g`, the one in-place pair a window of the buffer sees."""
+    buffer.mul_(momentum).add_(grad, alpha=1.0 - momentum)
