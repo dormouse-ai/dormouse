@@ -244,6 +244,10 @@ def train(
 ) -> dict[str, Any]:
     """Run one config end to end and return its receipt: journal, numbers, artifact."""
     recipe = RunRecipe.read(config)
+    if smoke:
+        # `--smoke` is the CPU seam test, not a measurement: it runs the reference policy.
+        # A real run of a config that omits `dtype` is bf16 (`model/spec.py:RUN_DEFAULT`).
+        recipe.spec.dtype = "fp32"
     budget = SMOKE_STEPS if smoke else recipe.steps
     steps = budget if until is None else min(until, budget)
     if until is not None and until > budget:
@@ -306,6 +310,7 @@ def train(
             clip_z=cfg.clip_z if cfg.clip else 0.0,
             ema=cfg.ema,
             schedule=recipe.schedule,
+            dtype=recipe.spec.dtype,
             config_hash=recipe.digest,
             plan_flops=priced,
             plan_source=plan_source,
@@ -439,7 +444,7 @@ def _read(path: str | Path) -> dict[str, Any]:
 
 def _build(raw: dict[str, Any]) -> tuple[StackSpec, nn.Module]:
     """Build the stack an artifact names and load its weights into it."""
-    spec = cast(StackSpec, StackSpec.from_mapping(raw["spec"]))
+    spec = StackSpec.from_mapping(raw["spec"])
     model = assemble(spec, smoke=bool(raw["smoke"])).model
     model.load_state_dict(raw["state"])
     model.eval()

@@ -14,6 +14,16 @@ computed here in chunks of `CHUNK_TOKENS` tokens, so the largest temporary is
 fp32 sum. The `[B, T, V]` logits themselves are the stack's own buffer — chunking the
 *head* is a change to `model/` and is not this module's.
 
+fp32 WHERE THE LOSS IS. Each chunk is upcast before `cross_entropy`, and the sum is
+fp32: the loss is the number the run is judged by, and a bf16 log-softmax over 32 000
+rows is the quality leak `train/precision.py` refuses. The upcast costs one chunk of
+fp32 (256 MiB at CHUNK_TOKENS=2048), which this module already priced above.
+
+THE FORWARD section of the policy. The forward runs under `Precision.autocast`, so a
+bf16 run's matmuls are bf16 and the context's entry is counted as `autocast_ops`; the
+cross-entropy and `optimizer.step()` stay outside it, in fp32, which is the rule
+`train/precision.py` writes down.
+
 GRAD ACCUMULATION. `ids` carries `accum` micro-batches of equal row count, and each
 micro-batch's mean loss is divided by `accum` before `backward()`, so the accumulated
 gradient is the mean over the whole batch rather than `accum` times it. The equal split
@@ -47,6 +57,7 @@ from torch import nn
 from torch.nn import functional
 
 from .optim import MixOptimizer
+from .precision import COUNTER, Precision
 
 __all__ = ["PreStep", "StepResult", "chunked_cross_entropy", "train_step"]
 
@@ -100,7 +111,9 @@ def chunked_cross_entropy(
     total = flat.new_zeros((), dtype=torch.float32)
     for start in range(0, flat.shape[0], chunk):
         total = total + functional.cross_entropy(
-            flat[start : start + chunk], flat_targets[start : start + chunk], reduction="sum"
+            flat[start : start + chunk].float(),
+            flat_targets[start : start + chunk],
+            reduction="sum",
         )
     return total / flat.shape[0]
 
@@ -159,6 +172,11 @@ def train_step(
         )
     inputs, targets = ids[:, :-1], ids[:, 1:]
     rows = ids.shape[0] // accum
+    policy = Precision.of(model)
+    if counters is not None and policy.mixed:
+        # Enabled before the first forward for the same reason `fwd` is: the context counts
+        # itself on entry and the stack checks its own counters inside `forward`.
+        counters.enable("autocast", counter=COUNTER, why="the forward's matmuls are bf16")
     optimizer.zero_grad(set_to_none=True)
     loss_total = 0.0
     for micro in range(accum):
@@ -169,7 +187,8 @@ def train_step(
             # `forward`, so a counter this module owns must already be non-zero there.
             counters.enable("fwd", counter="fwd", why="a forward runs in the step")
             counters.count("fwd", x.numel())
-        logits = model(x, counters)
+        with policy.autocast(x.device, counters=counters):
+            logits = model(x, counters)
         loss = chunked_cross_entropy(logits, y)
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)

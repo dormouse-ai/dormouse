@@ -6,6 +6,8 @@ next one safe:
     registry.pieces(spec)   refuse a conflicting pair, naming it, with nothing allocated
     build per layer         one attention arm per layer, one bank for every FFN slot
     quantize                ternary weights / int4 activations, if the slots ask
+    cast                    parameters into `spec.dtype`, after the fp32 init that
+                            `train/precision.py` states as the reference
     declarations            the mechanisms the forward must count, for `Counters.check`
 
 WHY THE BANK IS SHARED BY THE LAYERS. `ffn=moe` is one bank of `n_experts`, and every
@@ -35,6 +37,7 @@ from torch import nn
 
 from .. import economics
 from ..train.optim import MixOptimizer
+from ..train.precision import Precision
 from ..train.step import StepResult, train_step
 from . import quant, registry
 from .attn_variants.dsa import DSA
@@ -47,8 +50,10 @@ from .tsct import TSCT_RANK
 
 __concepts__ = ("Assembled", "FlatBank")
 
-#: Bytes one stored parameter costs per step: weight + gradient + two moments.
-STATE_BYTES = 16
+#: Bytes one stored parameter costs per step, by policy: weight + gradient in the
+#: policy's dtype plus the two fp32 moments of the AdamW arm (the widest of the two arms).
+#: Muon's arm is one moment, so this is the ceiling rather than the average.
+STATE_BYTES: dict[str, int] = {"fp32": 16, "bf16": 12}
 
 
 class FlatBank(nn.Module):
@@ -168,7 +173,7 @@ def assemble(
         device=device,
     )
     _quantize(model, spec)
-    return Assembled(spec=spec, model=model, pieces=pieces, bank=bank)
+    return Assembled(spec=spec, model=Precision(spec.dtype).cast(model), pieces=pieces, bank=bank)
 
 
 def _attention(
@@ -265,7 +270,8 @@ def plan_lines(
         f"ffn: moe (experts: {spec.expert_arm}, {spec.n_experts} routed, topk "
         f"{spec.topk}, tsct rank {spec.expert_tsct_rank})"
         + f", optimizer={spec.optimizer}, objective={spec.objective}"
-        + f", weight_qat={spec.weight_qat}, act_quant={spec.act_quant}",
+        + f", weight_qat={spec.weight_qat}, act_quant={spec.act_quant}"
+        + f", dtype={spec.dtype}",
         f"widths: d_model={spec.d_model} x {spec.n_layers} layers, "
         f"d_ffn={spec.d_ffn}, heads={spec.n_heads}x{spec.head_dim} "
         f"(kv={spec.n_kv_heads}, c_lat={spec.c_lat}), seq={spec.seq_len}",
@@ -275,8 +281,8 @@ def plan_lines(
         f"({attention_share:.1%} of the active set)",
         f"step: {tokens_per_step:,} tokens/step, {steps:,} steps for {spec.tokens:,} tokens; "
         f"flops/step={6 * report['active'] * tokens_per_step:,}",
-        f"bytes/step: state={STATE_BYTES * report['stored']:,} (weights+grad+2 moments), "
-        f"checkpoint={int(bits * report['stored']):,}",
+        f"bytes/step: state={STATE_BYTES[spec.dtype] * report['stored']:,} (weights+grad in "
+        f"{spec.dtype}, fp32 moments), checkpoint={int(bits * report['stored']):,}",
     ]
     plan = Plan().add(
         "train",

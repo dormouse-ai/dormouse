@@ -29,6 +29,7 @@ from torch import nn
 
 from ..metrics import BitsPerByte, from_nats
 from .optim import MixOptimizer
+from .precision import Precision
 from .recipe import BatchStream, check_batch
 from .step import chunked_cross_entropy
 
@@ -101,11 +102,13 @@ def evaluate(
     """
     nats = 0.0
     tokens = payload = 0
+    policy = Precision.of(model)
     with optim.eval_weights(), torch.no_grad():
         for index in range(first, first + batches):
             batch = stream.batch(index, tokens_per_step)
             check_batch(batch, stage=None, stream=stream, step=index)
-            logits = model(batch.ids[:, :-1], None)
+            with policy.autocast(batch.ids.device):
+                logits = model(batch.ids[:, :-1], None)
             loss = chunked_cross_entropy(logits, batch.ids[:, 1:])
             nats += float(loss) * batch.tokens
             tokens += batch.tokens

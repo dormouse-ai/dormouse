@@ -23,6 +23,9 @@ optimizer = "muon"
 objective = "ntp"
 weight_qat = "none"
 act_quant = "none"
+# bf16 weights and gradients, fp32 moments (train/precision.py): 4+4+4 bytes per parameter
+# is what does not fit the card at batch 2, and this is the one line that decides it.
+dtype = "bf16"
 torch_compile = false
 sources = "corpus"
 

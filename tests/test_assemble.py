@@ -31,8 +31,10 @@ from dormouse.train.optim import MixOptimizer
 
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
-#: The one config, at widths a CPU test can afford. Every slot is kept.
+#: The one config, at widths a CPU test can afford. Every slot is kept, and the policy
+#: is the reference fp32: a hand-built stack states its dtype and a run's config omits it.
 SMOKE = {
+    "dtype": "fp32",
     "d_model": 64,
     "n_heads": 4,
     "n_kv_heads": 2,

@@ -278,12 +278,22 @@ class Muon(Optimizer):
                     continue
                 state = self.state[param]
                 if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(param)
+                    #: fp32 whatever the parameter's dtype (`train/precision.py`): the
+                    #: momentum is where the update's arithmetic happens, and `polar`
+                    #: chains five products of it. A bf16 moment would round the ~1e-3
+                    #: increments a small learning rate lives on.
+                    state["momentum"] = torch.zeros_like(param, dtype=torch.float32)
                 buffer = state["momentum"]
                 buffer.mul_(momentum).add_(param.grad, alpha=1.0 - momentum)
                 direction = muon_direction(buffer, head_split=head_split, steps=steps)
+                #: The update runs on an fp32 view of the weight and is written back, so a
+                #: bf16 parameter is not updated in bf16. For fp32 parameters `weight` IS
+                #: the parameter, and this is the expression it always was.
+                weight = param if param.dtype == torch.float32 else param.detach().float()
                 if decay:
-                    param.mul_(1.0 - lr * decay)
+                    weight.mul_(1.0 - lr * decay)
                 rows, cols = param.shape
-                param.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
+                weight.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
+                if weight is not param:
+                    param.copy_(weight)
         return loss

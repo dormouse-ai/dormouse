@@ -263,7 +263,11 @@ class MoEFFN(nn.Module):
         sizes = counts.tolist()  # the ONE host read; see the module docstring
         order = torch.argsort(index.reshape(-1), stable=True)
         tokens = order // k
-        gates = weight.reshape(-1)[order]
+        #: The gate is rounded to the bank's output dtype: under autocast `softplus`/`sqrt`
+        #: come back fp32 (torch keeps those kernels at fp32), and `index_add_` accumulates
+        #: into the residual stream, which is the policy's dtype. The scores are still
+        #: formed in fp32 — the rounding is the product's, not the router's.
+        gates = weight.reshape(-1)[order].to(x.dtype)
         y = torch.zeros_like(x)
         pos = 0
         used = 0

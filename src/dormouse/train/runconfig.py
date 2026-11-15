@@ -29,7 +29,7 @@ import json
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from dormouse_core.errors import LoudError
 from dormouse_core.journal import Journal
@@ -101,12 +101,9 @@ class RunRecipe:
                 "a key no code path reads is a silent no-op; the run's keys are "
                 f"{', '.join(sorted(RUN_KEYS))}, the rest are StackSpec's fields",
             )
-        spec = cast(
-            StackSpec,
-            StackSpec.from_mapping(
-                {key: value for key, value in raw.items() if key in stack_keys},
-                source=str(source),
-            ),
+        spec = StackSpec.from_mapping(
+            {key: value for key, value in raw.items() if key in stack_keys},
+            source=str(source),
         )
         stages = cls._stages(raw.get("stage", ()), source)
         sources = cls._sources(raw.get("source", ()), source)
@@ -144,7 +141,7 @@ class RunRecipe:
         """Rebuild the recipe a run was written under, from its own `config.json`."""
         run: dict[str, Any] = data["run"]
         return cls(
-            spec=cast(StackSpec, StackSpec.from_mapping(data["stack"])),
+            spec=StackSpec.from_mapping(data["stack"]),
             sources=tuple(
                 Source(Path(item["path"]), float(item["weight"]), str(item["stage"]))
                 for item in run["sources"]

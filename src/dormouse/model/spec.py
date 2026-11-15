@@ -17,6 +17,11 @@ The literals that remain, and the refusal each one carries:
   refusal prints.
 * `optimizer` — `muon` is `MixOptimizer` (matrices under Muon, vectors under AdamW).
   `adamw` is the control arm.
+* `dtype` — the run's numeric policy (`train/precision.py`): `fp32` is the reference and
+  `bf16` is what a real run gets. A spec read from a config that omits it is a run's
+  spec and takes `bf16`; a `StackSpec(...)` built in code is a test or a notebook and
+  keeps `fp32`, so `train/entry.py` is the only place that has to take `fp32` back for
+  `--smoke`.
 * `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. `+tst`
   and `+jepa` have no loss module, so they are refused with that reason.
 * `weight_qat`, `act_quant`, `torch_compile` — the quantization slots and the compile
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any, cast
 
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
@@ -50,6 +56,11 @@ OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
+DTYPES: tuple[str, ...] = ("fp32", "bf16")
+
+#: The policy a config that omits `dtype` gets. A run is bf16 because 4 bytes of weights
+#: plus 4 of gradients plus fp32 moments is what does not fit the card at batch 2.
+RUN_DEFAULT = "bf16"
 
 #: The vocab each unit prices the token table at. `bpe` is the tokenizer's own default:
 #: the number exists in `data/tokenizer.py` and nowhere else, so a head priced here and a
@@ -99,6 +110,7 @@ class StackSpec(Config):
     objective: str = "ntp"
     weight_qat: str = "none"
     act_quant: str = "none"
+    dtype: str = "fp32"
 
     # ------------------------------------------------------------------ wiring
     torch_compile: bool = False
@@ -149,11 +161,24 @@ class StackSpec(Config):
             self.vocab = VOCAB.get(self.unit, 0)
         self.validate()
 
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any], *, source: str = "<mapping>") -> StackSpec:
+        """Build from a mapping, where an omitted `dtype` means a RUN, not a test.
+
+        The one field whose default depends on where the spec comes from. A config file —
+        or an artifact's `spec` — describes a run, and a run is bf16 (`RUN_DEFAULT`);
+        `train/entry.py` hands `--smoke` the reference fp32 back. A `StackSpec(...)` built
+        in code is a test, a tool or a notebook, and gets fp32 with no allocator to save.
+        """
+        spec = super().from_mapping({"dtype": RUN_DEFAULT, **data}, source=source)
+        return cast(StackSpec, spec)
+
     def validate(self) -> None:
         """Refuse an unknown literal or a pair of values that cannot coexist."""
         _literal("unit", self.unit, UNITS)
         _literal("attn", self.attn, ATTN)
         _literal("optimizer", self.optimizer, OPTIMIZERS)
+        _literal("dtype", self.dtype, DTYPES)
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)

@@ -80,8 +80,11 @@ def factors(weight: torch.Tensor, rank: int) -> tuple[torch.Tensor, torch.Tensor
                 eye,
             )
         )
-    u, s, vh = torch.linalg.svd(transposed, full_matrices=False)
-    return u[:, :rank], s[:rank], vh[:rank]
+    u, s, vh = torch.linalg.svd(transposed.float(), full_matrices=False)
+    #: fp32 in, the weight's dtype out (`train/precision.py`): bf16 has no LAPACK SVD path,
+    #: and a bf16 basis is a different rank-r approximation of the same matrix. For fp32
+    #: weights `.float()` and `.to()` are the identity, so this is the same call it was.
+    return u[:, :rank].to(weight.dtype), s[:rank].to(weight.dtype), vh[:rank].to(weight.dtype)
 
 
 def low_rank(

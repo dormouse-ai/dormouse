@@ -110,6 +110,14 @@ class MixOptimizer:
                 f"schedule={schedule!r} is not a mode this stack has",
                 f"use one of: {', '.join(SCHEDULES)}",
             )
+        if schedule == "sf" and any(p.dtype != torch.float32 for p in model.parameters()):
+            raise LoudError(
+                "schedule=sf over half-precision parameters: the sf arms keep their "
+                "iterate `z` in the parameter's own dtype",
+                "the tau/lerp update would then be a bf16 update of a bf16 weight — the "
+                "leak train/precision.py exists to refuse; use schedule=cosine or wsd "
+                "for a bf16 run, or dtype=fp32",
+            )
         self.schedule = schedule
         self.model = model
         self.table = route_all(model)
