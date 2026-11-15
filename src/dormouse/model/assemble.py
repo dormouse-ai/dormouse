@@ -33,6 +33,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.plan import Plan
 from torch import nn
 
+from .. import economics
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
 from . import quant, registry
@@ -42,6 +43,7 @@ from .blocks import PROJ_STD, Block
 from .model import Transformer
 from .moe import MoEFFN
 from .spec import StackSpec
+from .tsct import TSCT_RANK
 
 __concepts__ = ("Assembled", "FlatBank")
 
@@ -237,7 +239,12 @@ def _quantize(model: Transformer, spec: StackSpec) -> None:
     model.blocks = nn.ModuleList(wrapped)
 
 
-def plan_lines(spec: StackSpec) -> list[str]:
+def plan_lines(
+    spec: StackSpec,
+    *,
+    elasticity: float = economics.ELASTICITY,
+    elasticity_from: str = "constant",
+) -> list[str]:
     """Everything `dorm plan` prints: the stack, the bill, the step, the mechanisms.
 
     The model is built on the `meta` device, so the numbers are measured from the
@@ -277,7 +284,10 @@ def plan_lines(spec: StackSpec) -> list[str]:
         note=f"{spec.tokens:,} tokens at {spec.throughput_tflops} TFLOP/s sustained",
     )
     if spec.unit == "bpe":
-        plan.warn("unit=bpe: the tokenizer that produces 32768-way ids is not in this repo")
+        plan.warn(
+            f"unit=bpe: the tokenizer that produces {spec.vocab:,}-way ids is "
+            "data/tokenizer.py; a run must ship the tokenizer.json its manifest names"
+        )
     plan.warn(
         f"the bank is shared by {spec.n_layers} layers: stored is "
         f"{report['stored']:,}, not {spec.n_layers} banks"
@@ -287,4 +297,36 @@ def plan_lines(spec: StackSpec) -> list[str]:
         "mechanisms: "
         + ", ".join(dict.fromkeys(f"{p.mechanism}→{p.counter}" for p in assembled.pieces))
     )
+    lines.append(f"economics: elasticity {elasticity:.4f} ({elasticity_from})")
+    lines.append("  lever | speedup | loss | verdict")
+    lines.extend(f"  {lever.row(elasticity)}" for lever in levers(spec))
     return lines
+
+
+#: The lever slots a config sets, and the recipe's own value of each. Any other value is
+#: a proposal, and a proposal is priced by `economics` rather than assumed.
+RECIPE_LEVERS: dict[str, object] = {
+    "weight_qat": "none",
+    "act_quant": "none",
+    "torch_compile": False,
+    "expert_tsct_rank": TSCT_RANK,
+}
+
+
+def levers(spec: StackSpec) -> list[economics.Lever]:
+    """Every lever slot this config sets: the recipe's own value costs nothing.
+
+    A proposal with no measurement prints as `unmeasured` and is never `take`: the one
+    thing this table must not do is wave through a lever nobody measured.
+    """
+    out: list[economics.Lever] = []
+    for slot, recipe in RECIPE_LEVERS.items():
+        name = f"{slot}={getattr(spec, slot)}"
+        measured = economics.MEASURED.get(name)
+        if measured is not None:
+            out.append(economics.Lever(name, *measured))
+        elif getattr(spec, slot) == recipe:
+            out.append(economics.Lever(name, 1.0, 0.0))
+        else:
+            out.append(economics.Lever(name))
+    return out
