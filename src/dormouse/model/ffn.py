@@ -43,6 +43,16 @@ only (`one`) or on both branches (`bi`, the paper's best and the default).
 Normalising the sigmoid gate is what makes the single-entry dictionary collapse
 to `1·f(z)` exactly and keeps the `bi` product within the dictionary's own
 bounds — both are assertions in `tests/test_ffn_variants.py`.
+
+THE MIXTURE IS SUMMED IN ONE BUFFER, IN CHUNKS. `Σₖ wₖ·fₖ(z)` written as a chain of
+multiplies is arithmetically right and costs `K` full `[rows, d_ffn]` tensors of
+autograd bookkeeping per mixed branch: every `fₖ(z)` is kept alive to run the chain
+backwards, and at the live bank's 24 576 routed rows with `d_ffn=6144` that is
+15.5 GiB of peak before the backward ever runs — 3.4x the bi-sided plain FFN and the
+reason the bank OOM'd on a 16 GiB card. `_accumulate` sums into one buffer in row
+chunks and lets the backward recompute each entry, which measures 0.96x that FFN's
+peak; the output and every gradient stay `torch.equal` to the chain
+(`tests/test_ffn_mixture.py` holds the memory gate and that proof).
 """
 
 from __future__ import annotations
@@ -53,6 +63,7 @@ import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .activations import DEFAULT_DICTIONARY, activation, resolve
 from .tsct import low_rank
@@ -65,6 +76,13 @@ PROJ_STD = 0.02
 
 #: How many branches the mixture is applied to: the gate only, or gate and up.
 FFN_SIDES: tuple[str, ...] = ("one", "bi")
+
+#: Rows per transient buffer in the mixture: each dictionary entry is evaluated — and
+#: re-evaluated in the backward — on this many rows at a time. At the live
+#: `d_ffn=6144` one such buffer is 50 MiB, so the mixture's transient is a few tens of
+#: MiB whatever `K` says, where an unchunked mixture holds the whole `[rows, d_ffn]`
+#: slab per entry in flight (measured 1.35x vs 1.07x the plain FFN's peak at 8192 rows).
+MIX_CHUNK_ROWS = 2048
 
 
 def neutral_width(d_ffn_gelu: int) -> int:
@@ -84,6 +102,72 @@ def neutral_width(d_ffn_gelu: int) -> int:
 def _enabled(coef: torch.Tensor) -> list[int]:
     """Return the indices of coefficients that are switched on (non-zero)."""
     return [i for i, c in enumerate(coef.detach()) if float(c) != 0.0]
+
+
+def _entry(
+    fn: Callable[[torch.Tensor], torch.Tensor], w: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """One entry's weighted contribution, `wₖ·fₖ(z)` — the unit of recomputation."""
+    return w * fn(z)
+
+
+def _accumulate(
+    w: torch.Tensor,
+    z: torch.Tensor,
+    fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
+) -> torch.Tensor:
+    """`Σₖ wₖ·fₖ(z)` into one buffer, in row chunks, entries recomputed not kept.
+
+    WHY NOT THE PLAIN SUM. A chain of `K` multiplies keeps every `fₖ(z)` alive for
+    backward: `K` copies of a `[rows, d_ffn]` buffer, 604 MiB each at the live
+    24 576 routed rows with `d_ffn=6144`. `sides="bi"` mixes both branches, so the
+    live set is `2K` of them — 14.2 GiB retained where the plain FFN of the same
+    topology (silu on both branches) retains 2.9 GiB, and the bank OOM'd before its
+    backward on a 16 GiB card because of it.
+
+    TWO CHANGES FIX TWO HALVES. A checkpoint per entry stops the `K` copies being
+    kept — the retained set becomes the plain FFN's own, equal to the byte at every
+    row count measured. `MIX_CHUNK_ROWS`-row chunks stop the entries that *are* in
+    flight from being the whole slab, so the transient no longer scales with the row
+    count. Measured on CPU at 24 576 rows: 15.8 GiB → 4.4 GiB peak, against 4.6 GiB
+    for the plain bi-sided FFN (0.96x) and 4.0 GiB for the live one-sided SwiGLU
+    (1.10x); at 1024 rows the ratio is 1.46x, because a chunk there is the whole
+    input and the fixed per-entry transient dominates 25 MiB buffers.
+
+    THE ARITHMETIC DOES NOT MOVE. Every op here is elementwise and row-independent, so
+    chunking and recomputing re-run the same multiplies in the same order: the output
+    and the gradients are `torch.equal` to the chain, and `K=1` is still `1·f(z)`.
+
+    `w` carries the trailing `K`, so `w[..., k:k+1]` is per token, not per channel —
+    which is why a chunk of rows is a chunk of both.
+    """
+    rows = z.shape[-2]
+    if rows <= MIX_CHUNK_ROWS:
+        return _mix_rows(w, z, fns)
+    return torch.cat(
+        [
+            _mix_rows(
+                w[..., start : start + MIX_CHUNK_ROWS, :],
+                z[..., start : start + MIX_CHUNK_ROWS, :],
+                fns,
+            )
+            for start in range(0, rows, MIX_CHUNK_ROWS)
+        ],
+        dim=-2,
+    )
+
+
+def _mix_rows(
+    w: torch.Tensor,
+    z: torch.Tensor,
+    fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
+) -> torch.Tensor:
+    """One chunk's mixture: the accumulation `_accumulate` splits the rows into."""
+    out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False)
+    for k in range(1, len(fns)):
+        part = checkpoint(_entry, fns[k], w[..., k : k + 1], z, use_reentrant=False)
+        out = out + part
+    return out
 
 
 class _Glu(nn.Module):
@@ -203,10 +287,7 @@ class LaFFN(_Glu):
 
     def _mix(self, z: torch.Tensor) -> torch.Tensor:
         """`Σ cₖ·fₖ(z)` — a running sum, so `K=1` returns `1·f(z)` untouched."""
-        out = self.coef[0] * self._fns[0](z)
-        for k in range(1, len(self._fns)):
-            out = out + self.coef[k] * self._fns[k](z)
-        return out
+        return _accumulate(self.coef.expand(*z.shape[:-1], -1), z, self._fns)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the FFN write, same shape."""
@@ -290,10 +371,7 @@ class MoaFFN(_Glu):
 
     def _mix(self, w: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """`Σₖ wₖ·fₖ(z)` with `w [..., K]` — a running sum, exact at `K=1`."""
-        out = w[..., 0:1] * self._fns[0](z)
-        for k in range(1, len(self._fns)):
-            out = out + w[..., k : k + 1] * self._fns[k](z)
-        return out
+        return _accumulate(w, z, self._fns)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [batch, seq, d_model]` → the FFN write, same shape."""
