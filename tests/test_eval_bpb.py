@@ -66,3 +66,27 @@ def test_a_distribution_that_does_not_sum_to_one_is_refused() -> None:
     with pytest.raises(LoudError) as error:
         entropy_bits_per_byte([0.5, 0.4])
     assert "sum to" in str(error.value)
+
+
+def test_a_probability_outside_the_unit_interval_is_refused() -> None:
+    with pytest.raises(LoudError) as error:
+        entropy_bits_per_byte([-0.1, 1.1])
+    assert "outside" in str(error.value)
+
+
+def test_an_empty_distribution_is_refused() -> None:
+    with pytest.raises(LoudError) as error:
+        entropy_bits_per_byte([])
+    assert "no entropy" in str(error.value)
+
+
+def test_a_non_finite_loss_is_refused() -> None:
+    with pytest.raises(LoudError) as error:
+        from_token_nats(float("nan"), eval_text="a", token_count=1)
+    assert "not a finite number" in str(error.value)
+
+
+def test_from_token_nats_refuses_zero_tokens() -> None:
+    with pytest.raises(LoudError) as error:
+        from_token_nats(1.0, eval_text="abc", token_count=0)
+    assert "token_count" in str(error.value)
