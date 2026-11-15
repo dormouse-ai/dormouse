@@ -9,9 +9,9 @@ a value no code path read).
 
 The literals that remain, and the refusal each one carries:
 
-* `unit` — `bpe` is the recipe's vocabulary (`VOCAB["bpe"] = 32768`, priced into the
-  token table); the tokenizer that produces those ids is data-layer work that does not
-  live in this package. `byte` stays for a corpus that has no tokenizer yet.
+* `unit` — `bpe` is the recipe's vocabulary (`VOCAB["bpe"]` is
+  `data.tokenizer.DEFAULT_VOCAB`, priced into the token table); `byte` stays for a
+  corpus that has no tokenizer yet.
 * `attn` — `hybrid` is the architecture. `kda` and `dsa` build a uniform stack of one
   mechanism: the control arms a hybrid is measured against, and the only two names a
   refusal prints.
@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
 
+from ..data.tokenizer import DEFAULT_VOCAB
 from .attn_variants.hybrid import HYBRID_3_TO_1
 from .tsct import TSCT_RANK
 
@@ -50,8 +51,10 @@ OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
 
-#: The vocab each unit prices the token table at.
-VOCAB: dict[str, int] = {"byte": 256, "bpe": 32768}
+#: The vocab each unit prices the token table at. `bpe` is the tokenizer's own default:
+#: the number exists in `data/tokenizer.py` and nowhere else, so a head priced here and a
+#: tokenizer trained there cannot drift apart.
+VOCAB: dict[str, int] = {"byte": 256, "bpe": DEFAULT_VOCAB}
 
 #: One period of the stack's attention: three KDA layers per DSA layer. It is the
 #: mechanism's own declaration (`attn_variants/hybrid.py`), not a copy of it.
@@ -102,6 +105,15 @@ class StackSpec(Config):
     sources: str = "corpus"
 
     # ------------------------------------------------------------------ widths
+    #: The token table's row count. 0 means "the unit's own": `bpe` takes
+    #: `data.tokenizer.DEFAULT_VOCAB`, `byte` takes 256. A config that states a number is
+    #: checked against the tokenizer, never trusted.
+    vocab: int = 0
+    #: The `tokenizer.json` a run will load. When named, the token table is checked
+    #: against that file's real vocabulary (`data.tokenizer.check_vocab`), because a
+    #: trained tokenizer can come up short of the size it was asked for.
+    tokenizer: str = ""
+
     d_model: int = 832
     n_layers: int = 12
     n_heads: int = 8
@@ -129,7 +141,12 @@ class StackSpec(Config):
         `Config.from_mapping` validates after the fact; a caller that builds a spec
         directly (the assembler, a test, a notebook) would otherwise hold a value the
         rest of the stack is not allowed to see.
+
+        `vocab=0` is resolved here, before anything reads it: the number belongs to the
+        tokenizer, and a config that states one keeps it so `validate` can refuse it.
         """
+        if not self.vocab:
+            self.vocab = VOCAB.get(self.unit, 0)
         self.validate()
 
     def validate(self) -> None:
@@ -140,6 +157,17 @@ class StackSpec(Config):
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
+        if self.vocab != VOCAB[self.unit]:
+            raise LoudError(
+                f"vocab={self.vocab} is not the {self.unit} vocabulary ({VOCAB[self.unit]})",
+                "the token table's size is the tokenizer's, not the config's: it is "
+                "data.tokenizer.DEFAULT_VOCAB, and data.tokenizer.check_vocab is the "
+                "refusal for a trained tokenizer that came up short",
+            )
+        if self.tokenizer:
+            from ..data.tokenizer import check_vocab, load
+
+            check_vocab(load(self.tokenizer), self.vocab)
         if self.attn == "hybrid" and self.n_layers % len(HYBRID):
             raise LoudError(
                 f"n_layers={self.n_layers} is not a multiple of the "
@@ -207,11 +235,6 @@ class StackSpec(Config):
             )
 
     # ---------------------------------------------------------------- derived
-    @property
-    def vocab(self) -> int:
-        """The token table's row count, from the sequence unit."""
-        return VOCAB[self.unit]
-
     @property
     def ctx(self) -> dict[str, str]:
         """The shared context the components' `Coeffects` are checked against."""
