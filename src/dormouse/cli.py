@@ -72,6 +72,11 @@ def _parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="what a config will run, and what it will cost")
     plan.add_argument("config", help="path to a stack .toml, e.g. configs/kitchen_sink.toml")
+    plan.add_argument(
+        "--journal",
+        default=None,
+        help="a run journal whose eval events measure the quality/data elasticity",
+    )
 
     for name in sorted(PLANNED):
         cmd = sub.add_parser(name, help=f"not wired yet: {PLANNED[name]}")
@@ -86,7 +91,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "status":
         return _status(args.journal)
     if args.command == "plan":
-        return _plan(args.config)
+        return _plan(args.config, args.journal)
     raise LoudError(
         f"{args.command} is not wired yet",
         PLANNED.get(args.command, "see PLAN.md for the order of work"),
@@ -129,8 +134,8 @@ def _smi() -> str | None:
     return out.stdout.strip() or None
 
 
-def _plan(config: str) -> int:
-    """Print the plan for a config: the stack, its bill, its step, its mechanisms.
+def _plan(config: str, journal: str | None = None) -> int:
+    """Print the plan for a config: the stack, its bill, its step, its levers.
 
     Imported here rather than at module scope: `plan` is the only command that needs
     the model layer, and `dorm doctor` has to work on a machine where torch is not
@@ -138,9 +143,27 @@ def _plan(config: str) -> int:
     """
     from .model.assemble import plan_lines
 
-    for line in plan_lines(_spec(config)):
+    elasticity, source = _elasticity(journal)
+    for line in plan_lines(_spec(config), elasticity=elasticity, elasticity_from=source):
         print(line)
     return 0
+
+
+def _elasticity(journal: str | None) -> tuple[float, str]:
+    """Return the elasticity the lever verdicts use, and where it came from."""
+    from .economics import ELASTICITY, measured_elasticity
+
+    if journal is None:
+        return ELASTICITY, "constant"
+    measured = measured_elasticity(Journal.open(journal))
+    if measured is None:
+        raise LoudError(
+            f"{journal}: no two eval points to measure the elasticity from",
+            "a journal needs two `eval` events carrying loss and tokens (or drop "
+            "--journal to use the constant); silence here would price every lever "
+            "against a number the run did not produce",
+        )
+    return measured, f"measured from {journal}"
 
 
 def _spec(config: str) -> StackSpec:
