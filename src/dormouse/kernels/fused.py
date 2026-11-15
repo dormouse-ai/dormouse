@@ -22,7 +22,7 @@ THE PARITY BOUND, DERIVED AND NOT CHOSEN. Eager and the kernel compute the same
 expression; the only free parameter is the order of the `d`-term sum inside
 `mean(x²)` — a tree over `BLOCK = next_pow2(d)` lanes here, torch's own reduction there.
 With `u = 2⁻²⁴` the unit roundoff of fp32, a `d`-term sum has a relative error of at most
-`γ_{d-1} ≈ d·u` (Higham, Thm 3.1) and `√d·u` in the random-accumulation case a padded
+`gamma_{d-1} ≈ d·u` (Higham, Thm 3.1) and `√d·u` in the random-accumulation case a padded
 tree realises. At `d = 832` that is `28.8·5.96e-8 = 1.7e-6` on `mean(x²)`; `rsqrt`
 halves the relative error to `0.86e-6`, and `y = r·s·g` multiplies it by `|r|`, which is
 `≤ ~4` for a 4-sigma row of a unit-RMS stream. So the honest worst-case bound on an fp32
@@ -44,6 +44,7 @@ NO SILENT FALLBACK. A flag that is on and cannot fuse (no CUDA, no Triton) raise
 is this project's recorded failure class: a mechanism that was enabled and never ran,
 with every test green.
 """
+# ruff: noqa: N803
 
 from __future__ import annotations
 
@@ -77,7 +78,7 @@ _fused_ops = 0
 
 
 class Norm(Protocol):
-    """What the fused op needs from an `RMSNorm`: its gain, its ε, and its eager path."""
+    """What the fused op needs from an `RMSNorm`: its gain, its eps, and its eager path."""
 
     weight: torch.nn.Parameter
     eps: float
@@ -223,9 +224,9 @@ class _ResidualNorm(torch.autograd.Function):
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
         """Gradients of `x`, `delta` and the gain.
 
-        With `y = z·s·g`, `s = rsqrt(mean(z²)+ε)` and `z = x + delta`:
+        With `y = z·s·g`, `s = rsqrt(mean(z²)+eps)` and `z = x + delta`:
 
-            dz_j = s·g_j·dy_j − (s³/n)·z_j·Σ_k(dy_k·z_k·g_k),   dg_j = Σ_rows dy·z·s
+            dz_j = s·g_j·dy_j - (s³/n)·z_j·Σ_k(dy_k·z_k·g_k),   dg_j = Σ_rows dy·z·s
 
         and `dr = d_residual + dz` is the gradient of both inputs, because `+` is.
         """
@@ -270,7 +271,7 @@ class _Glu(torch.autograd.Function):
     def backward(
         ctx: Any, d_out: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """`dg = dout·u·σ(g)(1 + g(1−σ(g)))`, `du = dout·silu(g)`."""
+        """`dg = dout·u·sigma(g)(1 + g(1-sigma(g)))`, `du = dout·silu(g)`."""
         if d_out is None:
             return None, None
         gate, up = ctx.saved_tensors
