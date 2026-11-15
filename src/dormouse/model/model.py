@@ -36,12 +36,15 @@ class only decides that the stack uses it, and `rope=True` is the recipe.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
 from .blocks import EPS, Block, RMSNorm
+from .ffn_spec import FFNSpec
 
 
 class Transformer(nn.Module):
@@ -56,6 +59,10 @@ class Transformer(nn.Module):
         n_heads: int = 13,
         head_dim: int = 64,
         d_ffn: int = 2048,
+        d_ffn_gelu: int | None = None,
+        ffn_act: str = "silu",
+        ffn_dict: Sequence[str] | None = None,
+        ffn_moa_sides: str | None = None,
         max_seq_len: int = 1024,
         rope: bool = True,
         eps: float = EPS,
@@ -85,6 +92,15 @@ class Transformer(nn.Module):
         self.d_ffn = d_ffn
         self.max_seq_len = max_seq_len
         self.rope = rope
+        ffn_spec = FFNSpec(
+            d_model,
+            d_ffn,
+            act=ffn_act,
+            dictionary=None if ffn_dict is None else tuple(ffn_dict),
+            sides=ffn_moa_sides,
+            d_ffn_gelu=d_ffn_gelu,
+        )
+        self.ffn_act = ffn_spec.act
         self.embed = nn.Embedding(vocab, d_model, device=device)
         nn.init.normal_(self.embed.weight, std=1.0)
         self.blocks = nn.ModuleList(
@@ -98,6 +114,7 @@ class Transformer(nn.Module):
                     rope=rope,
                     max_seq_len=max_seq_len,
                     eps=eps,
+                    ffn=ffn_spec,
                     device=device,
                 )
                 for _ in range(n_layers)
@@ -154,6 +171,16 @@ class Transformer(nn.Module):
         counters.enable("blocks", counter="block_fwd", why="the residual stack runs")
         counters.enable("attention", counter="attn_fwd", why="every block attends")
         counters.enable("ffn", counter="ffn_fwd", why="every block has a gated FFN")
+        if self.ffn_act == "la":
+            counters.enable("ffn_la", counter="ffn_la", why="la mixes the dictionary")
+        elif self.ffn_act == "moa":
+            counters.enable("ffn_moa", counter="ffn_moa", why="moa gates the dictionary")
+        if self.ffn_act in ("la", "moa"):
+            counters.enable(
+                "ffn_dictionary",
+                counter="ffn_dict_entries_used",
+                why="an enabled dictionary entry must contribute",
+            )
         counters.enable("norm", counter="norm_fwd", why="two pre-norms per block + final")
         counters.enable("head", counter="head_fwd", why="logits come from the tied head")
         counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
