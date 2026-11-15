@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from dormouse_core.errors import LoudError
 
+from dormouse.data.tokenizer import DEFAULT_VOCAB
 from dormouse.model.registry import pieces
 from dormouse.model.spec import (
     ACT_QUANT,
@@ -148,7 +149,7 @@ def test_the_mechanisms_own_coeffects_refuse_a_rope_context() -> None:
 
 def test_the_unit_prices_the_token_table() -> None:
     assert StackSpec(unit="byte").vocab == 256
-    assert StackSpec(unit="bpe").vocab == 32768
+    assert StackSpec(unit="bpe").vocab == DEFAULT_VOCAB
 
 
 def test_the_one_config_is_the_architecture() -> None:
@@ -183,4 +184,4 @@ def test_a_config_is_a_value_and_a_copy_can_be_scaled() -> None:
     )
     assert small.as_dict()["d_ffn"] == 128
     assert small.pattern == ("kda", "kda", "kda", "dsa")
-    assert small.vocab == 32768
+    assert small.vocab == DEFAULT_VOCAB

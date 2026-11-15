@@ -11,9 +11,10 @@ one place that knows which attention mechanism a layer holds. A shell that also
 built its own would be a second model, and the two would disagree the first time a
 mechanism moved.
 
-TIED HEAD. The logits' matrix IS the token table, transposed. At `vocab=32768` a
-head of its own is 27M parameters (2.6% of a 1B model) that learn "predict token t"
-separately from "read token t"; for a table this size the two gradients belong in one
+TIED HEAD. The logits' matrix IS the token table, transposed. At the tokenizer's
+32 000 rows a head of its own is 27M parameters (2.6% of a 1B model) that learn
+"predict token t" separately from "read token t"; for a table this size the two
+gradients belong in one
 matrix, and the head's own bill stays 0 so a translation of the tying to a second
 matrix shows up as a number that moved.
 
@@ -45,6 +46,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from ..data.tokenizer import DEFAULT_VOCAB
 from .blocks import EPS, RMSNorm
 
 
@@ -54,7 +56,7 @@ class Transformer(nn.Module):
     def __init__(
         self,
         *,
-        vocab: int = 32768,
+        vocab: int = DEFAULT_VOCAB,
         d_model: int = 832,
         d_ffn: int = 6144,
         max_seq_len: int = 1024,
@@ -68,7 +70,8 @@ class Transformer(nn.Module):
         if vocab < 2:
             raise LoudError(
                 f"vocab={vocab}: a model that predicts one symbol predicts nothing",
-                "BPE is 32768 symbols; a 256-symbol byte model is the data layer's arm",
+                "BPE takes the tokenizer's vocabulary (data.tokenizer.DEFAULT_VOCAB); "
+                "a byte model has 256 symbols and is the data layer's arm",
             )
         if d_model < 1 or d_ffn < 1:
             raise LoudError(
