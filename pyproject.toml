@@ -40,6 +40,10 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
 
+markers = [
+  "gpu: needs the card — `_scaled_mm` with e2m1 operands has no CPU implementation",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

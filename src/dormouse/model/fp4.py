@@ -57,28 +57,53 @@ for a pair starting at an even index and UP for one starting at an odd index:
 boundary, so `round_e2m1` is one comparison per level and no lookup that can
 disagree with the arithmetic.
 
+PACKING IS OURS BECAUSE THE WHEEL HAS NO COPY KERNEL FOR THE DTYPE. Every cast to
+`torch.float4_e2m1fn_x2` on this build (`torch 2.14.1+cu130`) raises
+`copy_kernel not implemented for 'Float4_e2m1fn_x2'`, which is why the previous
+measurement of this rung measured a fake-quant and called it FP4. Nothing about
+the format needs that kernel: two codes are one byte (the FIRST code in the low
+nibble, the second in the high nibble — `pack` below, and the kernel's own
+arithmetic agrees, `tests/test_fp4.py`), and a `torch.uint8` buffer of the right
+last-dim ratio is viewed as the dtype in place (`as_fp4`). `view()` reinterprets
+the same storage — it is a stride/shape declaration, not a cast, so the missing
+copy kernel never runs. `.view()` was the one that works; `as_strided` on the
+uint8 buffer also reaches the dtype but only by rebuilding the layout the view
+already gives for free, and `torch.empty(..., dtype=float4_e2m1fn_x2)` then
+`copy_` into a uint8 view of the destination works too but copies through a
+second buffer for nothing.
+
+THE SCALES ARE SWIZZLED, AND THAT IS NOT OPTIONAL. `_scaled_mm` answers
+`ValueError: scale_a must be swizzled to SWIZZLE_32_4_4 format` for the plain
+`[rows, k/16]` layout — cuBLAS's block-scaled GEMM reads scale factors out of a
+128x4 tile of (128 rows x 4 k-blocks), internally 32x4x4 (cuBLAS §3.1.4.3.2). The
+tile is padded to 128 rows and 4 k-blocks, which is why a `[832, 52]` scale is
+handed to the kernel as 896 x 52 values. `swizzle` is that permutation, and
+`tests/test_fp4.py` checks it against the reference implementation that ships in
+torch's own test utilities, element for element.
+
 WHAT A FORWARD CAN AND CANNOT USE. `torch._scaled_mm` is the only kernel that
 touches the format, and on sm_120 it is forward-only: e2m1 operands, no backward.
 A training run is therefore QAT only — quantise in the forward, carry a
 straight-through estimator (the identity's gradient) in the backward, keep
-bf16/fp32 masters — and `linear` refuses the kernel while autograd is on, because
-a matmul that drops its gradient is an STE with a wrong slope, silently. On a
-forward-only run the kernel is tried and every outcome is recorded; a run that
-claims fp4 and never touches `_scaled_mm` says so in `tally()`.
+bf16/fp32 masters — because a matmul that drops its gradient is an STE with a
+wrong slope, silently. `fp4_mm` is the primitive: it runs the kernel or raises
+with the reason, and never substitutes the reference. `linear` is the rung: under
+autograd it takes the STE, without autograd it takes the kernel, and when the
+device has no kernel it counts `fp4_fallback` so a run cannot claim the kernel it
+did not use.
 
-`tally()` is not a `Counters` entry on purpose: a step's counters answer "did the
-rung run" (per step, and silent means `MissingReport`), while the tally answers
-"which kernel served this build" — a property of the machine and the wheel, not
-of the step.
+`tally()` answers "which path served this build", not "did the rung run" (the step
+counters answer that): `fp4_scaled_mm` is the kernel, `fp4_fakequant` the STE, and
+`fp4_fallback` the times an eligible matmul was served by the reference because
+the device refused the kernel. `require_kernel` is the gate over those numbers,
+used by the test and by `scripts/bench_fp4.py` — a run on a device whose verdict is
+"the kernel runs" with `fp4_scaled_mm == 0` fails, which is the failure this file
+was rewritten for.
 
-Ceiling (`ponytail:`), and it is a MEASURED one: neither wheel on this machine can even
-pack the dtype — `torch 2.14.1+cu130` on the card and `torch 2.15.0+cpu` both raise
-`copy_kernel not implemented for 'Float4_e2m1fn_x2'` at the cast, before `_scaled_mm`
-is called. So the kernel path below is written and never reached here, and the plain
-`[rows, k/16]` e4m3 scale layout it would hand the kernel is untested against NVFP4's
-padded 128x4-swizzled one. Both are wired on the first wheel that can pack the dtype
-and a free card to check the element order on: the swizzle (`_scaled_mm_v2` with an
-explicit `swizzle_a` also exists), then `tally()` proves it ran.
+Ceiling (`ponytail:`): the kernel path is forward-only here, and the per-tensor
+scale is applied as one elementwise multiply over the `[m, n]` output rather than
+folded into the epilogue (`_scaled_mm`'s `scale_result` is fp32-only). Both are
+fine at the measured sizes and both are visible in `scripts/bench_fp4.py`.
 """
 
 from __future__ import annotations
@@ -100,6 +125,10 @@ MAX_CODE = 6.0
 E4M3_MAX = 448.0
 E4M3_MIN = 2.0**-9
 
+#: Rows of a scale tile, and k-blocks per tile: the 128x4 shape cuBLAS reads.
+_TILE_ROWS = 128
+_TILE_K = 4
+
 #: Positive e2m1 magnitudes, low to high — the table of the docstring's formula.
 LEVELS: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -115,18 +144,19 @@ _LADDER: tuple[tuple[float, bool], ...] = (
     (5.0, False),
 )
 
+#: The sign bit of a code, and the mask of its magnitude.
+_SIGN = 8
+_MAG = 7
+
 #: Which path served the format in this process.
-_TALLY: Counter[str] = Counter({"fp4_fakequant": 0, "fp4_scaled_mm": 0})
+_TALLY: Counter[str] = Counter({"fp4_fakequant": 0, "fp4_scaled_mm": 0, "fp4_fallback": 0})
 
-#: One verdict per device: `""` when `_scaled_mm` ran, else the reason it did not.
+#: One verdict per device: `""` when `_scaled_mm` runs, else the reason it did not.
 _VERDICTS: dict[str, str] = {}
-
-#: Devices whose kernel output has already been checked against the reference.
-_CHECKED: set[str] = set()
 
 
 def tally(device: torch.device | str | None = None) -> dict[str, int | str]:
-    """Return the two path counters and, for `device`, the kernel's verdict.
+    """Return the three path counters and, for `device`, the kernel's verdict.
 
     `device` is the device the model RAN on, and it is a parameter for that reason:
     the tally must describe the machine the matmuls happened on, not whichever one
@@ -139,6 +169,25 @@ def reset() -> None:
     """Zero the path counters; the verdicts are a property of the build and stay."""
     for key in _TALLY:
         _TALLY[key] = 0
+
+
+def require_kernel(device: torch.device | str | None = None) -> None:
+    """Fail unless the rung's matmuls were served by the kernel on a device that has one.
+
+    This is the gate the rung needs and did not have: a run whose tests passed while
+    `fp4_scaled_mm` stayed at zero was a measurement of the quantiser. A device whose
+    verdict carries a reason has no kernel to require — the counter is not a claim
+    there, and the tally says so in the same breath.
+    """
+    reason = verdict(device)
+    if reason or _TALLY["fp4_scaled_mm"]:
+        return
+    raise LoudError(
+        f"the fp4 rung is on and {device if device is not None else _default_device()} "
+        "can run the kernel, but no matmul reached it",
+        "fp4.fp4_mm is the only path to `_scaled_mm`: a rung that quantises and "
+        "dequantises without calling it pays the format's cost and buys none of it",
+    )
 
 
 def round_e2m1(x: torch.Tensor) -> torch.Tensor:
@@ -203,21 +252,205 @@ def fake_quant(x: torch.Tensor, block: int = BLOCK) -> torch.Tensor:
     return x + (quantize(x, block) - x).detach()
 
 
-def verdict(device: torch.device | str | None = None) -> str:
-    """Attempt one NVFP4 matmul; return `""` when this build runs it, else the reason.
+def codes(x: torch.Tensor, block: int = BLOCK) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return `(q, S_block, S_tensor)`: the 4-bit codes as bytes, the two scales.
+
+    `q` has `x`'s shape and holds one code per value in the low nibble, `0x8` being
+    the sign — the arithmetic `unpack` reverses and `_scaled_mm` consumes. Its dtype
+    is uint8 because that is the byte the format is stored in; two codes per byte is
+    `pack`'s business, not this function's.
+    """
+    tensor_scale, block_scale, s = block_scales(x, block)
+    grid = x.detach().reshape(*x.shape[:-1], -1, block)
+    quotient = grid / s.unsqueeze(-1).to(grid.dtype)
+    magnitude = quotient.abs()
+    index = torch.zeros_like(magnitude)
+    for edge, tie_up in _LADDER:
+        index = index + (magnitude >= edge if tie_up else magnitude > edge).to(magnitude.dtype)
+    code = index.to(torch.uint8) | ((quotient < 0).to(torch.uint8) * _SIGN)
+    return code.reshape(x.shape), block_scale, tensor_scale
+
+
+def unpack(code: torch.Tensor) -> torch.Tensor:
+    """Expand one byte per value into the 2-bit-aligned code it holds in each nibble."""
+    code = code.view(torch.uint8)
+    wide = torch.empty(
+        (*code.shape[:-1], code.shape[-1] * 2), dtype=torch.uint8, device=code.device
+    )
+    wide[..., 0::2] = code & 0xF
+    wide[..., 1::2] = code >> 4
+    return wide
+
+
+def decode(code: torch.Tensor) -> torch.Tensor:
+    """Turn codes back into the exact values they stand for, scale-free (fp32)."""
+    wide = code.view(torch.uint8).to(torch.int64)
+    table = torch.tensor(LEVELS, dtype=torch.float32, device=wide.device)
+    magnitude = table[wide & _MAG]
+    return torch.where((wide & _SIGN) != 0, -magnitude, magnitude)
+
+
+def pack(code: torch.Tensor) -> torch.Tensor:
+    """Two codes per byte: the even element in the low nibble, the odd in the high.
+
+    The order is the format's, not a choice: the first of the pair is the low nibble
+    in every MX and NVFP4 description, and `_scaled_mm` reads it that way — the
+    swapped packing is the layout bug that produces plausible numbers, so
+    `tests/test_fp4.py` runs the kernel against an fp64 reference to pin it.
+    """
+    if code.shape[-1] % 2:
+        raise LoudError(
+            f"a width of {code.shape[-1]} codes cannot be packed: two per byte",
+            "the contraction axis is a multiple of the fp4 block (16), so this is a "
+            "width that never got that far",
+        )
+    return (code[..., 0::2] | (code[..., 1::2] << 4)).contiguous()
+
+
+def as_fp4(packed: torch.Tensor) -> torch.Tensor:
+    """Reinterpret the packed bytes as `float4_e2m1fn_x2` — the same storage, in place.
+
+    `view()` is a dtype declaration over the existing bytes: no copy kernel, which is
+    the entire reason this function exists (`tensor.to(torch.float4_e2m1fn_x2)` raises
+    `copy_kernel not implemented`). On this build the dtype's item size is one byte,
+    so the view keeps the buffer's shape and every byte stays exactly where `pack` put
+    it. `tests/test_fp4.py` pins the storage pointer, so a cast sneaking in shows up.
+    """
+    if packed.dtype is not torch.uint8:
+        raise LoudError(
+            f"a float4_e2m1fn_x2 operand is packed from uint8 bytes, not {packed.dtype}",
+            "pack the codes first: two per byte, even element in the low nibble",
+        )
+    if not packed.is_contiguous():
+        raise LoudError(
+            "the packed codes are not contiguous, so the dtype view would be a copy",
+            "call .contiguous() on the quantiser's output, or transpose after `as_fp4`",
+        )
+    return packed.view(torch.float4_e2m1fn_x2)
+
+
+def swizzle(scale: torch.Tensor) -> torch.Tensor:
+    """Lay block scales out in cuBLAS's 128x4 SWIZZLE_32_4_4 tile, flattened.
+
+    `scale` is `[rows, k-blocks]` — one e4m3 per 16 elements of one row. The kernel
+    reads a 128x4 tile of those as a 32x4x4 cube, so the tile's rows come in groups of
+    32 and the four k-blocks of a group are contiguous (cuBLAS §3.1.4.3.2, and torch's
+    own `to_blocked` in `torch/testing/_internal/common_quantized.py`). Padding to a
+    whole tile is part of the layout: a `[832, 52]` scale is passed as 896 x 52
+    values, and the extra rows are never read.
+    """
+    rows, cols = scale.shape
+    row_tiles = -(-rows // _TILE_ROWS)
+    col_tiles = -(-cols // _TILE_K)
+    padded = scale.new_zeros(row_tiles * _TILE_ROWS, col_tiles * _TILE_K)
+    padded[:rows, :cols] = scale
+    blocks = padded.view(row_tiles, _TILE_ROWS, col_tiles, _TILE_K).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, _TILE_K, 32, 4).transpose(1, 2).reshape(-1)
+
+
+def packed(x: torch.Tensor, block: int = BLOCK) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return `(operand, scale, S_tensor)` ready for the kernel: 2-D `x`, packed bytes.
+
+    `operand` is one `float4_e2m1fn_x2` tensor of `x`'s shape, `scale` the swizzled
+    e4m3 block scales, and `S_tensor` the fp32 tensor scale the caller multiplies the
+    result by. Splitting this out of `fp4_mm` is what lets the benchmark weigh the
+    quantiser against the matmul it feeds, instead of reporting their sum as one
+    number and calling it the format.
+    """
+    if x.dim() != 2:
+        raise LoudError(
+            f"the fp4 kernel takes a 2-D operand, not {tuple(x.shape)}",
+            "flatten the leading axes before packing: the block scale runs along the "
+            "contraction axis, which is the last one",
+        )
+    code, block_scale, tensor_scale = codes(x, block)
+    return as_fp4(pack(code)), swizzle(block_scale), tensor_scale
+
+
+def fp4_mm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """`a·bᵀ + bias` through `_scaled_mm`, both operands on the NVFP4 grid.
+
+    `b` is `[out, in]` like every weight in this repository, so the kernel gets
+    `bᵀ`; both operands are quantised here, which is the cost this function charges
+    for. There is no fallback: a device or a shape the kernel will not take raises
+    with the reason, because a matmul that quietly becomes the reference fake-quant
+    is how this rung came to be measured as a cost with no benefit.
+    """
+    if a.dim() != 2 or b.dim() != 2:
+        raise LoudError(
+            f"fp4_mm takes two matrices, got {tuple(a.shape)} and {tuple(b.shape)}",
+            "flatten the leading axes; the kernel is a 2-D GEMM",
+        )
+    if torch.is_grad_enabled() and (a.requires_grad or b.requires_grad):
+        raise LoudError(
+            "the fp4 kernel has no backward on this hardware, so it cannot serve autograd",
+            "a training forward is fp4.fake_quant (the STE): fp4.linear picks it, and "
+            "calling fp4_mm under autograd would drop the gradient silently",
+        )
+    reason = verdict(a.device)
+    if reason:
+        raise LoudError(
+            f"the fp4 kernel is not available on {a.device}: {reason}",
+            "run the rung on a device whose verdict is empty, or use fp4.linear, which "
+            "counts the reference path as fp4_fallback instead of claiming the kernel",
+        )
+    left, scale_a, tensor_a = packed(a)
+    right, scale_b, tensor_b = packed(b)
+    out = _scaled_mm(left, right, scale_a, scale_b)
+    result = out * (tensor_a * tensor_b)
+    if bias is not None:
+        result = result + bias
+    return result.to(a.dtype)
+
+
+def _scaled_mm(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    *,
+    count: bool = True,
+) -> torch.Tensor:
+    """One `_scaled_mm` call: fp4 operands, swizzled e4m3 scales, bf16 accumulation.
+
+    `count=False` is for `verdict`'s probe, whose whole job is to find out whether the
+    kernel runs. A probe that moved `fp4_scaled_mm` would let `require_kernel` pass on
+    a run that never asked the model for a single fp4 matmul.
+    """
+    out: torch.Tensor = torch._scaled_mm(
+        left,
+        right.transpose(0, 1),
+        scale_a,
+        scale_b,
+        out_dtype=torch.bfloat16,
+    )
+    if count:
+        _TALLY["fp4_scaled_mm"] += 1
+    return out
+
+
+def _probe(device: torch.device | str) -> str:
+    """Attempt one matmul on `device` and return `""` or the reason; never counts.
 
     The attempt IS the measurement: no list of supported dtypes is trusted, because
-    the last one of those disagreed with the wheel. Cached per device, so a build
-    that cannot pack the format pays for exactly one exception.
+    the last one of those disagreed with the wheel. It must not touch the tally, or
+    the gate `require_kernel` enforces could be satisfied by the probe itself rather
+    than by a matmul the model asked for.
     """
+    try:
+        left, scale_a, _ = packed(torch.ones(128, 64, device=device))
+        right, scale_b, _ = packed(torch.ones(128, 64, device=device))
+        _scaled_mm(left, right, scale_a, scale_b, count=False)
+    except Exception as error:
+        return f"{type(error).__name__}: {error}".split(" (Triggered")[0]
+    return ""
+
+
+def verdict(device: torch.device | str | None = None) -> str:
+    """`""` when this build runs the kernel on `device`, else the reason it does not."""
     key = str(device if device is not None else _default_device())
     if key not in _VERDICTS:
-        try:
-            _scaled_mm(torch.ones(16, 64), torch.ones(16, 64), None)
-        except Exception as error:
-            _VERDICTS[key] = f"{type(error).__name__}: {error}".split(" (Triggered")[0]
-        else:
-            _VERDICTS[key] = ""
+        _VERDICTS[key] = _probe(device if device is not None else _default_device())
     return _VERDICTS[key]
 
 
@@ -231,21 +464,7 @@ def build_note() -> str:
     reason = verdict()
     if reason:
         return f"fp4 here is the reference fake-quant, not the kernel: {reason}"
-    return "fp4 can use `_scaled_mm` forward; the backward is the reference STE"
-
-
-def _scaled_mm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """`x·Wᵀ + b` through the format's kernel; raises if this build cannot take it."""
-    _, scaled_x, _ = block_scales(x)
-    _, scaled_w, _ = block_scales(weight)
-    return torch._scaled_mm(
-        quantize(x).to(torch.float4_e2m1fn_x2),
-        quantize(weight).to(torch.float4_e2m1fn_x2).transpose(0, 1),
-        scaled_x.detach(),
-        scaled_w.detach(),
-        bias=bias,
-        out_dtype=torch.bfloat16,
-    )
+    return "fp4 uses `_scaled_mm` forward; the backward is the reference STE"
 
 
 def linear(
@@ -255,46 +474,21 @@ def linear(
     *,
     activations: bool = True,
 ) -> torch.Tensor:
-    """`x·Wᵀ + b` with the operands on the fp4 grid.
+    """`x·Wᵀ + b` with the operands on the fp4 grid, by the path this build allows.
 
     `activations=False` is the weight-only rung: `x` is read as it is, so the kernel
     (which needs both operands at ONE format) is not a candidate. Autograd on is the
     same kind of refusal: there is no fp4 backward on this hardware, so the kernel
-    would drop the gradient instead of passing it through.
+    would drop the gradient instead of passing it through, and the STE is the rung's
+    training path. Neither is silent — the STE counts `fp4_fakequant`, and a device
+    without the kernel counts `fp4_fallback` on every matmul it serves.
     """
-    key = str(x.device)
-    grad = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
-    if activations and not grad and not verdict(key):
-        kernel = _kernel(key, x, weight, bias)
-        if kernel is not None:
-            return kernel
-    return _reference(x, weight, bias, activations)
-
-
-def _kernel(
-    key: str, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
-) -> torch.Tensor | None:
-    """One kernel attempt; a failure is recorded and never retried on this device."""
-    try:
-        out = _scaled_mm(x, weight, bias)
-    except Exception as error:
-        _VERDICTS[key] = f"_scaled_mm refused: {type(error).__name__}: {error}"
-        return None
-    if key not in _CHECKED:
-        #: A layout that is ACCEPTED but read in the wrong order produces numbers
-        #: rather than an error, so the first result is checked against the format.
-        _CHECKED.add(key)
-        reference = _reference(x, weight, bias, activations=True).float()
-        if not torch.allclose(out.float(), reference, rtol=2e-2, atol=2e-2):
-            gap = (out.float() - reference).abs().max().item()
-            _VERDICTS[key] = f"the kernel ran and disagreed with the reference by {gap:.3g}"
-            return None
-    _TALLY["fp4_scaled_mm"] += 1
-    return out
-
-
-def _reference(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, activations: bool
-) -> torch.Tensor:
-    """Return the fake-quant matmul: the operands on the grid, the product in their dtype."""
-    return functional.linear(fake_quant(x) if activations else x, fake_quant(weight), bias)
+    if not activations:
+        return functional.linear(x, fake_quant(weight), bias)
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        return functional.linear(fake_quant(x), fake_quant(weight), bias)
+    flat = x.reshape(-1, x.shape[-1])
+    if verdict(x.device):
+        _TALLY["fp4_fallback"] += 1
+        return functional.linear(fake_quant(x), fake_quant(weight), bias)
+    return fp4_mm(flat, weight, bias).reshape(*x.shape[:-1], weight.shape[0])

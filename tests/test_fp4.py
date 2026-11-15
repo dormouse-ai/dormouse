@@ -16,7 +16,19 @@ the rung worth enabling:
 * the rung is wired into BOTH weight readers — `forward` and the rank-factored path —
   because a quantizer on `forward` alone leaves every expert in the bank unquantized
   while its counter still moves (`test_a_quantized_weight_is_read_by_the_factored_path`);
-* a run that claims fp4 and never reaches `_scaled_mm` says so (`test_..._says_so`).
+* the packed bytes are the format's — two codes per byte, the first in the low nibble —
+  and the dtype is a VIEW of them, so a copy kernel sneaking back in shows up as a new
+  storage pointer (`test_two_codes_share_a_byte_...`, `test_the_dtype_view_...`);
+* the scale tile is cuBLAS's 128x4 SWIZZLE_32_4_4, checked against the offset formula
+  from §3.1.4.3.2 rather than against the implementation it is testing
+  (`test_the_scale_tile_is_cublas_3_1_4_3_2`);
+* the quantiser's error is bounded by e2m1's own half-ulp, per code, not by a tolerance
+  somebody picked (`test_the_quantiser_is_within_half_an_ulp_of_the_format`);
+* the kernel's result is checked against an fp64 matmul of the very bytes it was handed,
+  so a nibble order or a swizzle read backwards fails (`test_the_kernel_matches_fp64_...`);
+* and the counter is the gate: an fp4 rung on a device that HAS the kernel must show
+  `fp4_scaled_mm > 0`, which is the measurement this rung never had
+  (`test_the_gate_refuses_a_rung_that_never_reached_the_kernel`).
 """
 
 from __future__ import annotations
@@ -27,8 +39,8 @@ from pathlib import Path
 import pytest
 import torch
 from dormouse_core.counters import Counters
+from dormouse_core.errors import LoudError
 from torch import nn
-from torch.nn import functional
 
 from dormouse.model import fp4, quant, tsct
 from dormouse.model.assemble import assemble
@@ -201,8 +213,6 @@ def test_the_format_keeps_the_dtype_it_was_handed() -> None:
 
 
 def test_a_width_the_block_cannot_tile_is_refused_with_the_remainder() -> None:
-    from dormouse_core.errors import LoudError
-
     with pytest.raises(LoudError) as caught:
         fp4.quantize(torch.zeros(2, 24))
     assert "24" in str(caught.value) and "16" in str(caught.value)
@@ -303,48 +313,191 @@ def test_a_weight_on_the_grid_makes_the_rung_a_no_op_with_torch_equal() -> None:
     assert torch.equal(plain(x), rung(x))
 
 
+# ----------------------------------------------------------------------- the bytes
+def test_two_codes_share_a_byte_and_the_first_is_the_low_nibble() -> None:
+    """The format's packing, pinned on one byte: 1 then 2 is `0x21`, not `0x12`."""
+    code = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0]], dtype=torch.uint8)
+    packed = fp4.pack(code)
+    assert packed.tolist() == [[0x21, 0x43, 0x65, 0x07]]
+    assert torch.equal(fp4.unpack(packed), code)
+    generator = torch.Generator().manual_seed(23)
+    wide = torch.randint(0, 16, (7, 64), generator=generator, dtype=torch.uint8)
+    assert torch.equal(fp4.unpack(fp4.pack(wide)), wide)
+
+
+def test_the_dtype_view_is_the_same_storage_not_a_copy() -> None:
+    """`view` is the trick: a cast would need the copy kernel this wheel lacks."""
+    generator = torch.Generator().manual_seed(29)
+    code, _, _ = fp4.codes(torch.randn(4, 64, generator=generator) * 5)
+    packed = fp4.pack(code)
+    operand = fp4.as_fp4(packed)
+    assert operand.dtype is torch.float4_e2m1fn_x2
+    assert operand.data_ptr() == packed.data_ptr()
+    #: On this build the dtype's item size is one byte, so the view keeps the buffer's
+    #: shape: the kernel reads `shape[-1]/2` bytes and doubles them back into K.
+    assert operand.element_size() == 1
+    assert operand.numel() == packed.numel()
+    #: And the bytes the kernel will read are the bytes the quantiser wrote.
+    assert torch.equal(fp4.unpack(operand.view(torch.uint8)), code)
+
+
+def test_the_dtype_view_refuses_bytes_it_cannot_read() -> None:
+    """A wrong dtype or a non-contiguous buffer would silently become a cast."""
+    with pytest.raises(LoudError) as wrong_dtype:
+        fp4.as_fp4(torch.zeros(4, 8))
+    assert "uint8" in str(wrong_dtype.value)
+    with pytest.raises(LoudError) as strided:
+        fp4.as_fp4(torch.zeros(4, 8, dtype=torch.uint8).t())
+    assert "contiguous" in strided.value.args[0]
+
+
+def test_the_scale_tile_is_cublas_3_1_4_3_2() -> None:
+    """The swizzle, against the offset formula from cuBLAS — an independent derivation."""
+
+    def cublas_offset(rows: int, cols: int) -> list[tuple[int, int, int]]:
+        col_tiles = -(-cols // 4)
+        placed = []
+        for row in range(rows):
+            for column in range(cols):
+                tile = 512 * ((row // 128) * col_tiles + column // 4)
+                outer, inner = row % 128, column % 4
+                placed.append((tile + (outer % 32) * 16 + (outer // 32) * 4 + inner, row, column))
+        return placed
+
+    for rows, cols in ((128, 4), (129, 5), (300, 52)):
+        scale = torch.randn(rows, cols).to(torch.float8_e4m3fn)
+        expected = torch.zeros((-(-rows // 128)) * 128 * (-(-cols // 4)) * 4)
+        expected = expected.to(torch.float8_e4m3fn)
+        for offset, row, column in cublas_offset(rows, cols):
+            expected[offset] = scale[row, column]
+        assert torch.equal(fp4.swizzle(scale), expected), (rows, cols)
+
+
+def test_the_scale_tile_is_padded_to_whole_tiles() -> None:
+    """A `[832, 52]` scale is 896 x 52 values: 832 is 6.5 tiles of 128 rows."""
+    scale = torch.zeros(832, 52).to(torch.float8_e4m3fn)
+    assert fp4.swizzle(scale).numel() == 896 * 52
+    assert fp4.swizzle(scale).is_contiguous()
+
+
+# ------------------------------------------------------------------- the grid's error
+def _half_ulp(code: torch.Tensor) -> torch.Tensor:
+    """Half the distance to the further neighbour of each code, in scale units."""
+    levels = torch.tensor(fp4.LEVELS, dtype=torch.float32)
+    index = code.long() & 0x7
+    here = levels[index]
+    below = torch.where(index > 0, levels[(index - 1).clamp_min(0)], torch.zeros_like(here))
+    #: The top code has no neighbour above it: the grid clamps at 6, so its step is 6 - 4.
+    above = torch.where(index < 7, levels[(index + 1).clamp_max(7)] - here, here - below)
+    return torch.maximum(here - below, above) / 2
+
+
+def test_the_quantiser_is_within_half_an_ulp_of_the_format() -> None:
+    """Every value is within half a step of the code it took — e2m1's own grid, per code.
+
+    Two bounds, both derived from the format and neither one a tolerance:
+
+    * absolute: `|x̂ - x| ≤ ½·Δ(code)·s`, where `Δ(code)` is the distance to the code's
+      FURTHER neighbour. This is the one that catches a quantiser one code off, or one
+      whose divisor `s` was built from a rounded reciprocal;
+    * relative to the code's own value: ≤ 25% inside the normal range (`½ ulp` of a
+      1-mantissa format, reached at the bottom of every binade) and ≤ 50% at 0.5, whose
+      neighbour below is zero. Below ¼·s the format's error is absolute, not relative:
+      the code is zero and `x̂` is `s`-sized, so it is bounded by the absolute rule only.
+    """
+    generator = torch.Generator().manual_seed(31)
+    x = torch.randn(4096, 832, generator=generator) * torch.rand(4096, 1, generator=generator)
+    code, block_scale, tensor_scale = fp4.codes(x)
+    scale = torch.repeat_interleave(tensor_scale * block_scale.float(), 16, dim=-1)
+    error = (fp4.quantize(x) - x).abs()
+    assert (error <= _half_ulp(code) * scale * (1 + 1e-6)).all()
+
+    value = fp4.decode(code) * scale
+    relative = error / value.abs().clamp_min(1e-30)
+    nonzero = value != 0
+    assert relative[nonzero].max().item() <= 0.5 * (1 + 1e-6)
+    normal = value.abs() >= scale
+    assert relative[normal].max().item() <= 0.25 * (1 + 1e-6)
+    print(
+        f"max relative quantisation error {relative[nonzero].max().item():.4f} "
+        f"(half-ulp ceilings: 0.5 at the smallest code, 0.25 in the normal range)"
+    )
+
+
 # -------------------------------------------------------------------- the kernel
-def test_the_kernel_is_not_used_while_autograd_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No fp4 backward exists, so a training forward must never reach `_scaled_mm`."""
-    calls: list[int] = []
+def test_fp4_mm_refuses_a_device_without_the_kernel() -> None:
+    """No silent substitution of the reference: the primitive raises the reason."""
+    x = torch.randn(4, 64)
+    with pytest.raises(LoudError) as caught:
+        fp4.fp4_mm(x, torch.randn(8, 64))
+    assert "cpu" in str(caught.value)
+    assert fp4.tally(torch.device("cpu"))["fp4_scaled_mm"] == 0
 
-    def stub(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor | None) -> torch.Tensor:
-        calls.append(1)
-        return functional.linear(fp4.quantize(x), fp4.quantize(w), b)
 
-    monkeypatch.setattr(fp4, "_scaled_mm", stub)
-    monkeypatch.setitem(fp4._VERDICTS, str(torch.device("cpu")), "")
-    monkeypatch.setattr(fp4, "_CHECKED", set())
-    cpu = torch.device("cpu")
+def test_fp4_mm_refuses_to_drop_a_gradient() -> None:
+    """A kernel with no backward would silently be an STE with the wrong slope."""
     x = torch.randn(4, 64, requires_grad=True)
-    w = torch.randn(8, 64)
-    out = fp4.linear(x, w)
-    assert not calls, "the kernel has no backward: it must not run under autograd"
-    assert fp4.tally(cpu)["fp4_scaled_mm"] == 0
-    assert out.requires_grad
-    with torch.no_grad():
-        fp4.reset()
-        fp4.linear(x, w)
-    assert len(calls) == 1
-    assert fp4.tally(cpu)["fp4_scaled_mm"] == 1
+    with pytest.raises(LoudError) as caught:
+        fp4.fp4_mm(x, torch.randn(8, 64))
+    assert "backward" in str(caught.value)
 
 
-def test_a_kernel_that_disagrees_with_the_reference_is_refused(
+def test_the_probe_does_not_count_as_a_matmul(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verdict's attempt must not satisfy the gate it exists to make honest."""
+    monkeypatch.setitem(fp4._VERDICTS, str(torch.device("cpu")), "")
+    assert fp4.verdict(torch.device("cpu")) == ""
+    assert fp4.tally(torch.device("cpu"))["fp4_scaled_mm"] == 0
+
+
+def test_the_gate_refuses_a_rung_that_never_reached_the_kernel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A layout accepted but read in the wrong order returns numbers: they are checked."""
-    monkeypatch.setattr(
-        fp4, "_scaled_mm", lambda x, w, b: torch.full((x.shape[0], w.shape[0]), 9.0)
-    )
+    """The rung on, the kernel available, zero calls: that run must fail, loudly.
+
+    This is the gate the previous measurement did not have — it passed its own tests
+    with `fp4_scaled_mm == 0` on every step and reported the quantiser's cost as FP4's.
+    """
     monkeypatch.setitem(fp4._VERDICTS, str(torch.device("cpu")), "")
-    monkeypatch.setattr(fp4, "_CHECKED", set())
-    x = torch.randn(4, 64)
-    w = torch.randn(8, 64)
-    with torch.no_grad():
-        out = fp4.linear(x, w)
-    assert torch.equal(out, fp4._reference(x, w, None, activations=True))
+    with pytest.raises(LoudError) as caught:
+        fp4.require_kernel(torch.device("cpu"))
+    assert "never" in str(caught.value) or "no matmul" in str(caught.value)
+    fp4._TALLY["fp4_scaled_mm"] = 1
+    fp4.require_kernel(torch.device("cpu"))
+
+
+def test_the_kernel_is_not_used_while_autograd_is_on() -> None:
+    """No fp4 backward exists, so a training forward must never reach `_scaled_mm`."""
+    torch.manual_seed(37)
+    rung = nn.Linear(64, 8, bias=False)
+    quant.quantize_weights(rung, "fp4", activations_fp4=True)
+    x = torch.randn(4, 64, requires_grad=True)
+    out = rung(x)
+    assert out.requires_grad
     assert fp4.tally(torch.device("cpu"))["fp4_scaled_mm"] == 0
-    assert "disagreed" in fp4.verdict(torch.device("cpu"))
+    assert fp4.tally(torch.device("cpu"))["fp4_fakequant"] > 0
+
+
+def test_a_device_without_the_kernel_counts_the_fallback() -> None:
+    """The reference path is not silent: every matmul it serves is counted."""
+    torch.manual_seed(41)
+    rung = nn.Linear(64, 8, bias=False)
+    quant.quantize_weights(rung, "fp4", activations_fp4=True)
+    with torch.no_grad():
+        rung(torch.randn(4, 64))
+    report = fp4.tally(torch.device("cpu"))
+    assert report["fp4_fallback"] == 1
+    assert report["fp4_scaled_mm"] == 0
+    assert isinstance(report["verdict"], str) and report["verdict"], "a reason, here"
+
+
+def test_a_weight_only_rung_never_takes_the_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kernel needs both operands at one format; activations are not quantized here."""
+    calls: list[int] = []
+    monkeypatch.setattr(fp4, "_scaled_mm", lambda *a, **k: calls.append(1))
+    monkeypatch.setitem(fp4._VERDICTS, str(torch.device("cpu")), "")
+    with torch.no_grad():
+        fp4.linear(torch.randn(4, 64), torch.randn(8, 64), activations=False)
+    assert not calls
 
 
 def test_a_run_that_claims_fp4_and_never_touches_the_kernel_says_so() -> None:
@@ -360,11 +513,46 @@ def test_a_run_that_claims_fp4_and_never_touches_the_kernel_says_so() -> None:
     assert "fp4" in fp4.build_note()
 
 
-def test_a_weight_only_rung_never_takes_the_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The kernel needs both operands at one format; activations are not quantized here."""
-    calls: list[int] = []
-    monkeypatch.setattr(fp4, "_scaled_mm", lambda x, w, b: calls.append(1))
-    monkeypatch.setitem(fp4._VERDICTS, str(torch.device("cpu")), "")
+# ----------------------------------------------------------------- the card, marked
+@pytest.mark.gpu
+def test_the_kernel_matches_fp64_on_the_bytes_it_was_handed() -> None:
+    """The kernel's result against an fp64 matmul of the decoded codes, not of `x`."""
+    for rows, out_features, width in ((256, 256, 256), (512, 384, 832), (248, 512, 832)):
+        a = torch.randn(rows, width, device="cuda")
+        w = torch.randn(out_features, width, device="cuda")
+        with torch.no_grad():
+            got = fp4.fp4_mm(a, w)
+            code_a, scale_a, tensor_a = fp4.codes(a)
+            code_w, scale_w, tensor_w = fp4.codes(w)
+            exact_a = _exact(code_a, scale_a, tensor_a, rows, width)
+            exact_w = _exact(code_w, scale_w, tensor_w, out_features, width)
+            reference = exact_a @ exact_w.T
+        #: The output is bf16, so one ulp of the largest |out| is the bound: 2^-8 of it.
+        bound = 2.0**-8 * got.abs().max().item()
+        assert (got.double() - reference).abs().max().item() <= bound, (rows, out_features, width)
+
+    assert fp4.tally("cuda")["fp4_scaled_mm"] == 3
+
+
+@pytest.mark.gpu
+def test_the_fp4_rung_reaches_the_kernel_on_the_card() -> None:
+    """The gate, live: the rung on and a forward must move `fp4_scaled_mm`."""
+    torch.manual_seed(43)
+    rung = nn.Linear(64, 32, bias=True).cuda()
+    quant.quantize_weights(rung, "fp4", activations_fp4=True)
     with torch.no_grad():
-        fp4.linear(torch.randn(4, 64), torch.randn(8, 64), activations=False)
-    assert not calls
+        out = rung(torch.randn(4, 64, device="cuda"))
+    assert out.shape == (4, 32)
+    fp4.require_kernel(torch.device("cuda"))
+    report = fp4.tally(torch.device("cuda"))
+    assert report["fp4_scaled_mm"] == 1
+    assert report["fp4_fallback"] == 0
+
+
+def _exact(
+    code: torch.Tensor, block_scale: torch.Tensor, tensor_scale: torch.Tensor, rows: int, width: int
+) -> torch.Tensor:
+    """The quantised operand in fp64: decoded codes times their own two-level scale."""
+    scale = (tensor_scale.double() * block_scale.double()).unsqueeze(-1)
+    values = fp4.decode(code).double().reshape(rows, -1, fp4.BLOCK) * scale
+    return values.reshape(rows, width)

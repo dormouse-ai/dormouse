@@ -1,286 +1,197 @@
-"""What the fp4 rung costs and buys, measured — and the one thing it does not prove.
+"""What the fp4 rung actually buys on the card, per live shape — kernel included.
 
-Three instruments, each named next to its number:
+The measurement this script exists to make impossible: a "cost of FP4" that never ran
+FP4. `require_kernel` is called at the end, so a run where every matmul fell back to the
+reference fake-quant exits non-zero instead of printing a time.
 
-* MEMORY — the bytes an activation of the live shape (`24 x 1024 x 832`) occupies, and
-  the process RSS high-water for the matmul that reads it, per rung. Peak RSS is
-  measured in an isolated child per rung, so one rung's high-water cannot leak into
-  another's. This is the number fp4 is actually for: it buys memory, not speed.
-* TIME — one `[tokens, 832] @ [6144, 832]ᵀ` forward per rung, on `--device`. The
-  default is the CPU: `card_state()` prints what the card is doing and whether this
-  wheel can pack the format at all, and a CPU number is labelled a CPU number rather
-  than reported as a GPU one. On the card, run it through `scripts/gpu_lock.sh`.
-* LOSS — `--steps` steps of fp32 training on `tests/fixtures/corpus_2mb.bin` with
-  `weight_qat`/`act_quant` at `none`, `ternary` and `fp4`, identical seeds. This is a
-  SMOKE, not a verdict: a 200-step run of a 2M-parameter arm on 2 MB of text cannot
-  rank two quantizers, and the line that reports it says so.
+Four numbers per shape, on `--device`:
 
-    python scripts/bench_fp4.py                    # defaults: 200 steps, b24 x s1024
-    python scripts/bench_fp4.py --steps 50 --time-reps 1
-    python scripts/bench_fp4.py --skip-loss        # memory + time only
-    GPU_TIMEOUT=300 bash scripts/gpu_lock.sh python scripts/bench_fp4.py --device cuda
+* BF16 — `a·wᵀ` at the shape the model actually uses, the baseline;
+* KERNEL — the `_scaled_mm` call alone, both operands already packed: the format's
+  compute, which is what a serving path with static weights pays;
+* ACT-QUANT — the activation packed per call, the weight kept packed: what a step pays;
+* END TO END — both operands quantised per call, which is what `fp4.linear` does today.
 
-The measured facts this script exists to keep honest (they are why the rung is
-forward-only today): on sm_120 `torch._scaled_mm` takes NVFP4 operands in the forward
-and has no backward at all, so a TRAINING run is QAT — the reference fake-quant with a
-straight-through estimator — and `fp4.tally()` will report `fp4_scaled_mm=0` for every
-step of it. A number that claims otherwise would be a claim about a kernel nobody ran.
+And one memory pair: the live activation as bf16 against the same activation packed to
+4.5 bits, plus the peak the matmul needs on each rung.
+
+    tools/gpu_lock.sh --wait -- python scripts/bench_fp4.py
+    tools/gpu_lock.sh --wait -- python scripts/bench_fp4.py --reps 50
+
+The card is shared by several lanes. Run it under `tools/gpu_lock.sh`: two processes
+timing the same GPU is one measurement of the contention.
 """
 
 from __future__ import annotations
 
 import argparse
-import resource
+import statistics
 import subprocess
-import sys
 import time
-from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from functools import partial
 
 import torch
-from torch.nn import functional
 
 from dormouse.model import fp4
-from dormouse.model.assemble import assemble
-from dormouse.model.spec import StackSpec
-from dormouse.train.optim import MixOptimizer
 
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "corpus_2mb.bin"
-CONFIGS = Path(__file__).resolve().parents[1] / "configs"
-
-#: The one architecture at widths a CPU can train for 200 steps; every slot is kept.
-SMOKE = {
-    "d_model": 64,
-    "n_heads": 4,
-    "n_kv_heads": 2,
-    "head_dim": 16,
-    "c_lat": 32,
-    "n_layers": 4,
-    "d_ffn": 128,
-    "n_experts": 4,
-    "topk": 1,
-    "expert_tsct_rank": 32,
-    "attn_k": 64,
-    "attn_window": 32,
-    "seq_len": 128,
-    "batch": 2,
-    "tokens": 1_000_000,
-}
-
-RUNGS: tuple[dict[str, str], ...] = (
-    {"weight_qat": "none", "act_quant": "none"},
-    {"weight_qat": "ternary", "act_quant": "int4"},
-    {"weight_qat": "fp4", "act_quant": "fp4"},
-)
-
-
-def rss_mib() -> float:
-    """Process RSS high-water mark in MiB (Linux reports KiB)."""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+#: The two contractions the model runs: attention's projections and the experts' FFN.
+SHAPES: tuple[tuple[int, int, int], ...] = ((24576, 832, 2048), (24576, 832, 832))
 
 
 def card_state() -> str:
-    """Say what the card is doing and what this wheel can do with it."""
-    try:
-        used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=20,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        used = "unreadable"
+    """Report what the card is doing and whether this wheel can run the kernel on it."""
     apps = subprocess.run(
-        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
+        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv"],
         capture_output=True,
         text=True,
         check=False,
         timeout=20,
     ).stdout.strip()
-    verdict = fp4.verdict()
-    return (
-        f"card: {used} MiB in use; compute apps:\n{apps}\n"
-        f"wheel: torch {torch.__version__}, cuda available={torch.cuda.is_available()}\n"
-        f"fp4 kernel on {('cuda' if torch.cuda.is_available() else 'cpu')}: "
-        f"{verdict or 'available'}"
-    )
-
-
-def memory(tokens: int, width: int) -> None:
-    """Bytes per rung at the live activation shape, and the peak of reading it."""
-    print(f"\n== memory: activations [{tokens}, {width}] ==")
-    values = tokens * width
-    rows = {
-        "fp32": values * 4,
-        "bf16": values * 2,
-        "fp4": values // 2 + values // fp4.BLOCK,
-    }
-    for name, size in rows.items():
-        print(f"  {name:5s} {size / 2**20:9.2f} MiB  ({size / values:.2f} bytes/value)")
-    print("  fp4 is 4 bits/value (measured as numel/2) plus one e4m3 scale per 16")
-    print("  (measured as numel/16); the packed dtype cannot be allocated on this build.")
-    if torch.cuda.is_available():
-        print("\n  peak allocation on the card (torch.cuda.max_memory_allocated):")
-        device = torch.device("cuda")
-        weight = torch.randn(width * 2, width)
-        for label, body in (
-            ("bf16", lambda x: x.to(torch.bfloat16) @ weight.to(device, torch.bfloat16).T),
-            ("fp4 ", lambda x: fp4.linear(x, weight.to(device))),
-        ):
-            with torch.no_grad():
-                x = torch.zeros(tokens, width, device=device)
-                torch.cuda.reset_peak_memory_stats()
-                body(x)
-                torch.cuda.synchronize()
-                peak = torch.cuda.max_memory_allocated() / 2**20
-                del x
-                torch.cuda.empty_cache()
-            print(f"    {label} peak {peak:9.1f} MiB (device total for the call)")
-        return
-
-    print("\n  peak RSS of one matmul, isolated child per rung:")
-    baseline = _child_peak(f"import torch; x = torch.empty({tokens}, {width})")[0]
-    for label, body in (
-        ("bf16", "y = x.to(torch.bfloat16) @ w.to(torch.bfloat16).T"),
-        ("fp4 ", "from dormouse.model import fp4\n    y = fp4.linear(x, w)"),
-    ):
-        peak = _child_peak(
-            f"import torch\n"
-            f"x = torch.empty({tokens}, {width})\n"
-            f"w = torch.empty({width * 2}, {width})\n"
-            f"def run():\n"
-            f"    {body}\n"
-            f"    return y\n"
-            f"run()"
-        )[0]
-        print(f"    {label} peak {peak:8.1f} MiB, +{peak - baseline:8.1f} MiB over baseline")
-
-
-def _child_peak(code: str) -> tuple[float, int]:
-    """Run `code` in a child interpreter; return its RSS high-water and exit status."""
-    done = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            f"import resource\n{code}\n"
-            "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0)",
-        ],
+    used = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.used,utilization.gpu", "--format=csv,noheader"],
         capture_output=True,
         text=True,
         check=False,
-        timeout=1800,
+        timeout=20,
+    ).stdout.strip()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return (
+        f"card: {used}\ncompute apps:\n{apps}\n"
+        f"torch {torch.__version__}, fp4 kernel on {device}: {fp4.verdict(device) or 'available'}"
     )
-    if done.returncode != 0:
-        print(f"    (child failed: {done.stderr.strip().splitlines()[-1:]})")
-        return (0.0, done.returncode)
-    return (float(done.stdout.strip().splitlines()[-1]), 0)
 
 
-def timing(tokens: int, reps: int, device: str) -> None:
-    """One linear forward per rung at the live shape, on `device`, with the verdict."""
-    width, ffn = 832, 6144
-    where = torch.device(device)
-    print(f"\n== time: [{tokens}, {width}] @ [{ffn}, {width}]ᵀ, {reps} reps, {device} ==")
-    generator = torch.Generator(device=where)
-    generator.manual_seed(0)
-    x = torch.randn(tokens, width, generator=generator, device=where)
-    weight = torch.randn(ffn, width, generator=generator, device=where)
-    with torch.no_grad():
-        quantized = fp4.quantize(weight)
-        scale = weight.abs().mean().clamp_min(1e-8)
-        ternary = ((weight / scale).round().clamp(-1, 1) * scale).contiguous()
-        for label, forward in (
-            ("none   ", lambda: functional.linear(x, weight)),
-            ("ternary", lambda: functional.linear(x, ternary)),
-            ("fp4    ", lambda: fp4.linear(x, weight)),
+def timed(body: Callable[[], object], reps: int, warmup: int = 3) -> float:
+    """Return the median wall time of `body`, in milliseconds, with the card synchronised."""
+    for _ in range(warmup):
+        body()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    samples = []
+    for _ in range(reps):
+        start = time.perf_counter()
+        body()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        samples.append((time.perf_counter() - start) * 1e3)
+    return statistics.median(samples)
+
+
+def flops(rows: int, out_features: int, width: int) -> float:
+    """Count multiply-adds twice, which is what GFLOP/s means everywhere else."""
+    return 2.0 * rows * out_features * width
+
+
+def kernel(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Run the matmul alone, operands packed: the format's compute, nothing else."""
+    left, right, scale_a, scale_b, tensor_a, tensor_b = tensors
+    out = fp4._scaled_mm(left, right, scale_a, scale_b)
+    torch.mul(out, tensor_a * tensor_b)
+
+
+def act_quant(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Run the matmul with the activation packed from scratch on every call."""
+    a, right, scale_b, tensor_b = tensors
+    left, scale_a, tensor_a = fp4.packed(a)
+    out = fp4._scaled_mm(left, right, scale_a, scale_b)
+    torch.mul(out, tensor_a * tensor_b)
+
+
+def speed(device: torch.device, reps: int) -> None:
+    """Time bf16 against the three fp4 paths on every live shape, and the ratios."""
+    print(f"\n== compute: GFLOP/s and ms, median of {reps} ==")
+    print(f"  {'shape':26s} {'rung':12s} {'ms':>9s} {'GFLOP/s':>9s} {'vs bf16':>8s}")
+    for rows, width, out_features in SHAPES:
+        a = torch.randn(rows, width, device=device)
+        w = torch.randn(out_features, width, device=device)
+        a16, w16 = a.to(torch.bfloat16), w.to(torch.bfloat16)
+        packed_a, scale_a, tensor_a = fp4.packed(a)
+        packed_w, scale_w, tensor_w = fp4.packed(w)
+        work = flops(rows, out_features, width)
+        baseline = timed(partial(torch.mm, a16, w16.T), reps)
+        for label, milliseconds in (
+            ("bf16", baseline),
             (
-                "fp4 grid, bf16 matmul",
-                lambda: functional.linear(x.to(torch.bfloat16), quantized.to(torch.bfloat16)),
+                "fp4 kernel",
+                timed(
+                    partial(kernel, (packed_a, packed_w, scale_a, scale_w, tensor_a, tensor_w)),
+                    reps,
+                ),
             ),
+            ("fp4 act-quant", timed(partial(act_quant, (a, packed_w, scale_w, tensor_w)), reps)),
+            ("fp4 e2e", timed(partial(fp4.fp4_mm, a, w), reps)),
         ):
-            _sync(where)
-            forward()
-            _sync(where)
-            start = time.perf_counter()
-            for _ in range(reps):
-                forward()
-            _sync(where)
-            elapsed = (time.perf_counter() - start) / reps
-            gflop = 2 * tokens * ffn * width / 1e9
-            print(f"  {label:22s} {elapsed * 1e3:9.2f} ms  {gflop / elapsed:8.1f} GFLOP/s")
-    print(f"  paths after the timing block: {fp4.tally(where)}")
-    print(
-        "  (the bf16 row is NOT an fp4 kernel: it dequantises to bf16 and uses tensor"
-        " cores, so its speed is bf16's, and its memory is the grid's)"
-    )
+            ratio = f"{milliseconds / baseline:7.2f}x" if label != "bf16" else "    1.00x"
+            shape = f"[{rows},{width}]x[{width},{out_features}]"
+            print(
+                f"  {shape:26s} {label:12s} {milliseconds:9.3f} "
+                f"{work / milliseconds / 1e6:9.1f} {ratio}"
+            )
+        del a, w, a16, w16, packed_a, packed_w
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
-def _sync(device: torch.device) -> None:
-    """Wait for the device when it is an accelerator, so a timing is a timing."""
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+def memory(device: torch.device, reps: int) -> None:
+    """Weigh the live activation on both rungs, and the peak the matmul allocates."""
+    rows, width, out_features = SHAPES[0]
+    print(f"\n== memory: activations [{rows}, {width}] and the matmul that reads them ==")
+    a = torch.randn(rows, width, device=device)
+    packed_a, scale_a, _ = fp4.packed(a)
+    a16 = a.to(torch.bfloat16)
+    bf16_bytes = a16.untyped_storage().nbytes()
+    fp4_bytes = packed_a.untyped_storage().nbytes() + scale_a.untyped_storage().nbytes()
+    per_value = fp4_bytes / (rows * width)
+    saved, ratio = (bf16_bytes - fp4_bytes) / 2**20, bf16_bytes / fp4_bytes
+    print(f"  bf16            {bf16_bytes / 2**20:9.2f} MiB  {bf16_bytes / (rows * width):.2f} B")
+    print(f"  fp4 + scales    {fp4_bytes / 2**20:9.2f} MiB  {per_value:.2f} B (4 + 8/16)")
+    print(f"  saved           {saved:9.2f} MiB  {ratio:.2f}x")
+
+    if not torch.cuda.is_available():
+        return
+    w = torch.randn(out_features, width, device=device)
+    packed_w, scale_w, _ = fp4.packed(w)
+    w16 = w.to(torch.bfloat16)
+    for label, body in (
+        ("bf16", partial(torch.mm, a16, w16.T)),
+        ("fp4 ", partial(fp4._scaled_mm, packed_a, packed_w, scale_a, scale_w)),
+    ):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        for _ in range(reps):
+            out = body()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - before
+        del out
+        torch.cuda.empty_cache()
+        print(f"  peak allocation during {label} matmul {peak / 2**20:8.1f} MiB")
 
 
-def loss(steps: int) -> None:
-    """Identical-seed training per rung on the 2 MB fixture; a smoke, not a verdict."""
-    text = torch.frombuffer(bytearray(FIXTURE.read_bytes()[:2_000_000]), dtype=torch.uint8)
-    base = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
-    spec = _replace(base, **SMOKE)
-    print(f"\n== loss smoke: {steps} fp32 CPU steps on {FIXTURE.name}, identical seeds ==")
-    print("   A 200-step run of a 2M-parameter arm on 2 MB cannot rank two quantizers.")
-    for rung in RUNGS:
-        torch.manual_seed(0)
-        stack: Any = assemble(_replace(spec, **rung), smoke=True)
-        optimizer = MixOptimizer(stack.model, steps=3, lr_muon=0.02, lr_adamw=0.02)
-        torch.manual_seed(1)
-        window = steps * spec.batch * spec.seq_len
-        offset = int(torch.randint(0, text.numel() - window - 1, (1,)))
-        data = text[offset : offset + window + spec.seq_len].long().reshape(spec.batch, -1)
-        losses, start = [], time.perf_counter()
-        for step in range(steps):
-            ids = data[:, step * spec.seq_len : (step + 1) * spec.seq_len + 1]
-            result, _ = stack.step(ids, optimizer=optimizer)
-            losses.append(result.loss)
-        tail = sum(losses[-20:]) / len(losses[-20:])
-        head = sum(losses[:20]) / len(losses[:20])
-        print(
-            f"  {rung['weight_qat']:>7s}+{rung['act_quant']:<4s} "
-            f"first20={head:.4f} last20={tail:.4f} "
-            f"({tail - head:+.4f})  {time.perf_counter() - start:.1f}s  {fp4.tally()}"
-        )
+def main(argv: list[str] | None = None) -> int:
+    """Measure the live shapes and refuse to report a run that never reached the kernel."""
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--reps", type=int, default=20)
+    arguments = parser.parse_args(argv)
+    device = torch.device(arguments.device)
 
-
-def _replace(spec: StackSpec, **changes: object) -> StackSpec:
-    """`dataclasses.replace` for the spec, spelled once."""
-    from dataclasses import replace
-
-    return replace(spec, **changes)
-
-
-def main() -> int:
-    """Run the three instruments and print the verdict lines, labelled as such."""
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else "")
-    parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--batch", type=int, default=24)
-    parser.add_argument("--sequence", type=int, default=1024)
-    parser.add_argument("--time-reps", type=int, default=2)
-    parser.add_argument("--skip-loss", action="store_true")
-    parser.add_argument("--skip-time", action="store_true")
-    parser.add_argument("--skip-memory", action="store_true")
-    parser.add_argument("--device", default="cpu", help="cpu (default) or cuda when free")
-    args = parser.parse_args()
-
-    sys.stdout.reconfigure(line_buffering=True)  # a long run must be watchable
     print(card_state())
-    tokens = args.batch * args.sequence
-    if not args.skip_memory:
-        memory(tokens, 832)
-    if not args.skip_time:
-        timing(tokens, args.time_reps, args.device)
-    if not args.skip_loss:
-        loss(args.steps)
-    print(f"\nprocess RSS high-water: {rss_mib():.1f} MiB")
+    reason = fp4.verdict(device)
+    if reason:
+        print(f"\nno fp4 kernel on {device}: {reason}\nnothing here can be measured.", flush=True)
+        return 2
+    fp4.reset()
+    speed(device, arguments.reps)
+    memory(device, arguments.reps)
+    fp4.require_kernel(device)
+    report = fp4.tally(device)
+    print(
+        f"\ncounter: fp4_scaled_mm={report['fp4_scaled_mm']} "
+        f"fp4_fakequant={report['fp4_fakequant']} fp4_fallback={report['fp4_fallback']}"
+    )
+    print("every number above is a matmul that reached the kernel.")
     return 0
 
 
