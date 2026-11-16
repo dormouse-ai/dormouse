@@ -15,7 +15,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import MissingReport
 from stacks import reference_stack
 
-from dormouse.train.muon import NS_GROUPED_COUNTER, Muon, polar
+from dormouse.train.muon import NS_GROUPED_COUNTER, Muon, _polar_many, polar
 from dormouse.train.optim import MixOptimizer
 from dormouse.train.step import train_step
 
@@ -124,21 +124,21 @@ def test_a_per_head_matrix_never_joins_a_whole_bucket_of_the_same_shape() -> Non
     ]
     for param in params:
         param.grad = torch.randn_like(param)
-    batches: list[torch.Size] = []
-    real_polar = polar
+    calls: list[tuple[torch.Size, ...]] = []
+    real_many = _polar_many
 
-    def recording_polar(x: torch.Tensor, steps: int = 5) -> torch.Tensor:
-        batches.append(x.shape)
-        return real_polar(x, steps=steps)
+    def recording_many(batch: list[torch.Tensor], steps: int = 5) -> list[torch.Tensor]:
+        calls.append(tuple(x.shape for x in batch))
+        return real_many(batch, steps=steps)
 
-    with patch("dormouse.train.muon.polar", recording_polar):
+    with patch("dormouse.train.muon._polar_many", recording_many):
         Muon(
             [
                 {"params": params[:1], "head_split": (4, 8)},
                 {"params": params[1:], "head_split": None},
             ]
         ).step()
-    sizes = {(tuple(batch[-2:]), batch[0]) for batch in batches}
+    sizes = {(tuple(shape[-2:]), shape[0]) for group in calls for shape in group}
     assert ((2, 4), 4) in sizes, "the four Q/K heads were not batched together"
     assert ((2, 4), 1) in sizes and ((4, 4), 1) in sizes, "a whole matrix joined a head bucket"
 
