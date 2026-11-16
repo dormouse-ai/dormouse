@@ -60,14 +60,25 @@ The compressed layers have no packed matrix: their Q is written by `q_up`
 `q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
 remainder — whole, so the arm is the same one applied to the same tensors, and the
 router reads it off the modules rather than off a shape heuristic.
+
+§6. SHAPE-GROUPED SCHEDULING. One `polar` per matrix issues ~22 serialized GEMMs
+    (3 power iterations × 2, 5 NS × 3, one final) and the port is host-dispatch-bound. A
+    bucket of equal-shaped regions runs those same GEMMs as `bmm` on a `[N, m, n]` stack:
+    one launch per bucket, identical arithmetic in fp32, no change to the iteration count,
+    coefficients, dtype or direction. The bucket key carries shape, step count and role
+    (per-head vs whole), so a Q/K head can never join a whole-matrix bucket, and Muon can
+    never see an AdamW parameter. A Triton fused chain was NOT ported: the box has no CUDA
+    device and no `triton` module, so it cannot compile or pass parity here.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Any
 
 import torch
-from dormouse_core.errors import LoudError
+from dormouse_core.counters import Counters
+from dormouse_core.errors import LoudError, MissingReport
 from torch.optim import Optimizer
 
 __all__ = [
@@ -75,6 +86,7 @@ __all__ = [
     "MUON_LR",
     "NS_COEFFS",
     "NS_EPS",
+    "NS_GROUPED_COUNTER",
     "NS_POWER_ITERS",
     "NS_STEPS",
     "Muon",
@@ -106,6 +118,11 @@ NS_EPS = 1e-7
 
 #: Muon's rate for the live 275M recipe. Shipped as a default, not a verdict.
 MUON_LR = 0.02
+
+#: Counter that proves the batched (rather than per-matrix) polar path ran. Enabled by
+#: `Muon.step` when grouping is on and a `Counters` object is supplied, so a declared but
+#: absent mechanism fails `Counters.check()` instead of reporting eager timings.
+NS_GROUPED_COUNTER = "ns_grouped"
 
 
 def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -243,8 +260,13 @@ class Muon(Optimizer):
         momentum: float = 0.95,
         steps: int = NS_STEPS,
         weight_decay: float = 0.0,
+        grouped: bool = True,
     ) -> None:
-        """Bind the four numbers every group inherits unless it overrides them."""
+        """Bind the four numbers every group inherits unless it overrides them.
+
+        `grouped` schedules equal-shaped regions as one `bmm` chain (§6). It is a
+        schedule switch, not a second algorithm: `grouped=False` is the parity control.
+        """
         if not 0.0 <= momentum < 1.0:
             raise LoudError(
                 f"muon momentum={momentum} is not in [0, 1)",
@@ -255,20 +277,38 @@ class Muon(Optimizer):
                 f"muon ns steps={steps} runs no iteration",
                 "5 is the recipe's, and §3 of the module docstring prices fewer",
             )
+        self.grouped = grouped
         super().__init__(
             params,
             {"lr": lr, "momentum": momentum, "steps": steps, "weight_decay": weight_decay},
         )
 
     @torch.no_grad()
-    def step(self, closure: Any = None) -> Any:
-        """Advance every parameter that carries a gradient; return the closure's loss."""
+    def step(self, closure: Any = None, *, counters: Counters | None = None) -> Any:
+        """Advance every parameter that carries a gradient; return the closure's loss.
+
+        Polar runs once per (shape, steps, role) bucket rather than once per matrix. The
+        bucket key carries the role so a per-head Q/K slice never joins a whole-matrix
+        bucket; AdamW parameters are never in this optimizer's param groups at all.
+        Passing `counters` enables and proves the batched path (§6).
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if counters is not None and self.grouped:
+            counters.enable(
+                "ns_grouped",
+                counter=NS_GROUPED_COUNTER,
+                why="shape-grouped polar runs as batched bmm",
+            )
+        jobs: dict[
+            tuple[torch.Size, int, tuple[int, int] | None],
+            list[tuple[Any, int, int, torch.Tensor]],
+        ] = defaultdict(list)
+        plans: dict[Any, tuple[float, float, float, list[tuple[bool, torch.Size]]]] = {}
         for group in self.param_groups:
-            momentum = group["momentum"]
+            rate = group["momentum"]
             steps = group["steps"]
             lr = group["lr"]
             decay = group["weight_decay"]
@@ -280,10 +320,43 @@ class Muon(Optimizer):
                 if "momentum" not in state:
                     state["momentum"] = torch.zeros_like(param)
                 buffer = state["momentum"]
-                buffer.mul_(momentum).add_(param.grad, alpha=1.0 - momentum)
-                direction = muon_direction(buffer, head_split=head_split, steps=steps)
-                if decay:
-                    param.mul_(1.0 - lr * decay)
+                buffer.mul_(rate).add_(param.grad, alpha=1.0 - rate)
+                regions = _regions(buffer, head_split)
+                plan: list[tuple[bool, torch.Size]] = []
+                for region_index, region in enumerate(regions):
+                    batched = region.ndim == 3
+                    matrices = [region[i] for i in range(region.shape[0])] if batched else [region]
+                    plan.append((batched, region.shape))
+                    for matrix_index, matrix in enumerate(matrices):
+                        jobs[(matrix.shape, steps, head_split)].append(
+                            (param, region_index, matrix_index, matrix)
+                        )
                 rows, cols = param.shape
-                param.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
+                plans[param] = (lr, decay, max(1.0, rows / cols) ** 0.5, plan)
+        results: dict[tuple[Any, int, int], torch.Tensor] = {}
+        for (_, steps, _), entries in jobs.items():
+            if self.grouped:
+                stacked = torch.stack([entry[3] for entry in entries])
+                out = colrow(polar(stacked, steps=steps))
+                if counters is not None:
+                    counters.count(NS_GROUPED_COUNTER, len(entries))
+            else:
+                out = torch.stack([colrow(polar(entry[3], steps=steps)) for entry in entries])
+            for index, (param, region_index, matrix_index, _) in enumerate(entries):
+                results[(param, region_index, matrix_index)] = out[index]
+        grouped_proof = counters.counts[NS_GROUPED_COUNTER] if counters is not None else 1
+        if self.grouped and jobs and not grouped_proof:
+            raise MissingReport([NS_GROUPED_COUNTER])
+        for param, (lr, decay, scale, plan) in plans.items():
+            parts: list[torch.Tensor] = []
+            for region_index, (batched, shape) in enumerate(plan):
+                matrices = [
+                    results[(param, region_index, matrix_index)]
+                    for matrix_index in range(shape[0] if batched else 1)
+                ]
+                parts.append(torch.stack(matrices).reshape(shape) if batched else matrices[0])
+            direction = _assemble(parts)
+            if decay:
+                param.mul_(1.0 - lr * decay)
+            param.add_(direction, alpha=-lr * scale)
         return loss
