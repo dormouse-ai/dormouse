@@ -12,7 +12,7 @@ built its own would be a second model, and the two would disagree the first time
 mechanism moved.
 
 TIED HEAD. The logits' matrix IS the token table, transposed. At the tokenizer's
-32 000 rows a head of its own is 27M parameters (2.6% of a 1B model) that learn
+32 768 rows a head of its own is 27M parameters (2.6% of a 1B model) that learn
 "predict token t" separately from "read token t"; for a table this size the two
 gradients belong in one
 matrix, and the head's own bill stays 0 so a translation of the tying to a second

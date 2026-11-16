@@ -18,6 +18,8 @@
 #   active     top-2 + shared = 3 experts =  16,072,704  (ffn active)
 
 unit = "bpe"
+# The one tokenizer its ids were cut with; DEFAULT_VOCAB and every manifest answer to it.
+tokenizer = "tokenizer32k.json"
 attn = "hybrid"
 optimizer = "muon"
 objective = "ntp"

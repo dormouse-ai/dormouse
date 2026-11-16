@@ -2,8 +2,8 @@
 
 Three contracts live here, and each one is a number rather than an opinion:
 
-* the model stores its experts as rank-256 factors — 400.3M stored, an FFN active set of
-  16.07M — measured from the module tree, with the attention share of the active set
+* the model stores its experts as rank-256 factors — 401.0M stored, an FFN active set of
+  16.14M — measured from the module tree, with the attention share of the active set
   printed next to it;
 * every attention layer is one of the two mechanisms, in the 3:1 pattern, with GQA and
   the bottleneck on both — and the DSA layers are where the plan says they are;
@@ -24,6 +24,7 @@ import pytest
 import torch
 from dormouse_core.errors import LoudError
 
+from dormouse.data.tokenizer import DEFAULT_VOCAB
 from dormouse.model.assemble import assemble, plan_lines
 from dormouse.model.registry import pieces
 from dormouse.model.spec import StackSpec
@@ -70,6 +71,7 @@ def test_the_model_stores_the_factors_and_runs_the_ffn_at_sixteen_million() -> N
     assert 0.35e9 <= report["stored"] <= 0.45e9, report["stored"]
     assert report["active_ffn"] < report["stored"] / 20
     assert report["head"] == 0  # tied: a nonzero here is a second matrix
+    assert report["embedding"] == DEFAULT_VOCAB * 832  # the tokenizer sizes the table
 
 
 def test_the_attention_share_of_the_step_is_printed_and_is_the_minority() -> None:
@@ -186,6 +188,16 @@ def test_dorm_plan_is_wired_and_train_refuses_a_config_with_no_data(
     assert "mechanisms:" in printed
     assert main(["train", str(CONFIGS / "dormouse_1b.toml"), "--runs", str(tmp_path)]) == 2
     assert "no [[source]] table" in capsys.readouterr().err
+
+
+def test_the_printed_parameter_bill_is_the_sum_of_the_tree() -> None:
+    """The plan prints the parameters the modules hold, not a remembered number."""
+    spec = StackSpec.from_toml(CONFIGS / "dormouse_1b.toml")
+    expected = sum(p.numel() for p in assemble(spec, device="meta").model.parameters())
+    printed = "\n".join(plan_lines(spec))
+    line = next(item for item in printed.splitlines() if item.startswith("params: stored="))
+    billed = int(line.split("stored=", 1)[1].split(" ", 1)[0].replace(",", ""))
+    assert billed == expected
 
 
 def test_plan_needs_no_allocation_so_the_real_stack_is_cheap() -> None:

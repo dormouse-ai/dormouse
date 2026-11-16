@@ -92,7 +92,9 @@ def test_the_reserved_set_is_fourteen_ids_and_fits_the_byte_budget() -> None:
     assert set(SPECIALS) == reserved
     assert len(SPECIALS) == len(set(SPECIALS)) == 14
     assert len(SPECIALS) < 32
-    assert DEFAULT_VOCAB == 32_000
+    # 32k is the power-of-two vocabulary tokenizer32k.json was trained at (32768 ids),
+    # not the decimal 32000: the corpus ids run to 32767 and the table must reach them.
+    assert DEFAULT_VOCAB == 32_768
 
 
 def test_the_specials_are_added_tokens_that_bpe_cannot_split(tok: Tokenizer) -> None:
