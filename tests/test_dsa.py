@@ -209,3 +209,89 @@ def test_the_coeffects_declare_the_sparse_state() -> None:
 def test_the_repr_names_the_sparsity_and_the_indexer() -> None:
     text = repr(_dsa())
     assert "k=8" in text and "window=4" in text and "d_idx=16" in text
+
+
+def test_the_gathered_slab_is_a_slice_of_queries_not_the_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `[b, heads, seq, k+window, head_dim]` gather never exists; the sum is the same.
+
+    At b1 x s1024 one such slab of K or V is 640 MiB in bf16 and the layer keeps two of
+    them per DSA layer — 3.75 GiB over the three the stack has, and the allocation that
+    OOM'd the 1B config (`tools/alloc_profile.py` names it). The budget is in ELEMENTS,
+    so the slab stays 64 MiB at b8 as well: a fixed number of query positions would be
+    1.28 GiB there.
+
+    The arithmetic claim is the one that matters: the query axis is not a reduction axis,
+    so slicing it changes no multiply and no add — the forward is `torch.equal` to the
+    one-slab form. The gradients are equal to fp32 summation order and not bit for bit:
+    `gather`'s backward is a scatter-add into the key/value rows, and splitting the
+    queries splits that sum into partial sums that autograd adds in a different order
+    (measured here: 1e-7 relative, one rounding of a sum of 64 terms). A difference
+    LARGER than that would mean the slab leaked into the reduction.
+    """
+    from dormouse.model.attn_variants import dsa as module
+
+    keep = K + WINDOW
+    torch.manual_seed(11)
+    layer = _dsa()
+    x = torch.randn(2, 64, D_MODEL)
+
+    def run(budget: int) -> tuple[torch.Tensor, dict[str, torch.Tensor], float]:
+        monkeypatch.setattr(module, "GATHER_ELEMENTS", budget)
+        for parameter in layer.parameters():
+            parameter.grad = None
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU], profile_memory=True
+        ) as profiler:
+            y = layer(x)
+        y.square().mean().backward()
+        peak = max(event.self_cpu_memory_usage for event in profiler.events())
+        gradients = {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
+        return y.detach(), gradients, peak
+
+    whole = run(2**40)
+    slab = 8 * keep * N_HEADS * HEAD_DIM * 4  # eight query positions of one layer's gather
+    sliced = run(slab)
+    whole_kib, sliced_kib = whole[2] / 2**10, sliced[2] / 2**10
+    print(f"\nlargest allocation: whole {whole_kib:.0f} KiB, sliced {sliced_kib:.0f} KiB")
+    assert torch.equal(whole[0], sliced[0]), "the query axis is not a reduction axis"
+    assert sorted(whole[1]) == sorted(sliced[1])
+    worst = 0.0
+    for name, gradient in whole[1].items():
+        assert torch.isfinite(gradient).all(), name
+        assert torch.allclose(gradient, sliced[1][name], rtol=1e-6, atol=1e-9), name
+        moved = (gradient - sliced[1][name]).abs().max()
+        worst = max(worst, float(moved / gradient.abs().max().clamp_min(1e-30)))
+    print(f"largest relative gradient difference: {worst:.1e}")
+    assert worst < 1e-5
+    assert sliced[2] < whole[2] / 3, "the whole-sequence slab was still built"
+    assert sliced[2] <= 4 * slab
+
+
+def test_the_pick_is_the_gather_it_replaces() -> None:
+    """The same rows out and the same gradient in — without `zeros_like` of the expanded view.
+
+    `torch.gather`'s backward allocates `zeros_like(source)` and scatters into it. Here the
+    source is expanded over the `keep` axis, so that copy is the whole-sequence slab the
+    forward no longer builds: 640 MiB at b1 x s1024, 2.5 GiB at b4, re-allocated once per
+    gathered slab. `_Pick` writes the same scatter-add into `[b, h, seq, head_dim]`.
+    """
+    from dormouse.model.attn_variants.dsa import _Pick
+
+    torch.manual_seed(3)
+    source = torch.randn(2, 2, 9, 4)
+    at = torch.randint(0, 9, (2, 5, 3))
+    place = at.unsqueeze(1).unsqueeze(-1).expand(2, 2, 5, 3, 4)
+    mine, theirs = source.clone().requires_grad_(True), source.clone().requires_grad_(True)
+    fast = _Pick.apply(mine, place)
+    slow = torch.gather(theirs.unsqueeze(-2).expand(2, 2, 9, 3, 4), 2, place)
+    assert torch.equal(fast, slow)
+    grad = torch.randn_like(fast)
+    (fast_grad,) = torch.autograd.grad(fast, mine, grad)
+    (slow_grad,) = torch.autograd.grad(slow, theirs, grad)
+    worst = float((fast_grad - slow_grad).abs().max() / slow_grad.abs().max().clamp_min(1e-30))
+    print(f"\nlargest relative gradient difference against torch.gather: {worst:.1e}")
+    #: The width axis is summed before the scatter; `gather` sums it inside `expand`'s
+    #: backward. Same sum, fp32 order.
+    assert worst < 1e-5
