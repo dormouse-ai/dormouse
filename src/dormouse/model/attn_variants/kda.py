@@ -57,6 +57,7 @@ from dormouse_core.coeffects import Coeffects
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ..blocks import PROJ_STD
 from .projections import LatentProjections
@@ -66,6 +67,13 @@ from .projections import LatentProjections
 #: across itself, short enough that the state is a rolling memory and not a sum
 #: that grows with the window (the bounded-state gate measures exactly this).
 A_BIAS_INIT = -4.0
+
+#: Recompute the chunk graph in the backward instead of retaining it. The graph is
+#: `O(T/chunk)` tensors of `[batch, heads, chunk, chunk, head_dim]` — measured 987 MiB
+#: per layer at b1 x s1024, 8.7 GiB over the nine KDA layers, which is what does not fit
+#: on a 16 GiB card; the trade is one extra forward of the chunk loop in the backward
+#: (`tests/test_kda.py` pins the arithmetic under both settings).
+CHECKPOINT_CHUNKS = True
 
 
 class KDA(LatentProjections):
@@ -288,33 +296,63 @@ class KDA(LatentProjections):
         keep_strict = strict.view(1, 1, chunk, chunk)
         keep_ratio = incl.view(1, 1, chunk, chunk, 1)
         state = q.new_zeros(batch, heads, width, width)
+        #: ONE CHECKPOINT PER CHUNK, not one for the loop. The forward keeps the five
+        #: inputs and the carry; the backward recomputes a chunk's graph, backprops
+        #: through it, and frees it before the next — a whole-loop checkpoint would
+        #: rebuild all `seq/chunk` chunk graphs at once in the backward and move the peak
+        #: there instead of removing it (measured at b8 x s1024: 2.0 GiB of `ratio` live
+        #: with the loop-wide form, and the per-chunk transient is 134 MiB).
+        keep = CHECKPOINT_CHUNKS and torch.is_grad_enabled() and q.requires_grad
+        masks = (keep_ratio, keep_pair, keep_strict)
         out = []
         for start in range(0, seq, chunk):
             window = slice(start, start + chunk)
-            qi, ki, vi = q[..., window, :], k[..., window, :], v[..., window, :]
-            a = torch.cumprod(alpha[..., window, :], dim=-2)
-            step = beta[..., window].unsqueeze(-1)
-            #: The floor is 1e-12 so that a fully decayed channel gives a finite
-            #: log and an exact `a_t/a_i = 1` pair instead of `-inf - (-inf)`.
-            log_a = torch.log(a.clamp_min(1e-12))
-            diff = (log_a.unsqueeze(-2) - log_a.unsqueeze(-3)).masked_fill(~keep_ratio, 0.0)
-            #: `a_t / a_i ≤ 1` on the lower triangle: the paper's Γ ratio, taken
-            #: pairwise so that no `1/Γ` reaches a matmul (see the module docstring).
-            ratio = diff.exp().masked_fill(~keep_ratio, 0.0)
-            keyed = a * ki
-            as_key = ki.unsqueeze(-3)  # [b, h, 1, i, d]
-            gram = (ratio * ki.unsqueeze(-2) * as_key).sum(-1)
-            qk = (ratio * qi.unsqueeze(-2) * as_key).sum(-1).masked_fill(~keep_pair, 0.0)
-            lower = step * gram.masked_fill(~keep_strict, 0.0)
-            pseudo = torch.linalg.solve_triangular(
-                lower,
-                step * (vi - keyed @ state),
-                upper=False,
-                unitriangular=True,
-            )
-            out.append((a * qi) @ state + qk @ pseudo)
-            carried = torch.exp(log_a[..., -1:, :] - log_a)
-            state = a[..., -1, :].unsqueeze(-1) * state + torch.einsum(
-                "bhtd,bhtv->bhdv", carried * ki, pseudo
-            )
+            rows = (state, q[..., window, :], k[..., window, :], v[..., window, :])
+            gates = (alpha[..., window, :], beta[..., window].unsqueeze(-1))
+            if keep:
+                carried_out, state = checkpoint(
+                    self._chunk, *rows, *gates, *masks, use_reentrant=False
+                )
+            else:
+                carried_out, state = self._chunk(*rows, *gates, *masks)
+            out.append(carried_out)
         return torch.cat(out, dim=2), state
+
+    def _chunk(
+        self,
+        state: torch.Tensor,
+        qi: torch.Tensor,
+        ki: torch.Tensor,
+        vi: torch.Tensor,
+        alpha: torch.Tensor,
+        step: torch.Tensor,
+        keep_ratio: torch.Tensor,
+        keep_pair: torch.Tensor,
+        keep_strict: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One chunk of eq. 2-9: `(o_chunk, S_next)` from `(S_in, q, k, v, a, β)`."""
+        a = torch.cumprod(alpha, dim=-2)
+        #: The floor is 1e-12 so that a fully decayed channel gives a finite
+        #: log and an exact `a_t/a_i = 1` pair instead of `-inf - (-inf)`.
+        log_a = torch.log(a.clamp_min(1e-12))
+        diff = (log_a.unsqueeze(-2) - log_a.unsqueeze(-3)).masked_fill(~keep_ratio, 0.0)
+        #: `a_t / a_i ≤ 1` on the lower triangle: the paper's Γ ratio, taken
+        #: pairwise so that no `1/Γ` reaches a matmul (see the module docstring).
+        ratio = diff.exp().masked_fill(~keep_ratio, 0.0)
+        keyed = a * ki
+        as_key = ki.unsqueeze(-3)  # [b, h, 1, i, d]
+        gram = (ratio * ki.unsqueeze(-2) * as_key).sum(-1)
+        qk = (ratio * qi.unsqueeze(-2) * as_key).sum(-1).masked_fill(~keep_pair, 0.0)
+        lower = step * gram.masked_fill(~keep_strict, 0.0)
+        pseudo = torch.linalg.solve_triangular(
+            lower,
+            step * (vi - keyed @ state),
+            upper=False,
+            unitriangular=True,
+        )
+        written = (a * qi) @ state + qk @ pseudo
+        carried = torch.exp(log_a[..., -1:, :] - log_a)
+        next_state = a[..., -1, :].unsqueeze(-1) * state + torch.einsum(
+            "bhtd,bhtv->bhdv", carried * ki, pseudo
+        )
+        return written, next_state

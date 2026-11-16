@@ -46,13 +46,14 @@ no arithmetic of its own — only an index list.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 import torch
 from dormouse_core.coeffects import Coeffects
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ..blocks import PROJ_STD
 from .dsa_indexer import LightningIndexer
@@ -65,6 +66,68 @@ WINDOW = 128
 #: Selected tokens per query. V3.2's 2048 is a serving budget; 512 is the one this
 #: stack's 4k/32k pricing is written at.
 K = 512
+
+#: Elements in one gathered key/value slab. The gather is `[batch, heads, queries,
+#: k+window, head_dim]` and only one slab has to exist at a time: 2**25 is 64 MiB in bf16,
+#: and the queries per slab are DERIVED from it, so the transient stays at that size at b8
+#: as well — a fixed 256 queries would be 1.28 GiB per slab there. Measured at b1 x s1024:
+#: 2.5 GiB of gathered K/V per DSA layer for the whole sequence, 128 MiB per slab here.
+GATHER_ELEMENTS = 2**25
+
+
+class _Pick(torch.autograd.Function):
+    """`source[b, h, s, d]` read at `place[b, h, q, keep, d]`, backward into the source.
+
+    WHY NOT `torch.gather`. The gather itself is the same op; its BACKWARD is the defect:
+    autograd allocates `zeros_like(source)` and scatter-adds into that, and our source is a
+    `[b, h, s, 1, d]` view expanded over `keep` — so the backward materialised
+    the whole-sequence slab (`b·h·seq·(k+window)·d`: 640 MiB at b1 x s1024, 2.5 GiB at b4)
+    once per gathered slab per DSA layer, hundreds of times per step. That is the
+    allocation the forward had just stopped building, rebuilt in the backward, and it also
+    made the step 20 s long at b1 by churning `cudaMalloc`.
+
+    THIS IS THE SAME SCATTER-ADD. Same indices, same values, into the `[b, h, s, d]`
+    tensor the keys are: the gradient of a gather is "add every `keep` slice back where it
+    came from", and the width axis is summed first because `place` repeats the same index
+    across it.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, source: torch.Tensor, place: torch.Tensor) -> torch.Tensor:
+        """Gather the rows `place` names out of `source`.
+
+        `source` is `[b, h, seq, d]` and `place` is `[b, h, queries, keep, d]`: the expand
+        is over `keep` only, and the query axis is free (that is what `gather`'s index axis
+        is for), which is why the slab can be shorter than the sequence.
+        """
+        ctx.place = place
+        ctx.source_shape = source.shape
+        batch, heads, span, width = source.shape
+        view = source.unsqueeze(-2).expand(batch, heads, span, place.shape[3], width)
+        return torch.gather(view, 2, place)
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Add every gathered slice back where it came from, in the source's shape.
+
+        `place` names one position per query and is broadcast over `head_dim` (that is how
+        `_gathered` builds it). The scatter's index is therefore ONE POSITION PER GATHERED
+        SLICE — `[b, h, queries, keep]`, 4 MiB at b8 — and the width rides along as the
+        second axis of the value, so nothing of the shape `[b, h, seq, k+window, head_dim]`
+        is ever allocated: that expanded copy is what `zeros_like` made in `gather`'s own
+        backward, 640 MiB at b1 and 2.5 GiB at b4, once per slab per DSA layer.
+
+        `accumulate=True` is the duplicate case (the window and the selection can name the
+        same position, and padded window slots clamp to 0) — the same atomic-add semantics
+        `scatter_add_` has inside `gather`'s backward.
+        """
+        batch, heads, seq, width = ctx.source_shape
+        columns = ctx.place[..., 0].reshape(batch * heads, -1)
+        base = torch.arange(batch * heads, device=columns.device).unsqueeze(-1) * seq
+        index = (columns + base).reshape(-1)
+        out = grad.new_zeros((batch * heads * seq, width))
+        out.index_put_((index,), grad.reshape(-1, width), accumulate=True)
+        return out.reshape(batch, heads, seq, width), None
 
 
 class DSA(LatentProjections):
@@ -268,18 +331,49 @@ class DSA(LatentProjections):
         at: torch.Tensor,
         visible: torch.Tensor,
     ) -> torch.Tensor:
-        """Exact causal attention over the gathered positions, then the write."""
+        """Exact causal attention over the gathered positions, then the write.
+
+        The gather is over QUERIES, in slabs of `GATHER_ELEMENTS` elements, and each slab
+        is checkpointed: the backward recomputes its gather instead of the forward
+        retaining `[batch, heads, seq, k+window, head_dim]` of K and V per layer (measured
+        1.25 GiB each at s1024, 3 DSA layers = 7.5 GiB of the step).
+
+        THE ARITHMETIC DOES NOT MOVE. Every slab runs `_gathered` on the same gathered
+        rows in the same order — the chunk axis is not a reduction axis, so each output
+        element is the sum over the same `head_dim` in the same order, and `window >= seq`
+        still equals `dense()` bit for bit (`tests/test_dsa.py` pins both, forward and
+        gradients).
+        """
+        batch, seq, heads, width = q.shape
+        keep = at.shape[-1]
+        per_query = max(1, batch * heads * keep * width)
+        chunk = max(1, GATHER_ELEMENTS // per_query)
+        parts = []
+        for start in range(0, seq, chunk):
+            slab = (q[:, start : start + chunk], at[:, start : start + chunk])
+            rows = (key, value, *slab, visible[:, start : start + chunk])
+            if torch.is_grad_enabled():
+                parts.append(checkpoint(self._gathered, *rows, use_reentrant=False))
+            else:
+                parts.append(self._gathered(*rows))
+        out = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        y = self.proj(out.reshape(batch, seq, self.d_kv))
+        return cast(torch.Tensor, y)
+
+    def _gathered(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        q: torch.Tensor,
+        at: torch.Tensor,
+        visible: torch.Tensor,
+    ) -> torch.Tensor:
+        """One slab of query positions: gather its K/V, softmax, and weight the values."""
         batch, seq, heads, width = q.shape
         keep = at.shape[-1]
         place = at.unsqueeze(1).unsqueeze(-1).expand(batch, heads, seq, keep, width)
-        keys = torch.gather(
-            key.transpose(1, 2).unsqueeze(-2).expand(batch, heads, seq, keep, width), 2, place
-        )
-        values = torch.gather(
-            value.transpose(1, 2).unsqueeze(-2).expand(batch, heads, seq, keep, width), 2, place
-        )
+        keys = _Pick.apply(key.transpose(1, 2), place)
+        values = _Pick.apply(value.transpose(1, 2), place)
         logits = torch.einsum("bhsd,bhskd->bhsk", q.transpose(1, 2), keys) * self.scale
         weights = torch.softmax(logits.masked_fill(~visible.unsqueeze(1), -torch.inf), dim=-1)
-        out = torch.einsum("bhsk,bhskd->bhsd", weights, values).transpose(1, 2)
-        y = self.proj(out.reshape(batch, seq, self.d_kv))
-        return cast(torch.Tensor, y)
+        return torch.einsum("bhsk,bhskd->bhsd", weights, values).transpose(1, 2)

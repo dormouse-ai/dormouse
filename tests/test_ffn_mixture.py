@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from dormouse_core.counters import Counters
 
 import dormouse
 from dormouse.model.activations import SITU_BETA
@@ -342,5 +343,83 @@ def test_the_peak_is_the_plain_ffns_not_three_times_it() -> None:
     plain = _peak_mib("GatedFFN(d, f, act='silu', sides='bi')", rows=8192)
     moa = _peak_mib("MoaFFN(d, f, dictionary=SIX, sides='bi')", rows=8192)
     print(f"\npeak growth: plain {plain:.0f} MiB, mixture {moa:.0f} MiB ({moa / plain:.2f}x)")
-    # Measured 1.08x here and 0.96x at the live 24 576 rows; the chain measured 3.4x.
-    assert moa <= 1.2 * plain, (moa, plain)
+    # Measured 1.06x against a `[rows, f]`-at-once read (plain 1488 MiB, mixture 1582 MiB)
+    # and 1.22x once both arms read in `MIX_CHUNK_ROWS` slices and recompute them (plain
+    # 687 MiB, mixture 839 MiB): the fixed cost the ratio divides by fell 2.2x while the
+    # mixture's entry evaluations fell 1.9x. The chain this replaced measured 3.4x.
+    assert moa <= 1.25 * plain, (moa, plain)
+    #: The absolute ceiling, so a regression cannot hide behind a moving denominator:
+    #: six slabs at 8192 rows and the live width are 1.15 GiB on their own.
+    assert moa < 6 * 8192 * LIVE_F * 4 / 2**20, moa
+
+
+@pytest.mark.parametrize("arm", ["gated", "la", "moa"])
+def test_the_read_is_sliced_and_the_slice_is_the_same_arithmetic(
+    arm: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `[rows, d_ffn]` slabs of a SLICE, never of the call — and the same output.
+
+    A feed-forward reads each row on its own, so slicing rows changes no multiply and
+    no add; each slice is checkpointed, so the forward keeps the slice and the backward
+    recomputes it. That is the fix for the bank's shared expert at 24 576 rows, where
+    the unchunked read retains three 302 MiB slabs per layer.
+
+    TWO CLAIMS, AND THEY NEED DIFFERENT EVIDENCE:
+
+    * the slices are the arm's own arithmetic on those rows, bit for bit — a slice of
+      the chunked call is `torch.equal` to the same rows handed to the arm on their own;
+    * the whole read is the same FUNCTION as the unchunked one, to fp32 summation order
+      and not bit for bit: `x·W` over 20 rows and over 5 rows can block the reduction
+      over `d` differently, so the block of the chunked call is compared against the
+      unchunked call with the measured relative difference printed. Under the run's bf16
+      that difference is ~1e-3 of an ulp of the dtype that is kept.
+
+    The counters are part of the claim: `ffn_fwd` is rows and not rows x slices,
+    `tsct_fwd` is rows per factorised matrix, and `ffn_dict_entries_used` is counted
+    ONCE per call — a recomputed slice must not report itself twice.
+    """
+    import dormouse.model.ffn as module
+
+    d, f, rows, chunk = 12, 10, 20, 5
+
+    def build() -> torch.nn.Module:
+        if arm == "gated":
+            return GatedFFN(d, f, act="silu", sides="bi")
+        if arm == "la":
+            return LaFFN(d, f, dictionary=SIX)
+        return MoaFFN(d, f, dictionary=SIX, sides="bi")
+
+    def build_and_run(
+        chunk_rows: int, blocks: bool = False
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, int]]:
+        monkeypatch.setattr(module, "MIX_CHUNK_ROWS", chunk_rows)
+        torch.manual_seed(6)
+        module_arm = build()
+        x = torch.randn(rows, d, requires_grad=True)
+        local = Counters()
+        if blocks:
+            y = torch.cat([module_arm(x[start : start + chunk]) for start in range(0, rows, chunk)])
+        else:
+            y = module_arm(x, local)
+        y.square().mean().backward()
+        gradients = {
+            n: p.grad.clone() for n, p in module_arm.named_parameters() if p.grad is not None
+        }
+        return y.detach(), gradients, local.snapshot()
+
+    sliced = build_and_run(chunk)
+    hand = build_and_run(chunk, blocks=True)
+    assert torch.equal(sliced[0], hand[0]), "a slice is not the arm on its own rows"
+    whole = build_and_run(10**9)
+    worst = float((whole[0] - sliced[0]).abs().max() / whole[0].abs().max().clamp_min(1e-30))
+    for name, gradient in whole[1].items():
+        assert torch.isfinite(gradient).all(), name
+        moved = float(
+            (gradient - sliced[1][name]).abs().max() / gradient.abs().max().clamp_min(1e-30)
+        )
+        worst = max(worst, moved)
+    print(f"\nlargest relative difference against the unchunked read: {worst:.1e}")
+    #: fp32 summation order, not a different function; bf16 keeps 8 mantissa bits.
+    assert worst < 1e-5
+    assert whole[2] == sliced[2], (whole[2], sliced[2])
+    assert sliced[2]["ffn_fwd"] == rows
