@@ -19,10 +19,12 @@ from stacks import reference_stack
 from dormouse.train.optim import (
     COLROW_EPS,
     MUON_LR,
+    NS_BATCH,
     AdamW,
     MixOptimizer,
     Muon,
     colrow,
+    directions,
     muon_direction,
     polar,
     route,
@@ -113,6 +115,70 @@ def test_the_batched_chain_is_the_per_matrix_chain() -> None:
     stacked = torch.randn(6, 64, 128)
     one_by_one = torch.stack([polar(stacked[i]) for i in range(stacked.shape[0])])
     assert (polar(stacked) - one_by_one).abs().max().item() <= 1e-6
+
+
+def test_a_shape_group_is_the_per_matrix_step() -> None:
+    """Bucketing by shape and writing with `_foreach` is scheduling: the step must not move (§6)."""
+    torch.manual_seed(10)
+    shapes = [(64, 128)] * 5 + [(32, 96)] * 3 + [(16, 16)]
+    starts = [torch.randn(*shape) for shape in shapes]
+    grads = [torch.randn(*shape) for shape in shapes]
+    alone = [torch.nn.Parameter(start.clone()) for start in starts]
+    together = [torch.nn.Parameter(start.clone()) for start in starts]
+    for index, param in enumerate(alone):
+        param.grad = grads[index].clone()
+    for index, param in enumerate(together):
+        param.grad = grads[index].clone()
+    for param in alone:
+        Muon([param], lr=MUON_LR).step()
+    Muon(together, lr=MUON_LR).step()
+    for single, grouped in zip(alone, together, strict=True):
+        scale = max(1.0, single.detach().abs().max().item())
+        assert (single.detach() - grouped.detach()).abs().max().item() <= 1e-6 * scale
+
+
+def test_a_bucket_wider_than_ns_batch_is_the_same_step() -> None:
+    """The chunk loop must not change the answer: `NS_BATCH + 3` matrices, one write."""
+    torch.manual_seed(12)
+    starts = [torch.randn(32, 48) for _ in range(NS_BATCH + 3)]
+    grads = [torch.randn(32, 48) for _ in range(len(starts))]
+    alone = [torch.nn.Parameter(start.clone()) for start in starts]
+    together = [torch.nn.Parameter(start.clone()) for start in starts]
+    for params in (alone, together):
+        for param, grad in zip(params, grads, strict=True):
+            param.grad = grad.clone()
+    for param in alone:
+        Muon([param], lr=MUON_LR).step()
+    Muon(together, lr=MUON_LR).step()
+    for single, grouped in zip(alone, together, strict=True):
+        assert (single.detach() - grouped.detach()).abs().max().item() <= 1e-6
+
+
+def test_a_grouped_head_split_chain_is_the_per_matrix_one() -> None:
+    """The group path concatenates per-head regions; the cut must be the same cut."""
+    torch.manual_seed(11)
+    group = [torch.randn(96, 32) for _ in range(3)]
+    together = directions(group, head_split=(2, 64))
+    for momentum, direction in zip(group, together, strict=True):
+        assert (direction - muon_direction(momentum, head_split=(2, 64))).abs().max().item() <= 1e-6
+
+
+def test_directions_refuses_a_mixed_shape_group() -> None:
+    """A batch is one kernel, so a group is one shape and anything else is refused."""
+    with pytest.raises(LoudError, match="one shape"):
+        directions([torch.randn(4, 8), torch.randn(8, 4)])
+
+
+@pytest.mark.parametrize("shape", [(64, 832), (832, 256), (256, 6144), (6, 832)])
+def test_the_polar_factor_of_a_shape_group_is_orthogonal(shape: tuple[int, int]) -> None:
+    """`‖QQᵀ - I‖∞ ≤ 1e-5` per matrix, batched — the anchor the grouping is accepted against."""
+    torch.manual_seed(13)
+    group = [torch.randn(*shape) for _ in range(4)]
+    for direction in directions(group, col_row=False):
+        rows, cols = shape
+        gram = direction @ direction.T if rows <= cols else direction.T @ direction
+        error = (gram - torch.eye(gram.shape[0])).abs().max().item()
+        assert error <= 1e-5, f"{shape}: {error:.2e}"
 
 
 def test_muon_step_norm_is_sqrt_rows_times_lr() -> None:

@@ -60,6 +60,21 @@ The compressed layers have no packed matrix: their Q is written by `q_up`
 `q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
 remainder — whole, so the arm is the same one applied to the same tensors, and the
 router reads it off the modules rather than off a shape heuristic.
+
+§6. ONE CHAIN PER SHAPE GROUP. A b8 x s1024 step runs the chain on 564 matrices in 14
+shape buckets (`[832, 256]` x130, `[256, 6144]` x130, `[6, 832]` x65, ...), and a
+per-matrix chain is ~60 host calls each — measured at 992 ms of a 4 997 ms step and
+~28 000 of its 31 112 kernel launches. `Muon.step` therefore buckets a group by shape and
+calls `directions` once per `NS_BATCH` of them: one `bmm` per group per iteration,
+`colrow` over the batch, the same arithmetic per matrix. The momentum and the write are
+`_foreach` calls over the whole bucket, so the step's launches are a function of the
+number of SHAPES (14), not of the number of parameters (564).
+
+It is a scheduling change and nothing else. The polar factor of each matrix is the one
+the per-matrix path returned to `1e-6` (`tests/test_optim.py`), and `_foreach_mul_` +
+`_foreach_add_` is the per-element expression `mul_` + `add_` already ran, so the step's
+magnitude does not move. What it does NOT do is widen the polynomial: the batch is a loop
+over independent matrices, so an ill-conditioned matrix still ends where §3 says it does.
 """
 
 from __future__ import annotations
@@ -79,6 +94,7 @@ __all__ = [
     "NS_STEPS",
     "Muon",
     "colrow",
+    "directions",
     "muon_direction",
     "orthogonalise",
     "polar",
@@ -106,6 +122,14 @@ NS_EPS = 1e-7
 
 #: Muon's rate for the live 275M recipe. Shipped as a default, not a verdict.
 MUON_LR = 0.02
+
+#: Matrices per batched chain call. The chain is shape-homogeneous, so a group of `N`
+#: matrices of one shape is one `bmm` per iteration instead of `N` `mm`s. The live stack
+#: has 564 Muon matrices in 14 shape buckets, and 564 separate chains is 564 x ~60 host
+#: calls. The cap bounds the stacked state: the largest bucket is 130 matrices, and
+#: `130·832·256` fp32 is 110 MiB before the chain's own temporaries, which the card
+#: cannot spare at the 13.1 GiB peak.
+NS_BATCH = 32
 
 
 def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -178,17 +202,26 @@ def colrow(x: torch.Tensor, eps: float = COLROW_EPS) -> torch.Tensor:
     return x.div_(x.norm(dim=1, keepdim=True) + eps)
 
 
-def _regions(momentum: torch.Tensor, head_split: tuple[int, int] | None) -> list[torch.Tensor]:
-    """Return the views one momentum is preconditioned in: one, or heads-then-rest (§5)."""
+def _cut(head_split: tuple[int, int] | None, shape: torch.Size) -> tuple[int, int] | None:
+    """Validate a `head_split` against a `[rows, cols]` shape, or refuse it by name."""
     if head_split is None:
-        return [momentum]
+        return None
     groups, rows = head_split
-    if rows % groups or rows > momentum.shape[0] or momentum.ndim != 2:
+    if rows % groups or rows > shape[0] or len(shape) != 2:
         raise LoudError(
-            f"head_split=(groups={groups}, rows={rows}) does not cut a "
-            f"{tuple(momentum.shape)} parameter into equal slices",
+            f"head_split=(groups={groups}, rows={rows}) does not cut a {tuple(shape)} "
+            "parameter into equal slices",
             "pass (2·n_heads, 2·d_model) for a [3d, d] packed qkv weight",
         )
+    return groups, rows
+
+
+def _regions(momentum: torch.Tensor, head_split: tuple[int, int] | None) -> list[torch.Tensor]:
+    """Return the views one momentum is preconditioned in: one, or heads-then-rest (§5)."""
+    cut = _cut(head_split, momentum.shape)
+    if cut is None:
+        return [momentum]
+    groups, rows = cut
     lead = momentum[:rows].view(groups, rows // groups, momentum.shape[1])
     rest = momentum[rows:]
     return [lead] if rest.shape[0] == 0 else [lead, rest]
@@ -217,6 +250,70 @@ def orthogonalise(
     return _assemble([polar(part, steps) for part in _regions(momentum, head_split)])
 
 
+def _grouped(momenta: list[torch.Tensor], cut: tuple[int, int] | None) -> list[torch.Tensor]:
+    """Stack a shape-homogeneous group's regions into batches, one per region kind.
+
+    `[(N, ·)]` for a whole matrix and `[(N·g, rows/g, cols), (N·rest, cols)]` for a
+    `head_split` one — the same regions `_regions` returns, concatenated across the
+    group so the chain runs once at `N` times the batch.
+    """
+    if cut is None:
+        return [torch.stack(momenta)]
+    groups, rows = cut
+    cols = momenta[0].shape[1]
+    lead = torch.stack(
+        [momentum[:rows].view(groups, rows // groups, cols) for momentum in momenta]
+    ).reshape(-1, rows // groups, cols)
+    if rows == momenta[0].shape[0]:
+        return [lead]
+    return [lead, torch.stack([momentum[rows:] for momentum in momenta])]
+
+
+def _ungroup(
+    parts: list[torch.Tensor], count: int, cut: tuple[int, int] | None, shape: torch.Size
+) -> list[torch.Tensor]:
+    """Cut a batched chain's output back into `count` `[rows, cols]` directions."""
+    if cut is None:
+        return list(parts[0].unbind(0))
+    groups, rows = cut
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else None
+    out: list[torch.Tensor] = []
+    for index in range(count):
+        lead = head[index * groups : (index + 1) * groups].reshape(rows, shape[1])
+        out.append(lead if tail is None else torch.cat([lead, tail[index]], dim=0))
+    return out
+
+
+def directions(
+    momenta: list[torch.Tensor],
+    *,
+    head_split: tuple[int, int] | None = None,
+    steps: int = NS_STEPS,
+    col_row: bool = True,
+) -> list[torch.Tensor]:
+    """`muon_direction` for a shape-homogeneous group, as one chain (§6).
+
+    One `bmm` per shape group per iteration, not one `mm` per matrix: the arithmetic is
+    the batched chain `polar` already runs (`tests/test_optim.py` pins a `[N, m, n]`
+    state to `1e-6` of `N` separate calls), so the direction each matrix receives is the
+    direction the per-matrix path gives it, and the launch count is divided by `N`.
+    """
+    if not momenta:
+        return []
+    shapes = {tuple(m.shape) for m in momenta}
+    if len(shapes) != 1:
+        raise LoudError(
+            f"directions got {len(shapes)} shapes ({sorted(shapes)}); a group is one shape",
+            "bucket by shape first: the chain batches the group into one bmm, and a "
+            "mixed batch cannot be one kernel",
+        )
+    cut = _cut(head_split, momenta[0].shape)
+    batches = _grouped(momenta, cut)
+    out = [colrow(polar(batch, steps)) if col_row else polar(batch, steps) for batch in batches]
+    return _ungroup(out, len(momenta), cut, momenta[0].shape)
+
+
 def muon_direction(
     momentum: torch.Tensor,
     *,
@@ -229,7 +326,7 @@ def muon_direction(
     per-head slices and the rest is one matrix: Q and K of a packed `[3d, d]`
     projection, with V as the remainder (§5).
     """
-    return _assemble([colrow(polar(part, steps)) for part in _regions(momentum, head_split)])
+    return directions([momentum], head_split=head_split, steps=steps)[0]
 
 
 class Muon(Optimizer):
@@ -262,7 +359,13 @@ class Muon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        """Advance every parameter that carries a gradient; return the closure's loss."""
+        """Advance every parameter that carries a gradient; return the closure's loss.
+
+        Three passes over a bucket, and the bucket is a SHAPE: `_foreach_mul_` +
+        `_foreach_add_` for the momentum, one `directions` chain (chunked at `NS_BATCH`),
+        then `_foreach_mul_` (decay, when it is on) and `_foreach_add_` for the write. So
+        the launches per step are `~60 · shape buckets` and not `~60 · parameters` (§6).
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -273,17 +376,31 @@ class Muon(Optimizer):
             lr = group["lr"]
             decay = group["weight_decay"]
             head_split = group.get("head_split")
+            buckets: dict[tuple[int, ...], list[Any]] = {}
             for param in group["params"]:
                 if param.grad is None:
                     continue
                 state = self.state[param]
                 if "momentum" not in state:
                     state["momentum"] = torch.zeros_like(param)
-                buffer = state["momentum"]
-                buffer.mul_(momentum).add_(param.grad, alpha=1.0 - momentum)
-                direction = muon_direction(buffer, head_split=head_split, steps=steps)
+                buckets.setdefault(tuple(param.shape), []).append(param)
+            for params in buckets.values():
+                buffers = [self.state[param]["momentum"] for param in params]
+                torch._foreach_mul_(buffers, momentum)
+                torch._foreach_add_(buffers, [param.grad for param in params], alpha=1.0 - momentum)
+                rows, cols = params[0].shape
+                alpha = -lr * max(1.0, rows / cols) ** 0.5
                 if decay:
-                    param.mul_(1.0 - lr * decay)
-                rows, cols = param.shape
-                param.add_(direction, alpha=-lr * max(1.0, rows / cols) ** 0.5)
+                    torch._foreach_mul_(params, 1.0 - lr * decay)
+                for start in range(0, len(params), NS_BATCH):
+                    chunk = params[start : start + NS_BATCH]
+                    torch._foreach_add_(
+                        chunk,
+                        directions(
+                            [self.state[param]["momentum"] for param in chunk],
+                            head_split=head_split,
+                            steps=steps,
+                        ),
+                        alpha=alpha,
+                    )
         return loss
