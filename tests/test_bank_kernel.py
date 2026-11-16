@@ -234,6 +234,40 @@ def test_the_fused_group_refuses_a_dictionary_the_kernel_lacks() -> None:
         moe._fused_group(bank, [arm], x, torch.zeros(4, dtype=torch.int32), torch.tensor([4]), 4)
 
 
+def test_the_padded_tiles_are_half_the_grid_and_return_early() -> None:
+    """`capacity` is 2x the mean, so the kernel's `m0 >= cnt` guard is arithmetic.
+
+    The guard is inside the Triton program (`fwd_kernel`), which a CPU job cannot run; what
+    it rests on is the slot width the dispatch sizes, and that is a number here: at any
+    batch the padded grid holds twice the rows the routing has, so half of its tiles have
+    no row to work on and the early return is the schedule's normal case, not a corner.
+    """
+    for routed in (4, 64, 1024, 49_152):
+        bank = MoEFFN(
+            16,
+            128,
+            n_experts=8,
+            topk=2,
+            n_shared=0,
+            act="moa",
+            d_ffn_gelu=192,
+            expert_tsct_rank=0,
+            min_expert_params=0,
+        )
+        width = bank.capacity(routed)
+        mean = routed / 8
+        assert width >= 2 * mean * 0.99, (routed, width)
+        padding = 8 * width - routed
+        assert padding >= routed * 0.9, (routed, width, padding)
+
+
+def test_the_bf16_step_is_read_from_the_device_not_guessed() -> None:
+    """`bf16_step` answers for the dtype of the call, and the tally proves it counted."""
+    assert kb.bf16_step(torch.device("cpu")) is False
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert kb.bf16_step(torch.device("cpu")) is True
+
+
 # ------------------------------------------------------------------ parity, on the card
 
 

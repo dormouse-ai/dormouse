@@ -13,19 +13,21 @@ Three gates, in the order the failure modes matter:
 
 from __future__ import annotations
 
+import copy
 import tomllib
 from dataclasses import fields
 from pathlib import Path
 
 import pytest
 import torch
+from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
 from dormouse.model.assemble import assemble
 from dormouse.model.spec import StackSpec
 from dormouse.train.graph import StepGraph
 from dormouse.train.optim import MixOptimizer
-from dormouse.train.step import train_step
+from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy, train_step
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE = ROOT / "configs" / "smoke.toml"
@@ -124,3 +126,160 @@ def test_a_host_read_in_the_step_names_the_op_that_stopped_it() -> None:
         graph._capture()
     assert graph.failed_on is not None
     assert graph.replays() == 0, "a failed capture must not report a replay"
+
+
+# ----------------------------------------------------- the CPU half, without a capture
+#
+# The capture is a card-side object, but only the CAPTURE is: the body it records and the
+# eager half `run` wraps around the replay are ordinary torch, and they are what a graph
+# changes the timing of, not the result. So CI builds the object without a capture and
+# holds those two to their claims: the body is a full step (zero_grad, forward, chunked
+# CE, backward), and `run` fails closed — a non-finite loss or a vetoed pre-step skips
+# the optimizer instead of writing a step of noise into the weights.
+
+
+def _uncaptured() -> tuple[StepGraph, MixOptimizer, torch.Tensor]:
+    """A `StepGraph` on the CPU: every field `_capture` would set, and `_graph=None`."""
+    torch.manual_seed(3)
+    spec = _spec()
+    assembled = assemble(spec, device="cpu", smoke=True)
+    optimizer = MixOptimizer(assembled.model)
+    ids = torch.randint(0, spec.vocab, (spec.batch, spec.seq_len + 1))
+    graph = StepGraph.__new__(StepGraph)
+    graph.model, graph.optimizer, graph.accum = assembled.model, optimizer, 1
+    graph.rows, graph.seq = ids.shape[0], ids.shape[1] - 1
+    graph.ids = ids.clone()
+    graph._loss = torch.zeros(())
+    graph._graph = None
+    graph._replays = 0
+    graph.failed_on = None
+    return graph, optimizer, ids
+
+
+def test_the_constructor_refuses_a_shape_and_an_accum_it_cannot_split() -> None:
+    """Both checks run before any card-side object exists, so CI can hold them."""
+    model = torch.nn.Linear(4, 4)
+    with pytest.raises(LoudError, match=r"ids \[batch, seq\+1\]"):
+        StepGraph(model, object(), torch.zeros((8, 1), dtype=torch.long))  # type: ignore[arg-type]
+    with pytest.raises(LoudError, match="does not split"):
+        StepGraph(model, object(), torch.zeros((8, 6), dtype=torch.long), accum=3)  # type: ignore[arg-type]
+
+
+def test_the_body_is_the_eager_step_it_captures() -> None:
+    """`_body` is `zero_grad → forward → chunked CE → backward`: same loss, same grads."""
+    graph, _optimizer, ids = _uncaptured()
+    twin = copy.deepcopy(graph.model)
+    loss = graph._body()
+    assert torch.isfinite(loss)
+
+    twin_optimizer = MixOptimizer(twin)
+    twin_optimizer.zero_grad(set_to_none=False)
+    logits = twin(ids[:, :-1], None)
+    expected = chunked_cross_entropy(logits, ids[:, 1:], chunk=CHUNK_TOKENS)
+    expected.backward()
+    assert float(loss.detach()) == pytest.approx(float(expected.detach()), rel=1e-6)
+    for (name, mine), (_, theirs) in zip(
+        graph.model.named_parameters(), twin.named_parameters(), strict=True
+    ):
+        if theirs.grad is None:
+            assert mine.grad is None, f"{name} grew a gradient the eager step does not have"
+            continue
+        assert mine.grad is not None, name
+        assert torch.allclose(mine.grad, theirs.grad, rtol=1e-6, atol=1e-8), name
+
+
+def test_run_clips_and_steps_with_the_replay_stubbed() -> None:
+    """The eager half `run` wraps around the replay: clip, both arms' counters, the step."""
+    graph, optimizer, ids = _uncaptured()
+    graph._body()
+    before = [p.detach().clone() for p in graph.model.parameters()]
+    counter = Counters()
+    graph.replay = lambda ids, counters=None: counter.count("graph_replays")  # type: ignore[method-assign]
+    result = graph.run(ids, counters=counter)
+    assert not result.skipped
+    assert counter.snapshot()["graph_replays"] == 1
+    assert counter.snapshot()["clip"] == 1
+    assert counter.snapshot()["opt_muon"] == optimizer.sizes["muon"]
+    assert counter.snapshot()["opt_adamw"] == optimizer.sizes["adamw"]
+    assert result.grad_norm > 0
+    moved = [
+        p
+        for p, was in zip(graph.model.parameters(), before, strict=True)
+        if not torch.equal(p, was)
+    ]
+    assert moved, "a completed step must move the weights"
+
+
+def test_a_non_finite_loss_never_reaches_the_optimizer() -> None:
+    """The nan guard drops the gradients and reports the skip; the weights are untouched."""
+    graph, _optimizer, ids = _uncaptured()
+    graph._body()
+    before = [p.detach().clone() for p in graph.model.parameters()]
+    graph.replay = lambda ids, counters=None: None  # type: ignore[method-assign]
+    graph._loss = torch.tensor(float("nan"))
+    counter = Counters()
+    result = graph.run(ids, counters=counter)
+    assert result.skipped
+    assert result.grad_norm != result.grad_norm  # NaN, stated
+    assert counter.snapshot()["nan_guard"] == 1
+    for param, was in zip(graph.model.parameters(), before, strict=True):
+        assert torch.equal(param, was), "a NaN step must not move a weight"
+
+
+def test_a_vetoed_pre_step_is_a_skip_and_a_kept_gradient() -> None:
+    """`pre_step` returning False skips the update, and the counter says which branch ran."""
+    graph, _optimizer, ids = _uncaptured()
+    graph._body()
+    before = [p.detach().clone() for p in graph.model.parameters()]
+    graph.replay = lambda ids, counters=None: None  # type: ignore[method-assign]
+    result = graph.run(ids, pre_step=lambda loss: False)
+    assert result.skipped
+    for param, was in zip(graph.model.parameters(), before, strict=True):
+        assert torch.equal(param, was)
+
+
+def test_a_non_finite_gradient_is_a_skip_as_well() -> None:
+    """The clip's norm is the second host read, and `inf` takes the same guard as NaN."""
+    graph, _optimizer, ids = _uncaptured()
+    graph._body()
+    for param in graph.model.parameters():
+        if param.grad is not None:
+            param.grad.fill_(float("inf"))
+    before = [p.detach().clone() for p in graph.model.parameters()]
+    graph.replay = lambda ids, counters=None: None  # type: ignore[method-assign]
+    counter = Counters()
+    result = graph.run(ids, counters=counter)
+    assert result.skipped
+    assert result.grad_norm == float("inf")
+    assert counter.snapshot()["nan_guard"] == 1
+    for param, was in zip(graph.model.parameters(), before, strict=True):
+        assert torch.equal(param, was), "an inf-norm step must not move a weight"
+
+
+def test_replay_copies_replays_and_counts() -> None:
+    """The replay's own bookkeeping, against a recorder standing in for the graph handle."""
+    graph, _optimizer, ids = _uncaptured()
+    seen: list[torch.Tensor] = []
+
+    class _Recorder:
+        def replay(self) -> None:
+            seen.append(graph.ids.clone())
+
+    graph._graph = _Recorder()  # type: ignore[assignment]
+    counter = Counters()
+    fresh = torch.zeros_like(ids)
+    graph.replay(fresh, counters=counter)
+    assert graph.replays() == 1
+    assert counter.snapshot()["graph_replays"] == 1
+    assert torch.equal(seen[0], fresh), "the replay must read the ids it was handed"
+
+
+def test_replay_at_another_shape_and_the_readers_are_pure() -> None:
+    """The shape refusal is before the copy; `loss`, `replays` and `__repr__` are reads."""
+    graph, _optimizer, ids = _uncaptured()
+    with pytest.raises(LoudError, match="captured at"):
+        graph.replay(ids[:1])
+    graph._loss = torch.tensor(2.5)
+    assert graph.loss() == pytest.approx(2.5)
+    assert graph.replays() == 0
+    assert "captured=False" in repr(graph) and "rows=8" in repr(graph)

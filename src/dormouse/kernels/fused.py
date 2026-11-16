@@ -576,14 +576,14 @@ def mixture(
             "this is the kernel entry point, not a fallback: call it only when "
             "fused.fused() is true, or the eager chain reports a launch that never ran",
         )
-    if not z.is_cuda:
-        _require("mixture")
     if not 1 <= len(kinds) <= MAX_MIX_ENTRIES:
         raise LoudError(
             f"a fused mixture of {len(kinds)} entries",
             f"the kernel sums 1 to {MAX_MIX_ENTRIES} entries with one constexpr branch "
             "each; shorten the dictionary or run with the fused flag off",
         )
+    if not z.is_cuda:
+        _require("mixture")
     return cast(torch.Tensor, _Mixture.apply(z, w, tuple(kinds), per_row))
 
 

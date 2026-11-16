@@ -13,13 +13,17 @@ Three claims, each one a number:
 * **duplicates** — two identical rows routed to the same expert are two assignments, not
   one slot: `moe_rows_run` stays `n·topk` and the write is the sum, exactly as the loop
   accumulated it;
-* **no host read** — on the card the forward runs under
-  `torch.cuda.set_sync_debug_mode("error")` and is captured in a CUDA graph, which is the
-  property `counts.tolist()` broke (a CPU test cannot see a sync, so these skip).
+* **skew** — 80% of the rows on one expert is a SECOND pass, not a refusal: the write and
+  every expert's gradient are still the loop's, and `moe_dispatch_passes` says 2;
+* **one host read** — the pass count is `ceil(largest group / capacity)`, read once from
+  the histogram on the card (a Python loop cannot be sized by a device value). The
+  forward is therefore not CUDA-graph capturable any more, and the test that used to
+  assert it says so instead of asserting a property the dispatch no longer has.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -183,16 +187,88 @@ def test_every_experts_gradient_is_the_loops_gradient(seed: int) -> None:
     assert torch.equal(index, loop_index), "same weights must route the same way"
     (_loop(loop, x, loop_index, loop_weight) - target).square().mean().backward()
 
-    worst = 0.0
+    _same_gradients(batched, loop)
+
+
+def _same_gradients(batched: MoEFFN, loop: MoEFFN) -> None:
+    """Every routed expert's gradient is the loop's, to fp32 epsilon."""
     for other in loop.experts:
         for param in other.parameters():
             assert param.grad is not None
+    worst = 0.0
     for mine, theirs in zip(batched.experts, loop.experts, strict=True):
         for name, param in mine.named_parameters():
             want = dict(theirs.named_parameters())[name].grad
             assert param.grad is not None and want is not None
             worst = max(worst, float((param.grad - want).abs().max()))
     assert worst < 1e-6, worst
+
+
+# --- skew: the second pass -------------------------------------------------
+
+
+def _skewed(n: int = 100) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """80% of the rows on expert 0, a duplicate row among them, and one gate each."""
+    x = torch.randn(n, D)
+    x[7] = x[3]
+    index = torch.zeros(n, 1, dtype=torch.long)
+    index[80:] = torch.tensor([1, 2, 3, 0] * 5).reshape(-1, 1)
+    weight = torch.full((n, 1), 0.5)
+    return x, index, weight
+
+
+def test_a_skewed_routing_is_two_passes_and_the_loops_numbers() -> None:
+    """80% on one expert: a second pass places the spill, and the write is the loop's.
+
+    The gate is bf16 epsilon because that is the card's stream; on this fp32 CPU the two
+    paths agree far below it, which is the stronger claim and costs nothing to assert.
+    """
+    torch.manual_seed(5)
+    bank = _bank(qb=False, n_shared=0, topk=1)
+    bank.eval()
+    x, index, weight = _skewed()
+    counts = bank.router.count(index)
+    counter = Counters()
+    got = bank._dispatch(x, index, weight, counts, counter)
+    snapshot = counter.snapshot()
+    assert snapshot["moe_dispatch_passes"] == 2, snapshot
+    assert snapshot["moe_rows_run"] == x.shape[0] * index.shape[1]
+    assert snapshot["moe_dropped"] == 0, "a second pass exists so nothing is dropped"
+    assert _worse(got, _loop(bank, x, index, weight)) < 1e-6
+
+
+def test_every_gradient_under_skew_is_the_loops_gradient() -> None:
+    """The spill's rows carry their gradient to the right expert, once each."""
+    torch.manual_seed(6)
+    batched = _bank(qb=False, n_shared=0, topk=1, expert_tsct_rank=8)
+    loop = _bank(qb=False, n_shared=0, topk=1, expert_tsct_rank=8)
+    loop.load_state_dict(batched.state_dict())
+    batched.eval()
+    loop.eval()
+    x, index, weight = _skewed()
+    counts = batched.router.count(index)
+    target = torch.randn(x.shape[0], D)
+
+    (batched._dispatch(x, index, weight, counts) - target).square().mean().backward()
+    (_loop(loop, x, index, weight) - target).square().mean().backward()
+
+    _same_gradients(batched, loop)
+
+
+def test_a_forward_under_skew_reports_its_passes_and_checks() -> None:
+    """The counter is on the log line and every enabled mechanism reported itself."""
+    torch.manual_seed(7)
+    bank = _bank(qb=False, n_shared=0, capacity_ratio=1.0, dispatch_sigma=0.0)
+    bank.eval()
+    with torch.no_grad():
+        #: A router bias this large routes every slot to expert 0: `2·n` rows against a
+        #: slot of `n` — the skew that used to be a refusal and is now a second pass.
+        bank.router.bias[0] = 50.0
+    counter = Counters()
+    bank(torch.randn(100, D), counter)
+    assert counter.snapshot()["moe_dispatch_passes"] == 2
+    assert "moe_dispatch_passes=2" in counter.line(), counter.line()
+    counter.check()
 
 
 def test_the_stack_logits_and_loss_are_the_loops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -239,40 +315,22 @@ def test_the_stack_logits_and_loss_are_the_loops(monkeypatch: pytest.MonkeyPatch
     assert worst / scale < 1e-5, worst / scale
 
 
-# --- no host read ----------------------------------------------------------
+# --- one host read ---------------------------------------------------------
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="a sync is a card-side defect")
-def test_the_forward_does_not_synchronise() -> None:
-    """`set_sync_debug_mode("error")`: device->host is an exception, and there is none."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a sync is a card-side fact")
+def test_the_forward_reads_the_histogram_once() -> None:
+    """One device->host read: the pass count. `warn` mode names every sync that happens."""
     torch.manual_seed(3)
     bank = _bank().to("cuda")
     x = torch.randn(256, D, device="cuda", requires_grad=True)
     torch.cuda.synchronize()
-    torch.cuda.set_sync_debug_mode("error")
+    torch.cuda.set_sync_debug_mode("warn")
     try:
-        bank(x).square().mean().backward()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            bank(x).square().mean().backward()
     finally:
         torch.cuda.set_sync_debug_mode("default")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="a graph is a card-side measurement")
-def test_the_bank_forward_is_cuda_graph_capturable() -> None:
-    """The dispatch's shapes come from the batch, so the forward captures."""
-    torch.manual_seed(4)
-    bank = _bank().to("cuda")
-    bank.eval()
-    x = torch.randn(256, D, device="cuda")
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(3):
-            bank(x)
-    torch.cuda.current_stream().wait_stream(stream)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = bank(x)
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.allclose(captured, bank(x), rtol=0, atol=0)
+    syncs = [str(w.message) for w in caught if "synchronizing" in str(w.message)]
+    assert len(syncs) == 1, syncs

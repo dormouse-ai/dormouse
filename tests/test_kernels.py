@@ -392,3 +392,68 @@ def test_an_unknown_entry_is_refused_rather_than_guessed() -> None:
     """The kernel answers for six formulas; a seventh is a refusal, not a default."""
     with pytest.raises(LoudError, match="not a dictionary entry"):
         fused.mixture_code("swish-ish")
+
+
+# ------------------------------------------------------- the entry points' refusals
+#
+# Every kernel entry point here is a launch, never a fallback: on a CPU wheel each one
+# must say so rather than run the eager path under the kernel's name. The card job never
+# takes these branches, so CI is the only place they are measured.
+
+
+def test_the_mixture_codes_are_the_dictionary_the_kernel_computes() -> None:
+    """One code per entry, dense from 0, and the table is the epilogue's constexpr set."""
+    assert list(fused.MIX_CODES) == ["gelu", "silu", "relu2", "leaky", "tanh", "situ"]
+    assert sorted(fused.MIX_CODES.values()) == list(range(fused.MAX_MIX_ENTRIES))
+    for name, code in fused.MIX_CODES.items():
+        assert fused.mixture_code(name) == code
+
+
+def test_mixture_refuses_the_flag_off_a_cpu_launch_and_an_empty_dictionary() -> None:
+    """Three refusals in `mixture`, each naming its own escape."""
+    z = torch.randn(4, 8)
+    w = torch.ones(4, 2)
+    fused.set_fused(False)
+    with pytest.raises(LoudError, match="fused flag off"):
+        fused.mixture(z, w, (0, 1), per_row=True)
+    fused.set_fused(True)
+    try:
+        with pytest.raises(LoudError, match="cannot run here"):
+            fused.mixture(z, w, (0, 1), per_row=True)
+        for kinds in ((), (0,) * (fused.MAX_MIX_ENTRIES + 1)):
+            with pytest.raises(LoudError, match="fused mixture of"):
+                fused.mixture(z, w, kinds, per_row=True)
+    finally:
+        fused.set_fused(False)
+
+
+def test_a_fused_flag_without_a_card_refuses_in_every_entry_point() -> None:
+    """`glu` and `residual_norm` too: the flag on a CPU wheel is a refusal, not eager."""
+    fused.set_fused(True)
+    try:
+        with pytest.raises(LoudError, match="cannot run here"):
+            fused.glu(torch.randn(4, 8), torch.randn(4, 8))
+        with pytest.raises(LoudError, match="cannot run here"):
+            fused.residual_norm(torch.randn(4, 8), torch.randn(4, 8), RMSNorm(8))
+    finally:
+        fused.set_fused(False)
+
+
+def test_the_flat_view_copies_only_when_it_has_to() -> None:
+    """`[rows, width]` as a view when contiguous, a copy when the strides say otherwise."""
+    contiguous = torch.arange(24.0).reshape(4, 6)
+    assert fused._flat(contiguous, 6).is_contiguous()
+    assert fused._flat(contiguous, 6).data_ptr() == contiguous.data_ptr(), "no copy needed"
+    strided = contiguous[:, ::2]
+    assert not strided.is_contiguous()
+    copied = fused._flat(strided, 3)
+    assert copied.is_contiguous() and torch.equal(copied, strided)
+
+
+def test_the_launch_tally_is_the_counter_the_gate_reads() -> None:
+    """A flag on with `fused_ops` at zero is the defect; the tally is what moves it."""
+    was = fused.fused_ops()
+    fused._tally()
+    assert fused.fused_ops() == was + 1
+    fused.reset_fused_ops()
+    assert fused.fused_ops() == 0

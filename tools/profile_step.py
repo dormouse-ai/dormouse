@@ -232,9 +232,10 @@ def main() -> int:
     amp = args.dtype == "bf16"
     spec, assembled, optimizer = build(args.config, args.batch, args.seq or None)
     #: Weights are frozen by default, and it is not a shortcut: with random token ids the
-    #: router concentrates past the dispatch capacity after two Muon steps (the guard
-    #: `moe.py` asserts, loudly), so a third timed step would not exist. A frozen step runs
-    #: the same kernels on the same shapes; only the values stop moving.
+    #: router concentrates past the dispatch capacity after two Muon steps, and the
+    #: dropless second pass (`moe.py: _passes`) would then be timed rather than the step
+    #: the profile is about. A frozen step runs the same kernels on the same shapes; only
+    #: the values stop moving.
     optimizer.set_lr(args.lr)
     bill = assembled.report()
     tokens_per_step = spec.batch * spec.seq_len

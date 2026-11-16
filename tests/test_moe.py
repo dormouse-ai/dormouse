@@ -28,6 +28,7 @@ from dormouse_core.errors import LoudError
 from dormouse.model.ffn import MoaFFN
 from dormouse.model.moe import (
     DISPATCH_SLAB_BYTES,
+    MAX_DISPATCH_PASSES,
     MAX_PAD_RATIO,
     MoEFFN,
     bank_bill,
@@ -109,6 +110,7 @@ def test_a_forward_executes_exactly_tokens_times_topk_rows() -> None:
     assert counts["moe_experts_used"] == 8
     assert counts["moe_bank_builds"] >= 1, "a batch-wide bank is one slab, not zero"
     assert counts["moe_capacity"] == bank.capacity(4096 * 2)
+    assert counts["moe_dispatch_passes"] == 1, "a balanced routing is one pass"
     assert counts["moe_pad_rows"] == 8 * counts["moe_capacity"]
     assert counts["moe_pad_rows"] <= MAX_PAD_RATIO * (4096 * 2), "the bound, not a wish"
     assert counts["moe_fwd"] == 1
@@ -116,36 +118,38 @@ def test_a_forward_executes_exactly_tokens_times_topk_rows() -> None:
     counter.check()  # every enabled mechanism reported itself
 
 
-def test_a_group_past_the_capacity_refuses_instead_of_dropping() -> None:
-    """Skew past the capacity is a LOUD failure: this bank has no drop policy.
-
-    The guard reads the `[E]` histogram on the device and asserts — no slot is shared, no
-    assignment is truncated — so the only way past the capacity is to raise the knob the
-    escape names. The card's twin of this check is `torch._assert_async`; on the CPU it is
-    the project's own error, and this is the same branch the forward takes.
-    """
+def test_a_collapsed_router_is_refused_naming_the_passes() -> None:
+    """Past `MAX_DISPATCH_PASSES` the routing is the defect; at four it is a slow step."""
     torch.manual_seed(3)
     bank = _bank(n_experts=4, n_shared=0)
     capacity = bank.capacity(64 * 2)
-    with pytest.raises(LoudError, match="wider than the dispatch capacity") as raised:
-        bank._refuse_overflow(torch.tensor([capacity + 1, 0, 0, 0]), capacity, 64 * 2)
-    assert "dispatch_sigma" in str(raised.value)
-    bank._refuse_overflow(torch.tensor([capacity, 0, 0, 0]), capacity, 64 * 2)
+    assert bank._passes(torch.tensor([capacity] * 4), capacity, 64 * 2) == 1
+    assert bank._passes(torch.tensor([3 * capacity, 0, 0, 0]), capacity, 64 * 2) == 3
+    assert (
+        bank._passes(torch.tensor([MAX_DISPATCH_PASSES * capacity, 0, 0, 0]), capacity, 64 * 2)
+        == MAX_DISPATCH_PASSES
+    ), "the last pass the bank runs is still dropless"
+    with pytest.raises(LoudError, match="the router has collapsed") as raised:
+        bank._passes(torch.tensor([MAX_DISPATCH_PASSES * capacity + 1, 0, 0, 0]), capacity, 64 * 2)
+    assert "dispatch passes" in str(raised.value)
+    assert "capacity_ratio" in str(raised.value), "a refusal names the escape"
 
 
-def test_the_forward_refuses_when_its_slot_is_too_narrow(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The guard runs before the layout, so a narrow slot is a refusal and not a collision."""
+def test_a_slot_too_narrow_for_four_passes_is_still_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard runs before the layout: a slot that would need 7 passes refuses."""
     torch.manual_seed(3)
     bank = _bank(n_shared=0)
     monkeypatch.setattr(bank, "capacity", lambda routed: 1)
-    with pytest.raises(LoudError, match="wider than the dispatch capacity"):
+    with pytest.raises(LoudError, match="the router has collapsed"):
         bank(torch.randn(8, D))
 
 
 def test_a_skewed_router_executes_every_row_inside_a_widened_slot() -> None:
     """Real skew runs every assignment once the slot is widened — no padding drop.
 
-    Two things at once: the escape the refusal names works (`dispatch_sigma`), and a
+    Two things at once: the escape the second pass leaves alone (`dispatch_sigma`), and a
     group wider than the mean is still executed exactly — the padded rows are masked, so
     `moe_rows_run` stays `n·topk` and nothing is dropped.
     """

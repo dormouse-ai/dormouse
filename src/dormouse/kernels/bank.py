@@ -667,7 +667,7 @@ def _require(what: str) -> dict[str, Any]:
             "run with DORMOUSE_BANK=0, or use the CUDA torch build; a flag that silently "
             "runs the anchor reports a kernel that never executed",
         )
-    return built
+    return built  # pragma: no cover - the card is required to get here
 
 
 def _validate(rank: int, d: int, f: int, kinds: tuple[int, ...], sides: str) -> None:
@@ -997,7 +997,7 @@ def bank(
             "this is the kernel entry point, not a fallback: call it only when "
             "bank.bank_enabled() is true, or the anchor reports a kernel that never ran",
         )
-    return _launch(
+    return _launch(  # pragma: no cover - the launch is the card's, not the CPU's
         cap,
         kinds,
         sides,
