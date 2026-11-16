@@ -39,6 +39,7 @@ from torch import nn
 
 from ..metrics import BitsPerByte
 from . import checkpoint, ema, guards, report
+from .graph import StepGraph
 from .optim import MixOptimizer
 from .recipe import (
     ANNEAL_FLOOR,
@@ -68,11 +69,17 @@ class Trainer:
         cfg: LoopConfig,
         journal: Journal,
         eval_stream: BatchStream | None = None,
+        use_graph: bool = False,
     ) -> None:
         """Wire the run and refuse a schedule whose last step is not the anneal's."""
         self.model, self.stream, self.optim = model, stream, optim
         self.schedule, self.cfg, self.journal = schedule, cfg, journal
         self.eval_stream = eval_stream
+        self.use_graph = use_graph
+        self.graph: StepGraph | None = None
+        self.log_every = 1
+        self._last_loss = 0.0
+        self._last_norm = 0.0
         self.run_id = journal.path.parent.name or "run"
         last = float(schedule(cfg.steps - 1))
         if last > ANNEAL_FLOOR:
@@ -108,14 +115,26 @@ class Trainer:
         steps: int | None = None,
         eval_every: int | None = None,
         ckpt_every: int | None = None,
+        log_every: int = 1,
     ) -> dict[str, float]:
         """Run to the **absolute** horizon `steps` (default: the config's), journaling.
+
+        `log_every` is the host-read cadence. Every read of a step scalar goes through
+        `step.host_scalar`; the step's own arithmetic and its skip decision stay on the
+        device. At the default of one the journal is unchanged; a larger value keeps the
+        loss and the norm on the device between log lines.
 
         `steps` is the total, not an increment: a run resumed at step 60 with
         `train(steps=100)` takes 40 more steps, which is what makes the resume gate a
         comparison with one 100-step run instead of two different budgets. A horizon past
         the config's needs stages for the extra steps; stopping short is a pause.
         """
+        if log_every < 1:
+            raise LoudError(
+                f"log_every={log_every} journalises no step",
+                "one reads every step; a larger value reads at that cadence",
+            )
+        self.log_every = log_every
         total = self.cfg.steps if steps is None else steps
         if total < self.step:
             raise LoudError(
@@ -182,17 +201,37 @@ class Trainer:
         fetched = time.perf_counter()
         check_batch(batch, stage=stage, stream=self.stream, step=step)
         rate = self._set_rate(step)
+        self._capture_graph(step, batch.ids)
+        # Read the journal's loss/norm at the log cadence; the skip decision inside the
+        # step stays on the device either way. ### ponytail: between reads the spike and
+        # nat accountants use the last logged loss — upgrading that to a device-resident
+        # loss window is a follow-up once a deferred-read run is measured on the card.
+        read = self.log_every <= 1 or (step + 1) % self.log_every == 0
+
         # The step's own global clip is off (`clip=inf` leaves the norm unscaled and still
         # reports it): the loop's per-tensor policy replaces it inside `pre_step`.
-        result: StepResult = train_step(
-            self.model,
-            batch.ids,
-            optimizer=self.optim,
-            accum=cfg.accum,
-            clip=math.inf,
-            counters=counters,
-            pre_step=lambda loss: self._pre_step(loss, counters),
-        )
+        def pre_step(loss: float) -> bool:
+            return self._pre_step(loss, counters)
+
+        if self.graph is not None:
+            result: StepResult = self.graph.run(
+                batch.ids, counters=counters, clip=math.inf, pre_step=pre_step
+            )
+        else:
+            result = train_step(
+                self.model,
+                batch.ids,
+                optimizer=self.optim,
+                accum=cfg.accum,
+                clip=math.inf,
+                counters=counters,
+                pre_step=pre_step,
+                read=read,
+            )
+        loss = result.loss if read else self._last_loss
+        norm = result.grad_norm if read else self._last_norm
+        if read:
+            self._last_loss, self._last_norm = loss, norm
         finished = time.perf_counter()
         elapsed = max(finished - started, 1e-9)
         self.step = step + 1
@@ -205,19 +244,24 @@ class Trainer:
             counters.count("skipped")
         else:
             self.consecutive = 0
-            self.losses = [*self.losses, result.loss][-cfg.spike_window :]
-            self.nats += result.loss * batch.tokens
+            self.losses = [*self.losses, loss][-cfg.spike_window :]
+            self.nats += loss * batch.tokens
             counters.count("opt_steps")
         report.note(
             self.journal,
             "step",
             step=step,
             stage=stage.name,
-            loss=report.finite(result.loss),
+            loss=report.finite(loss),
             lr=report.finite(rate),
-            grad_norm=report.finite(result.grad_norm),
+            grad_norm=report.finite(norm),
             clip_events=counters.counts.get("clip_events", 0),
             skipped=result.skipped,
+            **(
+                {"graph_replays": counters.counts.get("graph_replays", 0)}
+                if self.graph is not None
+                else {}
+            ),
             tokens=batch.tokens,
             bytes=batch.payload_bytes,
             bpb=report.step_bpb(result.loss, batch.tokens, batch.payload_bytes),
@@ -241,6 +285,19 @@ class Trainer:
             # A skipped step ran no mechanism (a NaN loss returns before the policy), so
             # the counter discipline has nothing to prove; `skipped` is the receipt.
             counters.check()
+
+    def _capture_graph(self, step: int, ids: torch.Tensor) -> None:
+        """Capture one whole-step graph after warm-up; a failed capture is LOUD."""
+        if not self.use_graph or self.graph is not None or step < self.cfg.warmup_steps:
+            return
+        try:
+            self.graph = StepGraph(self.model, self.optim, ids, accum=self.cfg.accum)
+        except LoudError as exc:
+            raise LoudError(
+                f"--graph requested, but capture refused at step {step}: {exc}",
+                "a graph that replayed nothing is not an eager fallback; fix the op the "
+                "capture names, or drop --graph — never let a refused capture run eager",
+            ) from exc
 
     def _pre_step(self, loss: float, counters: Counters) -> bool:
         """Apply the loop's policy between the backward pass and the optimizer step.
@@ -365,6 +422,7 @@ class Trainer:
         schedule: Callable[[int], float],
         journal: Journal,
         eval_stream: BatchStream | None = None,
+        use_graph: bool = False,
     ) -> Trainer:
         """Restore a run from `run_dir` so that the next batch is the one that would have come.
 
@@ -384,6 +442,7 @@ class Trainer:
             config_from_dict(snapshot.config),
             journal,
             eval_stream,
+            use_graph=use_graph,
         )
         checkpoint.restore(trainer, snapshot)
         trainer.stage = trainer._stage(min(snapshot.step, trainer.cfg.steps - 1)).name
