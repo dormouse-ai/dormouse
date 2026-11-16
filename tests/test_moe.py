@@ -26,7 +26,14 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
 from dormouse.model.ffn import MoaFFN
-from dormouse.model.moe import MoEFFN, bank_bill, check_row_budget, expert_parameters
+from dormouse.model.moe import (
+    DISPATCH_SLAB_BYTES,
+    MAX_DISPATCH_PASSES,
+    MAX_PAD_RATIO,
+    MoEFFN,
+    bank_bill,
+    expert_parameters,
+)
 from dormouse.model.tsct import TSCT_RANK
 
 D, F = 16, 12
@@ -101,53 +108,78 @@ def test_a_forward_executes_exactly_tokens_times_topk_rows() -> None:
     assert counts["moe_rows_run"] == 4096 * 2
     assert counts["moe_dropped"] == 0, "dropless: a drop is a bug, not a policy"
     assert counts["moe_experts_used"] == 8
-    assert counts["moe_bank_builds"] == counts["moe_experts_used"], "a batch-wide bank"
-    assert counts["moe_max_group"] < 2 * (4096 * 2 // 8), "the capacity is the assignment"
+    assert counts["moe_bank_builds"] >= 1, "a batch-wide bank is one slab, not zero"
+    assert counts["moe_capacity"] == bank.capacity(4096 * 2)
+    assert counts["moe_dispatch_passes"] == 1, "a balanced routing is one pass"
+    assert counts["moe_pad_rows"] == 8 * counts["moe_capacity"]
+    assert counts["moe_pad_rows"] <= MAX_PAD_RATIO * (4096 * 2), "the bound, not a wish"
     assert counts["moe_fwd"] == 1
     assert counts["moe_qb"] == 1
     counter.check()  # every enabled mechanism reported itself
 
 
-def test_a_collapsed_router_still_executes_every_row() -> None:
-    """Skew is the arm's own worst case: no truncation, no padding, no drop."""
+def test_a_collapsed_router_is_refused_naming_the_passes() -> None:
+    """Past `MAX_DISPATCH_PASSES` the routing is the defect; at four it is a slow step."""
+    torch.manual_seed(3)
+    bank = _bank(n_experts=4, n_shared=0)
+    capacity = bank.capacity(64 * 2)
+    assert bank._passes(torch.tensor([capacity] * 4), capacity, 64 * 2) == 1
+    assert bank._passes(torch.tensor([3 * capacity, 0, 0, 0]), capacity, 64 * 2) == 3
+    assert (
+        bank._passes(torch.tensor([MAX_DISPATCH_PASSES * capacity, 0, 0, 0]), capacity, 64 * 2)
+        == MAX_DISPATCH_PASSES
+    ), "the last pass the bank runs is still dropless"
+    with pytest.raises(LoudError, match="the router has collapsed") as raised:
+        bank._passes(torch.tensor([MAX_DISPATCH_PASSES * capacity + 1, 0, 0, 0]), capacity, 64 * 2)
+    assert "dispatch passes" in str(raised.value)
+    assert "capacity_ratio" in str(raised.value), "a refusal names the escape"
+
+
+def test_a_slot_too_narrow_for_four_passes_is_still_a_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard runs before the layout: a slot that would need 7 passes refuses."""
     torch.manual_seed(3)
     bank = _bank(n_shared=0)
+    monkeypatch.setattr(bank, "capacity", lambda routed: 1)
+    with pytest.raises(LoudError, match="the router has collapsed"):
+        bank(torch.randn(8, D))
+
+
+def test_a_skewed_router_executes_every_row_inside_a_widened_slot() -> None:
+    """Real skew runs every assignment once the slot is widened — no padding drop.
+
+    Two things at once: the escape the second pass leaves alone (`dispatch_sigma`), and a
+    group wider than the mean is still executed exactly — the padded rows are masked, so
+    `moe_rows_run` stays `n·topk` and nothing is dropped.
+    """
+    torch.manual_seed(3)
+    bank = _bank(n_experts=8, n_shared=0, capacity_ratio=MAX_PAD_RATIO)
     with torch.no_grad():
-        bank.router.bias[0] = 100.0
+        bank.router.bias[0] = 0.05
     counter = Counters()
-    bank(torch.randn(64, D), counter)
+    bank(torch.randn(512, D), counter)
     counts = counter.snapshot()
-    assert counts["moe_rows_run"] == 128
+    assert counts["moe_rows_run"] == 512 * 2
     assert counts["moe_dropped"] == 0
-    assert counts["moe_max_group"] >= 64, "expert 0 is every token's first choice"
-
-
-def test_the_row_budget_check_fails_loudly() -> None:
-    """A 2.0 capacity pads to 98304 rows for 49152 assignments; a drop executes fewer."""
-    with pytest.raises(LoudError, match="executed 98304 expert rows"):
-        check_row_budget(executed=98304, routed=49152, topk=2, largest_group=1536)
-    with pytest.raises(LoudError, match="fewer means dropped assignments"):
-        check_row_budget(executed=49151, routed=49152, topk=2, largest_group=768)
-    with pytest.raises(LoudError) as raised:
-        check_row_budget(executed=98304, routed=49152, topk=2, largest_group=1536)
-    assert "Escape:" in str(raised.value)
-    check_row_budget(executed=49152, routed=49152, topk=2, largest_group=850)
+    assert counts["moe_capacity"] > 1.5 * (512 * 2 // 8), "expert 0 takes far more than the mean"
 
 
 # --- buffers ---------------------------------------------------------------
 
 
-def test_no_batch_wide_bank_is_allocated() -> None:
-    """At b24 x s1024's token count, measure the largest single allocation.
+def test_the_wide_slab_is_one_expert_group_and_not_the_batch() -> None:
+    """Measure the largest single allocation: a group's slab, not the padded bank.
 
-    The old arm's per-row `[R, f]` bank is `R·f·4` bytes; with `d=8, f=160` that
-    is 31.5 MB here (1.21 GB at the live f=6144). The measured peak must be the
-    router's `[n, E]` matrix, so the bound is `n·E·4` bytes, not `R·f·4`. The
-    shared expert is off here on purpose: its `[n, f]` activation is the DENSE
-    path's own buffer, not the bank's, and it would hide the claim.
+    The loop's per-row `[R, f]` bank is `R·f·4` — 1.15 GiB at b24's 49 152 rows and the
+    live `f=6144` — and a padded `[E, capacity, f]` bank is 1.37x that. Neither is what
+    runs: `group` is chosen so ONE `[group, capacity, d_ffn]` slab is under
+    `DISPATCH_SLAB_BYTES` (256 MiB), which is what bounds the padded layout's transient at
+    any batch size. At this test's widths the group is the whole bank, so the assertion is
+    the bound itself plus the live ratio by arithmetic.
     """
     torch.manual_seed(4)
-    n, d, f, e, k = 24 * 1024, 8, 160, 64, 2
+    n, d, f, e, k = 24 * 1024, 16, 160, 8, 2
     bank = MoEFFN(
         d,
         f,
@@ -169,13 +201,15 @@ def test_no_batch_wide_bank_is_allocated() -> None:
     ):
         bank(x)
     peak = max(event.self_cpu_memory_usage for event in profiler.events())
-    router_matrix = n * e * 4
-    removed_bank = n * k * f * 4
+    capacity = bank.capacity(n * k)
+    slab = min(e, bank.group(capacity, 4)) * capacity * f * 4
+    ragged_bank = n * k * f * 4
     print(
-        f"\npeak single allocation {peak / 2**20:.1f} MiB vs [R,f] {removed_bank / 2**20:.1f} MiB"
+        f"\npeak single allocation {peak / 2**20:.1f} MiB vs one group's slab "
+        f"{slab / 2**20:.1f} MiB and the [R,f] bank {ragged_bank / 2**20:.1f} MiB"
     )
-    assert peak <= 1.25 * router_matrix, (peak, router_matrix)
-    assert removed_bank > 4 * peak, (removed_bank, peak)
+    assert peak <= 1.25 * slab, (peak, slab)
+    assert DISPATCH_SLAB_BYTES * 4 < 24 * 1024 * 2 * 6144 * 4, "the live bank is 4x the budget"
 
 
 # --- the bill --------------------------------------------------------------

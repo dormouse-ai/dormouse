@@ -21,65 +21,121 @@ brief itself fixes `f=6144`. The refused configuration is the one that would mak
 expert a rounding error: below 10M dense parameters, or below 1% of the active set
 (`topk + n_shared > 100`), and both refusals name the escape.
 
-DROPLESS, SO THERE IS NOTHING FOR A CAPACITY TO PAD. The old arm multiplied a
-fixed capacity of `2.0` into the per-expert bank; at b24 it executed 2.52x the
-rows the router assigned, which doubled the FLOPs and made every training-cost
-number an upper bound on a different model. Here `capacity` is not a knob: the
-largest group is whatever the router assigned THIS batch (reported as
-`moe_max_group`), and `_dispatch` executes exactly `n_tokens · topk` expert rows
-— no zero rows, no dropped assignments. `check_row_budget` fails LOUDLY if the
-rows the loop executed disagree with the router's own count, which is the check
-the 2.0 arm would have failed.
+DROPLESS, AND ONE PADDED DISPATCH PER LAYER. `_dispatch` lays every routed row into ONE
+contiguous `[E·capacity, d]` bank — a row's slot is `expert·capacity + its rank inside
+that expert` — and reads each group of experts as a 3-D batch: `[g, capacity, d] @
+[g, d, r] @ [g, r, f]`. The old arm ran the same arithmetic one expert at a time and paid
+a Python call and ~77 kernel launches per expert per bank call: 4 919 per call and 59 028
+per step at twelve layers, which was 81% of a measured 403 387 launches per step. The
+batched path issues `6·ceil(E/g)` matmuls for the up/gate/down trio plus the mixture's
+elementwise chain, i.e. a few hundred dispatches per bank call, and no Python loop over
+experts exists to scale with `n_experts`.
 
-NO `[R, f]` BANK. Two wide buffers made the old arm unmeasurable: the gathered
-per-row activation bank `[R, f]` (R = n·topk) and a zero-padded
-`[E, 2·R/E, f]` one. At b24 x s1024 in fp32 those are 1.21 GB and 2.42 GB PER
-BUFFER. This module never builds either: the router multiplies its `[E, d]`
-weight once (`[n, E]`, 6.3 MB at b24) and never gathers winner weights into
-`[R, d]`; `_dispatch` gathers one expert's TOKENS (`[r, d]`, r = that group's
-size) and runs the three matmuls on `[r, ·]`, so the activation peak is the
-largest single group (~850 rows at b24, ~63 MB across gate/up/h) and not the
-batch's. `scripts/bench_moe.py --peak` measures the real peak; the analytic
-numbers are in the tests.
+CAPACITY IS A FORMULA OVER SHAPES, MASKED, AND NEVER A DROP. `capacity` is
+`CAPACITY_RATIO·mean` (2x), floored by `mean + DISPATCH_SIGMA·√mean` (4 sigma of the
+assignment's own noise, which is what a small batch needs) with `mean = n·topk/E` —
+integers the caller already knows (`n`, `topk`, `E`). That is the whole point: a capacity
+that depends on the assignment's own maximum has to be read back from the device to size a
+tensor, and `counts.tolist()` was that read. Padding rows are MASKED, not
+executed-and-reported: the output is gathered by the slot each real row owns, so a padded
+slot is never read, and its gradient is zero, so no expert's gradient moves. The padded
+total is bounded by `MAX_PAD_RATIO` by construction (the capacity is clamped by it) and
+reported as `moe_pad_rows`: 2.0x the routed rows at b8 and b24 (1.0x would be a ragged
+bank, and the old arm's 2.0 was never reported at all).
 
-ONE HOST READ, AND IT IS NOT ON THE COUNTING PATH. The router scores, selects
-and counts entirely on the device (`router.count` is a `scatter_add_`, not
-`bincount`), so a CUDA-graph capture of the routing is possible — the test
-compiles it with `fullgraph=True`. `_dispatch` then reads the `[E]` histogram
-once (`counts.tolist()`): a ragged per-expert GEMM needs the group sizes as
-Python ints, and PyTorch has no CPU grouped-GEMM that takes device offsets.
-That is one transfer of 64 integers per forward, the same read the reference
-loop has always needed — `ponytail:` the ceiling is that the dispatch cannot be
-CUDA-graph captured until a grouped GEMM (`torch._grouped_mm` on CUDA, a Triton
-kernel on the roadmap) replaces the loop; the ROUTER, which is what `.item()`
-and `bincount` broke, is already capture-safe.
+A GROUP PAST THE CAPACITY IS A SECOND PASS, NOT A REFUSAL. `_passes` slices the routing
+into as many passes as the widest expert needs: pass `p` owns the rows whose rank inside
+their expert is in `[p·capacity, (p+1)·capacity)`, the rest of the bank is padded and
+masked, and the passes accumulate into the same `[n, d]` write. Each real row is computed
+by exactly one expert at exactly one slot, so the result is the unconstrained fan-out's —
+nothing is dropped and nothing is truncated. `moe_dispatch_passes` reports how many passes
+the step needed, so an unbalanced run is visible instead of silent. The refusal that
+remains is a genuine pathology: past `MAX_DISPATCH_PASSES` (4) slots the router has
+collapsed — that is a routing defect worth stopping for, and the error says so.
+
+MEMORY IS ONE GROUP'S SLAB, NOT THE BATCH'S. Two buffers are proportional to the routed
+rows `R = n·topk`: the `[E·capacity, d]` layout (the `[R, d]` gather the loop did per
+group, plus the padding) and the slots it is gathered from. The wide buffers are
+`[group, capacity, d_ffn]`, and the group is CHOSEN to keep one of them under
+`DISPATCH_SLAB_BYTES` (256 MiB): four of them are live in the mixture at once, so the
+transient is bounded by an expert group's slab and never by `E·capacity·f` — the padded
+2.0 bank the old docstring refused, 1.38 GiB at b24 in fp32. At b8 in fp32 the group is
+32 experts (2 groups per call), at b16 17 (4), and the slab in flight is ~250 MiB.
+
+ONE HOST READ REMAINS, AND IT IS THE PASS COUNT. `capacity` comes from the batch's shape
+and costs nothing; but how many passes a dropless dispatch needs is a function of the
+routing's own histogram (`ceil(largest group / capacity)`), and no device value can size a
+Python loop. So `_passes` reads `counts.max()` once per forward — the same read the
+overflow guard made on the CPU, now used to decide instead of only to assert. That is the
+one device→host synchronisation in this path, and it is unavoidable while the dispatch is
+both dropless and shape-static: the alternative is a fixed number of passes, which either
+pays 2x on every uniform step or drops a row on a skewed one. The consequence is stated
+rather than hidden: a forward is no longer CUDA-graph capturable, because its control flow
+depends on a device value (`train/graph.py` says what a host read does to a capture).
 
 COUNTERS (a zero must be a measurement, not a default):
 
-* `moe_fwd` — bank passes (one per forward);
-* `moe_rows_run` — expert rows executed, must be `n_tokens · topk`;
-* `moe_experts_used` — groups with at least one row;
-* `moe_bank_builds` — per-group activation buffers materialised; equal to
-  `moe_experts_used`, and a batch-wide bank would make it 1;
+* `moe_fwd` — bank forwards (one per call, however many passes it took);
+* `moe_rows_run` — routed expert rows executed, must be `n_tokens · topk`;
+* `moe_dispatch_passes` — dispatch passes this forward needed: 1 for a balanced routing,
+  more when one expert's group is wider than a slot (`_passes`);
 * `moe_dropped` - `routed - executed`, counted even when 0 so a run that never
   drops proves it measured (the key is in `snapshot()`; `Counters.line()` prints
   non-zero values only, so a zero is read from the snapshot, not from the log);
-* `moe_max_group` — the largest group this batch, i.e. the capacity that is
-  actually used (no 2.0 multiplier);
+* `moe_capacity` — rows per expert slot this forward sized, from the formula above;
+* `moe_pad_rows` — the padded total `passes · E·capacity`, i.e. what the slabs executed
+  against `moe_rows_run` (the ratio is itself the padding's report);
+* `moe_experts_used` — expert slots executed: the bank's width, because a padded
+  dispatch reads every expert (a dead expert is a routing fact, and the router's own
+  `[E]` histogram is the device-side place it is read);
+* `moe_bank_builds` — expert-group slabs materialised, `ceil(E/group)`; a batch-wide
+  bank would make it 1;
 * `moe_shared`, `moe_qb` — the always-on expert and the balance update.
 """
 
 from __future__ import annotations
 
+import math
+from typing import cast
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
-from .ffn import PROJ_STD
+from ..kernels import bank as fused_bank
+from .ffn import PROJ_STD, LaFFN, MoaFFN, Stacked, _Glu, stack_matrices
 from .ffn_spec import FFNSpec
 from .router import Router
 from .tsct import TSCT_RANK
+
+#: Rows per expert slot, as a multiple of the mean load `routed/E`. Two is what the
+#: bank's own run needs: measured on the card at b8 x s1024, the largest group is 1.43x
+#: the mean on the first step (router bias zero, before QB has equalised anything) and
+#: 1.87x on the second; beyond that the ROUTER is unbalanced, not the dispatch, and a
+#: capacity that followed it would have to be recomputed from the device — which is the
+#: host read this path exists to avoid. 2.0 is also the multiple the old arm multiplied
+#: into the bank and never reported; here it is the slot width, the padding is masked,
+#: `moe_pad_rows` reports it, and a wider group spills into another pass (`_passes`)
+#: instead of being truncated.
+CAPACITY_RATIO = 2.0
+
+#: Counting-noise floor on the same width, in standard deviations of the assignment
+#: (`sd ~ √mean` of a multinomial): 4 sigma is what a small batch needs where `mean` is
+#: a handful of rows and `CAPACITY_RATIO` alone would be a slot of two.
+DISPATCH_SIGMA = 4.0
+
+#: The padded bank may not exceed this multiple of the routed rows. The capacity above is
+#: CLAMPED by it, so the padding is bounded by construction and reported (`moe_pad_rows`);
+#: it binds only below `mean ≈ 16` rows per expert, i.e. a 64-expert bank fed under 1024
+#: routed rows (b1 x s1024), where the √mean term is the whole slack.
+MAX_PAD_RATIO = 3.0
+
+#: Bytes one `[group, capacity, d_ffn]` slab may hold. The mixture keeps ~4 of them live
+#: (gate, up, their weighted sum and the write's input), so an expert group is chosen to
+#: keep that set near a GiB; the trio's dispatch count is `6·ceil(E/group)` per call.
+DISPATCH_SLAB_BYTES = 128 * 2**20
 
 #: An expert below this is not an expert at this project's scale; see the
 #: module docstring for why 10M and the live config that satisfies it. Measured against
@@ -91,6 +147,13 @@ MIN_EXPERT_PARAMS = 10_000_000
 #: An expert must be at least this share of the active set. The design's
 #: headline pair is 5.36M stored against 16.07M active: 33% per expert, not 1%.
 MIN_EXPERT_SHARE = 0.01
+
+#: Dispatch passes one forward may take before the routing is a pathology. A balanced
+#: bank needs one; an expert at 3.2x the mean needs two; a router that has collapsed onto
+#: one or two experts needs the width of the batch and is worth stopping for, so past
+#: four slots the refusal says the router collapsed instead of running a slow forward
+#: forever. The check reads the same histogram the pass count does — no extra sync.
+MAX_DISPATCH_PASSES = 4
 
 
 def expert_parameters(d_model: int, d_ffn: int, rank: int = 0) -> int:
@@ -131,22 +194,59 @@ def bank_bill(
     }
 
 
-def check_row_budget(*, executed: int, routed: int, topk: int, largest_group: int) -> None:
-    """LOUD: a dispatch that executed a different number of rows than it routed.
+def _group_write(bank: MoEFFN, arms: list[_Glu], slab: torch.Tensor) -> torch.Tensor:
+    """One expert group's write, recomputed in the backward rather than retained.
 
-    `executed` is the row count the DISPATCH itself accumulated, `routed` the
-    router's `n_tokens · topk`. This is the gate the capacity-2.0 arm fails:
-    a padded bank executes `E · max_group ≥ routed` rows (2.52x measured), a
-    capacity rule at 1.0 drops rows and executes fewer, and both make the
-    counter a lie about the model that ran.
+    Two things are inside the recomputed region, not outside it: the `[group, capacity,
+    d_ffn]` slabs the mixture reads, and the `Stacked` COPY of the group's factors. Keeping
+    either alive per layer for the backward retains `E·capacity·d_ffn` (1.2 GiB at b8) and
+    `E·r·d_ffn` (470 MiB) — measured as 10 GiB of `torch.stack` blocks over twelve layers
+    before this was moved in — where recomputing them keeps one group's slab as the
+    graph's whole routed activation.
+
+    This is the ANCHOR: the `[rows, d_ffn]` slabs above are exactly what
+    `kernels/bank.py` deletes, and the fused path runs instead whenever a kernel can
+    (`_fused_group`). The anchor is kept because it is the thing the kernel is checked
+    against, on the card and at every shape a test can reach.
     """
-    if executed != routed:
+    return arms[0].batch_write(bank._stacked(arms), slab)
+
+
+def _fused_group(
+    bank: MoEFFN,
+    arms: list[_Glu],
+    x: torch.Tensor,
+    tok: torch.Tensor,
+    counts: torch.Tensor,
+    capacity: int,
+) -> torch.Tensor:
+    """One expert group through the fused chain: the kernel path's recompute boundary.
+
+    `checkpoint` for the same reason `_group_write` has one: the `Stacked` copy of the
+    group's factors is `3·(d·r + r·f)·group` parameters (~54 MiB at the live group) and
+    retaining it for every layer's backward is 4.5 GiB. The recomputed region is the
+    stack and the chain; the `[rows, r]` scratches the chain saves are one group's.
+    """
+    first = arms[0]
+    kinds = first._kinds
+    if kinds is None:
         raise LoudError(
-            f"executed {executed} expert rows against {routed} routed assignments "
-            f"(topk={topk}, largest group={largest_group})",
-            "dropless dispatch executes exactly n_tokens·topk rows: more means a "
-            "padded capacity bank, fewer means dropped assignments",
+            f"the fused bank cannot mix {getattr(first, 'dictionary', ())}",
+            "the kernel knows kernels.fused.MIX_CODES; run with DORMOUSE_BANK=0 for a "
+            "dictionary it does not",
         )
+    sides = cast("MoaFFN", first).sides
+
+    def run(  # pragma: no cover - launches the kernels
+        group: list[_Glu], rows: torch.Tensor
+    ) -> torch.Tensor:
+        return fused_bank.bank(
+            rows, tok, counts, capacity, bank._stacked(group), kinds=kinds, sides=sides
+        )
+
+    if torch.is_grad_enabled() and x.requires_grad:  # pragma: no cover - launches
+        return checkpoint(run, arms, x, use_reentrant=False, preserve_rng_state=False)
+    return run(arms, x)  # pragma: no cover - launches
 
 
 class MoEFFN(nn.Module):
@@ -171,6 +271,8 @@ class MoEFFN(nn.Module):
         write_std: float = PROJ_STD,
         qb: bool = True,
         min_expert_params: int = MIN_EXPERT_PARAMS,
+        dispatch_sigma: float = DISPATCH_SIGMA,
+        capacity_ratio: float = CAPACITY_RATIO,
         device: torch.device | str | None = None,
     ) -> None:
         """Build the router, the routed experts and the shared expert, in that order."""
@@ -221,6 +323,8 @@ class MoEFFN(nn.Module):
         self.topk = topk
         self.n_shared = n_shared
         self.expert_tsct_rank = expert_tsct_rank
+        self.dispatch_sigma = dispatch_sigma
+        self.capacity_ratio = capacity_ratio
         self.router = Router(d_model, n_experts, topk, qb=qb, device=device)
         self.experts = nn.ModuleList(
             self.expert_spec.build(write_std=write_std, device=device) for _ in range(n_experts)
@@ -247,7 +351,7 @@ class MoEFFN(nn.Module):
                 "skip empty micro-batches; an all-empty step is not a training step",
             )
         if counters is not None:
-            self._enable(counters)
+            self._enable(counters, x)
         index, weight, counts = self.router(x, counters)
         y = self._dispatch(x, index, weight, counts, counters)
         if self.shared is not None:
@@ -258,6 +362,33 @@ class MoEFFN(nn.Module):
             counters.count("moe_fwd")
         return y
 
+    def capacity(self, routed: int) -> int:
+        """Rows per expert slot: `CAPACITY_RATIO` of the mean, floored by counting noise.
+
+        A function of `routed = n·topk` alone — the property that lets the dispatch size
+        its layout without reading the routing back from the device. `MAX_PAD_RATIO` is
+        what keeps the clamp a bound and not a wish: the padded total `E·capacity` cannot
+        exceed it, so the waste is stated before the tensors exist, and a batch whose
+        largest group is wider than the slot spills into another pass (`_passes`), never
+        into a truncation.
+        """
+        mean = routed / self.n_experts
+        slack = max(self.capacity_ratio * mean, mean + self.dispatch_sigma * math.sqrt(mean))
+        return max(1, min(math.ceil(slack), int(MAX_PAD_RATIO * mean)))
+
+    def group(self, capacity: int, itemsize: int) -> int:
+        """Experts per slab: the most whose transients fit the budget.
+
+        Two allocations scale with the group, and the smaller limit governs: the padded
+        `[group, capacity, d_ffn]` slab (the mixture's own wide buffer) and the stacked
+        `[group, r, d_ffn]` factors (the batched read's operands, a copy of that group's
+        parameters). At the live bank the first is 1.5x the second, so the slab governs;
+        at a tiny capacity the factors do, and this keeps their stack off the peak.
+        """
+        factors = self.expert_tsct_rank * max(self.d_model, self.d_ffn)
+        per_expert = max(capacity * self.d_ffn, factors or self.d_model * self.d_ffn)
+        return max(1, min(self.n_experts, DISPATCH_SLAB_BYTES // (per_expert * itemsize)))
+
     def _dispatch(
         self,
         x: torch.Tensor,
@@ -266,42 +397,191 @@ class MoEFFN(nn.Module):
         counts: torch.Tensor,
         counters: Counters | None = None,
     ) -> torch.Tensor:
-        """Execute each routed row on its own expert, expert-major, row-exact."""
+        """Lay the routed rows into padded banks — one pass per slot-width slice — and read.
+
+        Pass `p` owns the rows whose rank inside their expert is `[p·capacity,
+        (p+1)·capacity)`; the rest of the bank is padding, which is masked out of the write.
+        Every routed row is owned by exactly one pass and lands in exactly one slot, so the
+        sum is the unconstrained fan-out's, dropless, at whatever skew the router produces.
+        """
         n, k = index.shape
         routed = n * k
-        sizes = counts.tolist()  # the ONE host read; see the module docstring
+        capacity = self.capacity(routed)
         order = torch.argsort(index.reshape(-1), stable=True)
         tokens = order // k
         gates = weight.reshape(-1)[order]
+        expert = index.reshape(-1)[order]
+        #: The rank of a row inside its own expert: the sorted position minus the number
+        #: of rows the experts before it took. Device-only, like everything below.
+        starts = counts.cumsum(0) - counts
+        local = torch.arange(routed, device=x.device) - starts.index_select(0, expert)
+        passes = self._passes(counts, capacity, routed)
+        pad = self.n_experts * capacity
+        #: One row past the bank: rows this pass does not own are summed there and never
+        #: read (`out[trash]` is zeroed). `index_copy_` needs unique slots and the rows of
+        #: another pass share theirs, so the layout is built with an accumulate — into a
+        #: row nobody reads, which is what keeps the cost one write and no second sync.
+        trash = pad
+        fused = self._fused_ready(x)
+        group = self.group(capacity, x.element_size())
+        launches = fused_bank.bank_launches()
         y = torch.zeros_like(x)
-        pos = 0
-        used = 0
-        largest = 0
-        for expert, size in zip(self.experts, sizes, strict=True):
-            if size == 0:
-                continue
-            tok = tokens[pos : pos + size]
-            out = expert(x.index_select(0, tok), counters)
-            y.index_add_(0, tok, out * gates[pos : pos + size, None])
-            pos += size
-            used += 1
-            largest = max(largest, size)
-        check_row_budget(executed=pos, routed=routed, topk=k, largest_group=largest)
+        for current in range(passes):
+            span_local = local - current * capacity
+            keep = (span_local >= 0) & (span_local < capacity)
+            slot = torch.where(keep, expert * capacity + span_local, trash)
+            if fused:  # pragma: no cover - the fused branch needs a device
+                #: The slot -> row index map the kernel reads. The `[E·capacity, d]` gather
+                #: is what the fused chain does not build: `tok` is `[pad]` int32.
+                tok = torch.zeros(pad + 1, dtype=torch.int32, device=x.device)
+                tok.index_copy_(0, slot, tokens.to(torch.int32))
+                bank = x.new_zeros((0, x.shape[1]))
+            else:
+                bank = x.new_zeros((pad + 1, x.shape[1]))
+                bank.index_add_(0, slot, x.index_select(0, tokens))
+            out = x.new_empty((pad + 1, x.shape[1]))
+            for start in range(0, self.n_experts, group):
+                stop = min(start + group, self.n_experts)
+                span = slice(start * capacity, stop * capacity)
+                arms = self._arms(start, stop)
+                if fused:  # pragma: no cover - the fused branch needs a device
+                    live = (counts[start:stop] - current * capacity).clamp(0, capacity)
+                    written = _fused_group(self, arms, x, tok[span], live, capacity)
+                else:
+                    slab = bank[span].view(stop - start, capacity, x.shape[1])
+                    written = (
+                        checkpoint(
+                            _group_write,
+                            self,
+                            arms,
+                            slab,
+                            use_reentrant=False,
+                            preserve_rng_state=False,
+                        )
+                        if torch.is_grad_enabled() and slab.requires_grad
+                        else _group_write(self, arms, slab)
+                    )
+                out[span] = written.view(-1, x.shape[1])
+            out[trash].zero_()
+            y.index_add_(0, tokens, out.index_select(0, slot) * (gates * keep).unsqueeze(1))
         if counters is not None:
-            counters.count("moe_rows_run", pos)
-            counters.count("moe_experts_used", used)
-            counters.count("moe_bank_builds", used)
-            counters.count("moe_max_group", largest)
-            counters.count("moe_dropped", routed - pos)
+            counters.count("moe_rows_run", routed)
+            counters.count("moe_experts_used", self.n_experts)
+            counters.count("moe_bank_builds", passes * math.ceil(self.n_experts / group))
+            counters.count("moe_capacity", capacity)
+            counters.count("moe_pad_rows", passes * pad)
+            counters.count("moe_dispatch_passes", passes)
+            counters.count("moe_dropped", 0)
+            if fused:
+                counters.count("bank_ops", fused_bank.bank_launches() - launches)
+            #: The read belongs to the arm, so it reports the rows the DISPATCH read — the
+            #: assignments, not their padding (that is `moe_pad_rows`).
+            self._arms(0, 1)[0].count_read(routed, counters)
         return y
 
-    def _enable(self, counters: Counters) -> None:
-        """Declare the mechanisms this forward runs, so silence becomes an error."""
+    def _fused_ready(self, x: torch.Tensor) -> bool:
+        """Whether this bank can run the fused chain, and refuse loudly if it was asked to.
+
+        Four conditions, and each one has an escape named where it fails: a CUDA tensor
+        under a Triton build (a CPU tensor on a CUDA host is the anchor path — a Triton
+        program cannot read host memory, and `tests/test_assemble.py` runs three CPU steps
+        on this card), a factorised arm (the dense `rank=0` control has no rank-space tiles
+        to hold), and a per-row mixture the kernel knows the codes for. A bank that was
+        asked for the fused chain and cannot run it REFUSES — the alternative is the anchor
+        running under a flag that reports a kernel.
+        """
+        requested = self.expert_tsct_rank > 0 and fused_bank.bank_enabled() and x.is_cuda
+        if not requested:
+            return False
+        first = self.experts[0]
+        if not isinstance(first, MoaFFN) or first._kinds is None:
+            raise LoudError(
+                f"the fused bank cannot read {type(first).__name__} experts over "
+                f"{getattr(first, 'dictionary', ())}",
+                "the fused chain is the rank-r MoA expert (per-token coefficients, "
+                "dictionary in kernels.fused.MIX_CODES); run with DORMOUSE_BANK=0 for "
+                "any other arm",
+            )
+        return True
+
+    def _arms(self, start: int, stop: int) -> list[_Glu]:
+        """Return experts `[start, stop)` as the arms they are: one `nn.ModuleList` slice."""
+        return cast("list[_Glu]", list(self.experts[start:stop]))
+
+    def _stacked(self, arms: list[_Glu]) -> Stacked:
+        """Stack one group's parameters into the `[group, ...]` batches `batch_write` reads."""
+        first = arms[0]
+        mix = None
+        coef = None
+        if isinstance(first, MoaFFN):
+            moa = cast("list[MoaFFN]", arms)
+            mix = (
+                torch.stack([arm.mix.weight for arm in moa]).transpose(1, 2),
+                torch.stack([arm.mix.bias for arm in moa]),
+            )
+        if isinstance(first, (LaFFN, MoaFFN)):
+            mixture = cast("list[LaFFN | MoaFFN]", arms)
+            coef = torch.stack([arm.coef for arm in mixture])
+        return Stacked(
+            gate=stack_matrices([arm.gate for arm in arms]),
+            up=stack_matrices([arm.up for arm in arms]),
+            down=stack_matrices([arm.down for arm in arms]),
+            mix=mix,
+            coef=coef,
+        )
+
+    def _passes(self, counts: torch.Tensor, capacity: int, routed: int) -> int:
+        """Return the dispatch passes this routing needs, refusing a collapsed router.
+
+        `ceil(largest group / capacity)`: the widest expert's rows, sliced into
+        slot-width passes, and every other expert rides along in the same passes with
+        padding. This is the forward's ONE host read — `counts.max()` — and it is the
+        same read the old overflow guard made: a pass count is control flow, and no
+        device-side value can size a Python loop. What it buys is droplessness at any
+        skew, which a device-side assert could not: the assert could only stop the step.
+
+        Past `MAX_DISPATCH_PASSES` the refusal is a real one: an expert needing five
+        slots holds `5·capacity` rows against a mean of `capacity/2`, i.e. the router has
+        stopped routing. That is worth stopping for, and the error says so.
+        """
+        mean = routed / max(1, counts.numel())
+        largest = int(counts.max())
+        passes = max(1, -(-largest // capacity))
+        if passes > MAX_DISPATCH_PASSES:
+            raise LoudError(
+                f"the routing needs {passes} dispatch passes: one expert took {largest} "
+                f"rows against a {capacity}-row slot — the router has collapsed",
+                f"a dropless bank slices the widest expert into slots, and past "
+                f"{MAX_DISPATCH_PASSES} the routing is the defect rather than the "
+                f"dispatch; check the router's gradient/QB, or raise `capacity_ratio` "
+                f"(now {self.capacity_ratio:g}) for a wider first slot. Mean load is "
+                f"{mean:.0f} rows per expert.",
+            )
+        return passes
+
+    def _enable(self, counters: Counters, x: torch.Tensor) -> None:
+        """Declare the mechanisms this forward runs, so silence becomes an error.
+
+        `x` decides one of them: a CPU tensor on a CUDA host runs the anchor, so the
+        fused-chain counter must not be enabled for it — an enabled counter that reports
+        nothing is `MissingReport`, which is the gate doing its job.
+        """
         counters.enable("moe", counter="moe_fwd", why="the routed bank runs")
         counters.enable("moe_dropless", counter="moe_rows_run", why="every assignment is executed")
-        counters.enable("moe_experts", counter="moe_experts_used", why="an expert with rows ran")
-        counters.enable("moe_bank", counter="moe_bank_builds", why="the per-group bank was built")
-        counters.enable("moe_max_group", counter="moe_max_group", why="the capacity used")
+        counters.enable("moe_experts", counter="moe_experts_used", why="every expert slot ran")
+        counters.enable(
+            "moe_bank", counter="moe_bank_builds", why="the expert-group slab was built"
+        )
+        counters.enable("moe_capacity", counter="moe_capacity", why="the capacity sized")
+        counters.enable(
+            "moe_dispatch",
+            counter="moe_dispatch_passes",
+            why="the dispatch counted its passes",
+        )
+        if self.expert_tsct_rank > 0 and fused_bank.bank_enabled() and x.is_cuda:
+            #: A flag-on forward that reports no fused launch is the defect `bank_ops`
+            #: exists for: the anchor would otherwise run under the kernel's name.
+            counters.enable("moe_bank_fused", counter="bank_ops", why="the fused chain ran")
         if self.shared is not None:
             counters.enable("moe_shared", counter="moe_shared", why="the shared expert")
         if self.router.qb and self.training:
