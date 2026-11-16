@@ -23,7 +23,9 @@ by name — and `counters.check()` fails if the graphs are zero.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import signal
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -33,6 +35,11 @@ from torch import nn
 #: The counter a compiled step reports. `Counters.check()` fails when it stays at zero,
 #: which is what makes "compile ran" a measurement instead of an assumption.
 COUNTER = "compile_graphs"
+
+#: Ten minutes. `torch.compile` is lazy: the cost lands on the first forward, so the cap
+#: belongs around that call, not around `enable`. A compile that has not landed by then is
+#: NO ARTIFACT — the earlier card probe was killed at 540 s (tools/bench_compile_step.py:33).
+COMPILE_BUDGET_S = 600
 
 #: Set while the model is compiled, so callers can tell a compiled step from an eager one
 #: without inspecting `torch._dynamo`'s globals.
@@ -107,6 +114,57 @@ def line() -> str:
     found = breaks()
     top = ", ".join(f"{name} x{count}" for name, count in list(found.items())[:3])
     return f"compile on: {unique_graphs()} graphs, breaks {sum(found.values())} ({top or 'none'})"
+
+
+@contextmanager
+def compile_budget(seconds: int = COMPILE_BUDGET_S) -> Iterator[None]:
+    """Bound the first compiled call with a named refusal when inductor never lands.
+
+    The SIGALRM handler raises instead of returning, so an expired budget cannot be logged
+    and then ignored. The previous handler is restored on both the success and failure path.
+    """
+    if seconds < 1:
+        raise LoudError(
+            f"compile budget {seconds}s is not a budget",
+            f"use a positive number of seconds (the default is {COMPILE_BUDGET_S})",
+        )
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def _expired(signum: int, frame: object) -> None:
+        """Turn the alarm into a refusal that names the missing artifact."""
+        del signum, frame
+        raise LoudError(
+            f"inductor did not produce a graph within {seconds}s",
+            "an unfinished compile is NO ARTIFACT, never an eager speed-up under a "
+            "compiled name; run with torch_compile=false or raise the budget deliberately",
+        )
+
+    signal.signal(signal.SIGALRM, _expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def require_graph() -> dict[str, Any]:
+    """Refuse a compiled run that built no graph, naming dynamo's break reasons.
+
+    A graph break is not by itself a failure — the counter calls in `model/` end regions.
+    Zero graphs with the flag on is: the eager kernels ran under the compiled name, which
+    is the defect this counter exists to catch.
+    """
+    found = proof()
+    if found["unique_graphs"] <= 0:
+        breaks = ", ".join(f"{name} x{count}" for name, count in found["graph_break"].items())
+        raise LoudError(
+            "torch.compile built 0 inductor graphs: the eager path ran under a compiled name",
+            f"graph breaks: {breaks or 'none'}; no ms/step may be reported from this run. "
+            "A historical live-shape blocker is recorded in "
+            "docs/records/2026-11-16-step-graph-live-shape.md §5",
+        )
+    return found
 
 
 def checked(model: nn.Module, **kwargs: Any) -> None:
