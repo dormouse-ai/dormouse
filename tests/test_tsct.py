@@ -121,7 +121,12 @@ def test_the_bill_is_the_factors_not_the_dense_master() -> None:
 
 
 def test_no_dense_expert_matrix_is_ever_allocated() -> None:
-    """No single allocation in an expert's forward is a `[832, 6144]` slab."""
+    """No single allocation in an expert's forward is a `[832, 6144]` slab.
+
+    The batched read stacks a group's rank-256 factors into 3-D operands, so the largest
+    block is ONE factor (`r·f`), still 3.2x below the dense master the factors replaced —
+    and the group is chosen from the slab budget, so it does not grow with the bank.
+    """
     bank = MoEFFN(
         LIVE_D,
         LIVE_F,
@@ -135,6 +140,7 @@ def test_no_dense_expert_matrix_is_ever_allocated() -> None:
     )
     bank.eval()
     dense = LIVE_D * LIVE_F * 4
+    factored = LIVE_R * LIVE_F * 4
     with (
         torch.no_grad(),
         torch.profiler.profile(
@@ -144,9 +150,11 @@ def test_no_dense_expert_matrix_is_ever_allocated() -> None:
         bank(torch.randn(8, LIVE_D))
     peak = max(event.self_cpu_memory_usage for event in profiler.events())
     print(
-        f"\npeak single allocation {peak / 2**20:.2f} MiB vs a dense master {dense / 2**20:.2f} MiB"
+        f"\npeak single allocation {peak / 2**20:.2f} MiB vs one factor "
+        f"{factored / 2**20:.2f} MiB and a dense master {dense / 2**20:.2f} MiB"
     )
-    assert peak < dense / 8, (peak, dense)
+    assert peak <= 1.25 * factored, (peak, factored)
+    assert peak < dense / 3, (peak, dense)
 
 
 # --- gate 6: the MACs are the two matmuls --------------------------------------

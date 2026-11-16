@@ -58,6 +58,7 @@ peak; the output and every gradient stay `torch.equal` to the chain
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -69,7 +70,11 @@ from torch.utils.checkpoint import checkpoint
 from .activations import DEFAULT_DICTIONARY, activation, resolve
 from .tsct import FactorLinear, project
 
-__concepts__ = ("GatedFFN", "LaFFN", "MoaFFN")
+__concepts__ = ("GatedFFN", "LaFFN", "MoaFFN", "Stacked")
+
+#: One matrix of the batched read, as the pair the storage gives it: `x·a·b`, and
+#: `b is None` on the dense arm (`a` is then the transposed `[in, out]` weight).
+Matrix = tuple[torch.Tensor, torch.Tensor | None]
 
 #: Std of the two `d -> d_ffn` halves; the residual-writing `down` takes the
 #: caller's `write_std` (the depth-dependent scale, see `model.Transformer`).
@@ -86,6 +91,60 @@ FFN_SIDES: tuple[str, ...] = ("one", "bi")
 #: number governs the dictionary's transient (measured 1.35x vs 1.07x the plain FFN's peak
 #: at 8192 rows unchunked).
 MIX_CHUNK_ROWS = 2048
+
+
+@dataclass(frozen=True)
+class Stacked:
+    """A GROUP of experts' parameters, as the `[group, ...]` batches the dispatch reads.
+
+    One expert's matrix is `u [in, r]`/`v [r, out]` (or a dense `W [out, in]`), so a
+    group of `g` of them is a 3-D batch and its read is one `matmul` per matrix instead
+    of `g` module calls — the difference between 4 900 dispatches and ~40 per bank call.
+
+    `mix` is the `d → K` gate as `([group, d, K]`, `[group, K])` — the module's weight
+    transposed, because the read is `x·Wᵀ` — and `coef` is the `[group, K]` priors; both
+    are `None` on the arms that have none. Nothing here checks a row's expert id: a
+    group's rows are already contiguous and the caller masks padding.
+    """
+
+    gate: Matrix
+    up: Matrix
+    down: Matrix
+    mix: tuple[torch.Tensor, torch.Tensor] | None = None
+    coef: torch.Tensor | None = None
+
+
+def _apply(matrix: Matrix, x: torch.Tensor) -> torch.Tensor:
+    """`x [..., in] · matrix` — one `matmul` dense, two through the rank-`r` factors."""
+    a, b = matrix
+    return x @ a if b is None else (x @ a) @ b
+
+
+def stack_matrices(matrices: Sequence[nn.Linear | FactorLinear]) -> Matrix:
+    """Stack one matrix of a group of experts into the batched read's form.
+
+    `g` factors `[d, r]`/`[r, f]` become one `[g, d, r]`/`[g, r, f]` batch; `g` dense
+    weights `[f, d]` become one `[g, d, f]` batch (transposed, because the read is
+    `x·Wᵀ`). The stack is a COPY of that group's parameters, made once per bank call:
+    at the live bank the whole 342.9M-parameter routed set is ~3 ms of copy, against the
+    20 s a step spent on kernel launches.
+    """
+    if isinstance(matrices[0], FactorLinear):
+        factors = cast("Sequence[FactorLinear]", matrices)
+        return torch.stack([m.u for m in factors]), torch.stack([m.v for m in factors])
+    dense = cast("Sequence[nn.Linear]", matrices)
+    return torch.stack([m.weight for m in dense]).transpose(1, 2), None
+
+
+def _batched(value: torch.Tensor | None, what: str) -> torch.Tensor:
+    """Return a `Stacked` field an arm needs; a missing one is a construction bug."""
+    if value is None:
+        raise LoudError(
+            f"the batched read of a mixture needs its {what}",
+            "build the group's `Stacked` through `MoEFFN._stacked`, which takes it from "
+            "the arms themselves",
+        )
+    return value
 
 
 def neutral_width(d_ffn_gelu: int) -> int:
@@ -258,9 +317,55 @@ class _Glu(nn.Module):
             "a _Glu subclass implements _write: the three matrices are its bill, not its behaviour",
         )
 
+    # ------------------------------------------------------------ the batched read
+    def batch_write(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`x [group, rows, d_model]` → the same shape: `group` experts in one read.
+
+        The dispatch's layout, not a second arithmetic: `_write` runs one expert's rows
+        through three matrices, this runs `group` experts' rows through the same three as
+        a 3-D batch (`Stacked`), and `_hidden` is the mixture each arm below already has.
+
+        THE MIXTURE RUNS ON FLAT ROWS. Between the reads the three matmuls' `[group, rows,
+        ·]` slabs are VIEWED as `[group·rows, ·]` (`the same bytes, one dimension`), so
+        `_accumulate` chunks the mixture at `MIX_CHUNK_ROWS` rows however many experts the
+        slab holds — the padded path's transient is then the arm's own slice bound and not
+        `group·capacity` slabs of `d_ffn`. That is 50 MiB at the live width instead of
+        380 MiB at b8's capacity.
+        """
+        g = _apply(stacked.gate, x)
+        u = _apply(stacked.up, x)
+        weights = self.batch_weights(stacked, x)
+        rows = x.shape[0] * x.shape[1]
+        h = self._hidden(
+            weights.reshape(rows, -1) if weights is not None else None,
+            g.reshape(rows, -1),
+            u.reshape(rows, -1),
+        )
+        return _apply(stacked.down, h.reshape(x.shape[0], -1, h.shape[-1]))
+
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor | None:
+        """Return `[group, rows, K]` per-token mixture weights, or `None` if there are none."""
+        return None
+
+    def _hidden(
+        self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the arm's mixture on `[group·rows, d_ffn]`: the batched twin of `_write`."""
+        raise NotImplementedError(
+            "a _Glu subclass implements _hidden: the batched twin of its _write",
+        )
+
     def _count(self, x: torch.Tensor, counters: Counters) -> None:
         """Report this call: `ffn_fwd` per row and `tsct_fwd` per factorised matrix."""
-        rows = x.numel() // self.d_model
+        self.count_read(x.numel() // self.d_model, counters)
+
+    def count_read(self, rows: int, counters: Counters) -> None:
+        """Report `rows` rows of this arm's read, however many modules ran them.
+
+        The bank's dispatch reads a whole expert group in one batched call, so the rows it
+        read are not the rows of one `forward` — the count belongs to the arm (its bill,
+        its factors) and not to the call site that happened to run it.
+        """
         counters.count("ffn_fwd", rows)
         if self._factorised:
             counters.count("tsct_fwd", rows * self._factorised)
@@ -307,6 +412,10 @@ class GatedFFN(_Glu):
         h = self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
         return self._read(self.down, h)
 
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`act(g) · act?(u)` on `[rows, d_ffn]`."""
+        return self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
+
     def extra_repr(self) -> str:
         """Show the shape the parameter bill is quoted for."""
         return f"d_model={self.d_model}, d_ffn={self.d_ffn}, act={self.act}, sides={self.sides}"
@@ -349,11 +458,19 @@ class LaFFN(_Glu):
         h = self._mix(self._read(self.gate, x)) * self._read(self.up, x)
         return self._read(self.down, h)
 
-    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`cₖ` on a group: the same prior for every row, `[group, rows, K]`."""
+        coef = _batched(stacked.coef, "dictionary coefficients")
+        return coef.unsqueeze(1).expand(x.shape[0], x.shape[1], -1)
+
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`Σ cₖ·fₖ(gate) * up` on `[rows, d_ffn]`."""
+        return _accumulate(_batched(w, "dictionary coefficients"), g, self._fns) * u
+
+    def count_read(self, rows: int, counters: Counters) -> None:
         """Add the mixture's own two counters to the base read's."""
-        super()._count(x, counters)
-        tokens = x.numel() // self.d_model
-        counters.count("ffn_la", tokens)
+        super().count_read(rows, counters)
+        counters.count("ffn_la", rows)
         counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:
@@ -437,11 +554,30 @@ class MoaFFN(_Glu):
         h = self._mix(w, g) * (self._mix(w, u) if self.sides == "bi" else u)
         return self._read(self.down, h)
 
-    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`A(x,g) · A(x,u)?` on `[rows, d_ffn]`."""
+        weights = _batched(w, "per-token mixture weights")
+        return _accumulate(weights, g, self._fns) * (
+            _accumulate(weights, u, self._fns) if self.sides == "bi" else u
+        )
+
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`_weights` on a group: `[group, rows, K]`, normalised by the token's own sum."""
+        if stacked.mix is None:
+            raise LoudError(
+                "a MoA expert's batched read has no `d → K` gate",
+                "build the group's `Stacked` through `MoEFFN._stacked`, which takes it "
+                "from the arms themselves",
+            )
+        mix, bias = stacked.mix
+        coef = _batched(stacked.coef, "dictionary coefficients").unsqueeze(1)
+        w = torch.sigmoid(x @ mix + bias.unsqueeze(1)) * coef
+        return w / w.sum(-1, keepdim=True)
+
+    def count_read(self, rows: int, counters: Counters) -> None:
         """Add the mixture's own counters to the base read's."""
-        super()._count(x, counters)
-        tokens = x.numel() // self.d_model
-        counters.count("moa_fwd", tokens)
+        super().count_read(rows, counters)
+        counters.count("moa_fwd", rows)
         counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:
