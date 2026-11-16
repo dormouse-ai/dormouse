@@ -353,7 +353,9 @@ class DSA(LatentProjections):
             slab = (q[:, start : start + chunk], at[:, start : start + chunk])
             rows = (key, value, *slab, visible[:, start : start + chunk])
             if torch.is_grad_enabled():
-                parts.append(checkpoint(self._gathered, *rows, use_reentrant=False))
+                parts.append(
+                    checkpoint(self._gathered, *rows, use_reentrant=False, preserve_rng_state=False)
+                )
             else:
                 parts.append(self._gathered(*rows))
         out = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]

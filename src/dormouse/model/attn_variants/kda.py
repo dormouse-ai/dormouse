@@ -311,7 +311,12 @@ class KDA(LatentProjections):
             gates = (alpha[..., window, :], beta[..., window].unsqueeze(-1))
             if keep:
                 carried_out, state = checkpoint(
-                    self._chunk, *rows, *gates, *masks, use_reentrant=False
+                    self._chunk,
+                    *rows,
+                    *gates,
+                    *masks,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
                 )
             else:
                 carried_out, state = self._chunk(*rows, *gates, *masks)

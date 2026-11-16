@@ -358,7 +358,14 @@ class MoEFFN(nn.Module):
             arms = self._arms(start, stop)
             slab = bank[span].view(stop - start, capacity, x.shape[1])
             written = (
-                checkpoint(_group_write, self, arms, slab, use_reentrant=False)
+                checkpoint(
+                    _group_write,
+                    self,
+                    arms,
+                    slab,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
                 if torch.is_grad_enabled() and slab.requires_grad
                 else _group_write(self, arms, slab)
             )

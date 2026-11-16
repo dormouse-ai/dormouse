@@ -266,9 +266,11 @@ def _mix_rows(
     fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
 ) -> torch.Tensor:
     """One chunk's mixture: the accumulation `_accumulate` splits the rows into."""
-    out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False)
+    out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False, preserve_rng_state=False)
     for k in range(1, len(fns)):
-        part = checkpoint(_entry, fns[k], w[..., k : k + 1], z, use_reentrant=False)
+        part = checkpoint(
+            _entry, fns[k], w[..., k : k + 1], z, use_reentrant=False, preserve_rng_state=False
+        )
         out = out + part
     return out
 
@@ -350,7 +352,7 @@ class _Glu(nn.Module):
         """One slice's write, recomputed in the backward when the forward has a graph."""
         if not (torch.is_grad_enabled() and x.requires_grad):
             return self._write(x)
-        return checkpoint(self._write, x, use_reentrant=False)
+        return checkpoint(self._write, x, use_reentrant=False, preserve_rng_state=False)
 
     def _write(self, x: torch.Tensor) -> torch.Tensor:
         """One slice's arithmetic: what each arm below implements."""
