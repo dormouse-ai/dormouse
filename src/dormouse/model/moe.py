@@ -62,17 +62,18 @@ transient is bounded by an expert group's slab and never by `E·capacity·f` —
 2.0 bank the old docstring refused, 1.38 GiB at b24 in fp32. At b8 in fp32 the group is
 32 experts (2 groups per call), at b16 17 (4), and the slab in flight is ~250 MiB.
 
-ONE HOST READ REMAINS IN EAGER, NONE IN CAPTURE. `capacity` comes from the batch's
-shape and costs nothing; the passes a dropless dispatch needs is a function of the
-routing's own histogram. The eager forward reads `counts.max()` once to size its
-Python loop — one device→host sync, a hard error inside a CUDA graph. So `StepGraph`
-sets `fixed_passes`: the loop runs `MAX_DISPATCH_PASSES` times with the same write
-mask, and a pass that owns no rows contributes an exact zero (the masked gather is
-zeroed and multiplied by `keep=False`). Every row is still owned by one slot, so the
-fixed loop is bit-identical to the eager one for every routing the eager path
+NO HOST READ IN THE FUSED PATH, NONE IN CAPTURE. `capacity` comes from the batch's
+shape and costs nothing. The fused path runs the fixed `MAX_DISPATCH_PASSES` grid by
+default: the loop runs that many times with the same write mask, and a pass that owns
+no rows contributes an exact zero (its slots are trash and multiplied by
+`keep=False`). Every row is still owned by one slot, so the fixed loop is
+bit-identical to the data-dependent one for every routing the data-dependent path
 accepts. A routing wider than the fixed slots cannot raise inside the graph; it sets
-`overflow` on device, and the eager half after the replay refuses the step. No host
-value decides control flow inside the capture and no row is dropped silently.
+`overflow` on device, and the eager half after the replay refuses the step. The
+anchor (dense control, CPU) still reads `counts.max()` once to size its loop — it
+never runs inside a graph. `fixed_passes` forces the static grid onto the anchor as
+well; `moe_static_passes` reports the slots the static grid ran, so a flag without
+the counter is a MissingReport.
 
 COUNTERS (a zero must be a measurement, not a default):
 
@@ -80,6 +81,9 @@ COUNTERS (a zero must be a measurement, not a default):
 * `moe_rows_run` — routed expert rows executed, must be `n_tokens · topk`;
 * `moe_dispatch_passes` — dispatch passes this forward needed: 1 for a balanced routing,
   more when one expert's group is wider than a slot (`_passes`);
+* `moe_static_passes` — slots the static grid executed: `MAX_DISPATCH_PASSES` on the
+  fused path, or the forced `fixed_passes` on the anchor; zero on the data-dependent
+  path, where this counter is not enabled;
 * `moe_dropped` - `routed - executed`, counted even when 0 so a run that never
   drops proves it measured (the key is in `snapshot()`; `Counters.line()` prints
   non-zero values only, so a zero is read from the snapshot, not from the log);
@@ -221,12 +225,12 @@ def _fused_group(
     counts: torch.Tensor,
     capacity: int,
 ) -> torch.Tensor:
-    """One expert group through the fused chain: the kernel path's recompute boundary.
+    """One expert group through the fused chain: no per-group recompute boundary.
 
-    `checkpoint` for the same reason `_group_write` has one: the `Stacked` copy of the
-    group's factors is `3·(d·r + r·f)·group` parameters (~54 MiB at the live group) and
-    retaining it for every layer's backward is 4.5 GiB. The recomputed region is the
-    stack and the chain; the `[rows, r]` scratches the chain saves are one group's.
+    The `Stacked` copy of the group's factors is `3·(d·r + r·f)·group` parameters and
+    retaining it for every layer's backward is GiBs. It is still recomputed, but by
+    the ONE checkpoint around the whole dispatch (`_dispatch.run`) rather than a
+    boundary per group: the saved set is the same, the count of regions is not.
     """
     first = arms[0]
     kinds = first._kinds
@@ -237,17 +241,9 @@ def _fused_group(
             "dictionary it does not",
         )
     sides = cast("MoaFFN", first).sides
-
-    def run(  # pragma: no cover - launches the kernels
-        group: list[_Glu], rows: torch.Tensor
-    ) -> torch.Tensor:
-        return fused_bank.bank(
-            rows, tok, counts, capacity, bank._stacked(group), kinds=kinds, sides=sides
-        )
-
-    if torch.is_grad_enabled() and x.requires_grad:  # pragma: no cover - launches
-        return checkpoint(run, arms, x, use_reentrant=False, preserve_rng_state=False)
-    return run(arms, x)  # pragma: no cover - launches
+    return fused_bank.bank(  # pragma: no cover - launches the kernels
+        x, tok, counts, capacity, bank._stacked(arms), kinds=kinds, sides=sides
+    )
 
 
 class MoEFFN(nn.Module):
@@ -418,6 +414,11 @@ class MoEFFN(nn.Module):
         (p+1)·capacity)`; the rest of the bank is padding, which is masked out of the write.
         Every routed row is owned by exactly one pass and lands in exactly one slot, so the
         sum is the unconstrained fan-out's, dropless, at whatever skew the router produces.
+
+        The fused grid is STATIC: `MAX_DISPATCH_PASSES` passes whether or not the routing
+        needs them, narrow slots producing exact zeros. The whole pass/group loop is ONE
+        checkpoint region, so a recompute drops every group's `Stacked` copy and wide slab
+        at once instead of buying a boundary per group.
         """
         n, k = index.shape
         routed = n * k
@@ -430,12 +431,9 @@ class MoEFFN(nn.Module):
         #: of rows the experts before it took. Device-only, like everything below.
         starts = counts.cumsum(0) - counts
         local = torch.arange(routed, device=x.device) - starts.index_select(0, expert)
-        passes = (
-            self.fixed_passes
-            if self.fixed_passes is not None
-            else self._passes(counts, capacity, routed)
-        )
-        if self.fixed_passes is not None:
+        fused = self._fused_ready(x)
+        passes, static = self._pass_plan(counts, capacity, routed, fused)
+        if static:
             #: The graph cannot raise, so record overflow on device; the eager half after
             #: the replay reads the flag and refuses. No `.item()` lives inside the capture.
             over: torch.Tensor = (local >= passes * capacity).any()
@@ -446,49 +444,56 @@ class MoEFFN(nn.Module):
         #: another pass share theirs, so the layout is built with an accumulate — into a
         #: row nobody reads, which is what keeps the cost one write and no second sync.
         trash = pad
-        fused = self._fused_ready(x)
         group = self.group(capacity, x.element_size())
         launches = fused_bank.bank_launches()
-        y = torch.zeros_like(x)
-        for current in range(passes):
-            span_local = local - current * capacity
-            keep = (span_local >= 0) & (span_local < capacity)
-            slot = torch.where(keep, expert * capacity + span_local, trash)
-            if fused:  # pragma: no cover - the fused branch needs a device
-                #: The slot -> row index map the kernel reads. The `[E·capacity, d]` gather
-                #: is what the fused chain does not build: `tok` is `[pad]` int32.
-                tok = torch.zeros(pad + 1, dtype=torch.int32, device=x.device)
-                tok.index_copy_(0, slot, tokens.to(torch.int32))
-                bank = x.new_zeros((0, x.shape[1]))
-            else:
-                bank = x.new_zeros((pad + 1, x.shape[1]))
-                bank.index_add_(0, slot, x.index_select(0, tokens))
-            out = x.new_empty((pad + 1, x.shape[1]))
-            for start in range(0, self.n_experts, group):
-                stop = min(start + group, self.n_experts)
-                span = slice(start * capacity, stop * capacity)
-                arms = self._arms(start, stop)
+
+        def run(
+            x: torch.Tensor,
+            tokens: torch.Tensor,
+            gates: torch.Tensor,
+            expert: torch.Tensor,
+            local: torch.Tensor,
+            counts: torch.Tensor,
+        ) -> torch.Tensor:
+            y = torch.zeros_like(x)
+            for current in range(passes):
+                span_local = local - current * capacity
+                keep = (span_local >= 0) & (span_local < capacity)
+                slot = torch.where(keep, expert * capacity + span_local, trash)
                 if fused:  # pragma: no cover - the fused branch needs a device
-                    live = (counts[start:stop] - current * capacity).clamp(0, capacity)
-                    written = _fused_group(self, arms, x, tok[span], live, capacity)
+                    #: The slot -> row index map the kernel reads. The `[E·capacity, d]` gather
+                    #: is what the fused chain does not build: `tok` is `[pad]` int32.
+                    tok = torch.zeros(pad + 1, dtype=torch.int32, device=x.device)
+                    tok.index_copy_(0, slot, tokens.to(torch.int32))
+                    bank = x.new_zeros((0, x.shape[1]))
                 else:
-                    slab = bank[span].view(stop - start, capacity, x.shape[1])
-                    written = (
-                        checkpoint(
-                            _group_write,
-                            self,
-                            arms,
-                            slab,
-                            use_reentrant=False,
-                            preserve_rng_state=False,
-                        )
-                        if torch.is_grad_enabled() and slab.requires_grad
-                        else _group_write(self, arms, slab)
-                    )
-                out[span] = written.view(-1, x.shape[1])
-            out[trash].zero_()
-            y.index_add_(0, tokens, out.index_select(0, slot) * (gates * keep).unsqueeze(1))
+                    bank = x.new_zeros((pad + 1, x.shape[1]))
+                    bank.index_add_(0, slot, x.index_select(0, tokens))
+                out = x.new_empty((pad + 1, x.shape[1]))
+                for start in range(0, self.n_experts, group):
+                    stop = min(start + group, self.n_experts)
+                    span = slice(start * capacity, stop * capacity)
+                    arms = self._arms(start, stop)
+                    if fused:  # pragma: no cover - the fused branch needs a device
+                        live = (counts[start:stop] - current * capacity).clamp(0, capacity)
+                        written = _fused_group(self, arms, x, tok[span], live, capacity)
+                    else:
+                        slab = bank[span].view(stop - start, capacity, x.shape[1])
+                        written = _group_write(self, arms, slab)
+                    out[span] = written.view(-1, x.shape[1])
+                out[trash].zero_()
+                y.index_add_(0, tokens, out.index_select(0, slot) * (gates * keep).unsqueeze(1))
+            return y
+
+        args = (x, tokens, gates, expert, local, counts)
+        y = (
+            checkpoint(run, *args, use_reentrant=False, preserve_rng_state=False)
+            if torch.is_grad_enabled() and (x.requires_grad or gates.requires_grad)
+            else run(*args)
+        )
         if counters is not None:
+            if static:
+                counters.count("moe_static_passes", passes)
             counters.count("moe_rows_run", routed)
             counters.count("moe_experts_used", self.n_experts)
             counters.count("moe_bank_builds", passes * math.ceil(self.n_experts / group))
@@ -554,6 +559,20 @@ class MoEFFN(nn.Module):
             coef=coef,
         )
 
+    def _pass_plan(
+        self, counts: torch.Tensor, capacity: int, routed: int, fused: bool
+    ) -> tuple[int, bool]:
+        """Return `(passes, static)`: the fixed grid's bound or the anchor's host read.
+
+        The fused path never reads the histogram — a fixed grid and the device overflow
+        flag are the whole answer. The anchor may read because it never runs in a graph.
+        """
+        if self.fixed_passes is not None:
+            return self.fixed_passes, True
+        if fused:
+            return MAX_DISPATCH_PASSES, True
+        return self._passes(counts, capacity, routed), False
+
     def _passes(self, counts: torch.Tensor, capacity: int, routed: int) -> int:
         """Return the dispatch passes this routing needs, refusing a collapsed router.
 
@@ -602,6 +621,14 @@ class MoEFFN(nn.Module):
             counter="moe_dispatch_passes",
             why="the dispatch counted its passes",
         )
+        if self.fixed_passes is not None or self._fused_ready(x):
+            #: The static grid is a mechanism the same way QB is: enabled here, counted in
+            #: `_dispatch`, and a zero at step end is a MissingReport rather than silence.
+            counters.enable(
+                "moe_static",
+                counter="moe_static_passes",
+                why="the static pass grid ran without a device read",
+            )
         if self.expert_tsct_rank > 0 and fused_bank.bank_enabled() and x.is_cuda:
             #: A flag-on forward that reports no fused launch is the defect `bank_ops`
             #: exists for: the anchor would otherwise run under the kernel's name.
