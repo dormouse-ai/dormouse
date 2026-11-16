@@ -131,17 +131,43 @@ def profile(fn, steps: int) -> tuple[float, int, int]:
     return ms, launches // steps, casts // steps
 
 
-def kernel_stats() -> dict[str, tuple[int, int]]:
-    """Return `{kernel: (registers per thread, spill bytes)}` for every compiled kernel."""
-    out: dict[str, tuple[int, int]] = {}
+def kernel_stats() -> dict[str, tuple[int, int, int]]:
+    """Return `{kernel: (registers per thread, spill bytes, shared bytes)}` per compiled kernel."""
+    out: dict[str, tuple[int, int, int]] = {}
     for name in ("prep", "fwd", "bwd_rows", "bwd_cols"):
         fn = kb._KERNELS.get(name)
         if fn is None:
             continue
         for cache in getattr(fn, "device_caches", {}).values():
             for compiled in cache[0].values():
-                out[name] = (compiled.n_regs, compiled.n_spills)
+                out[name] = (compiled.n_regs, compiled.n_spills, int(compiled.metadata.shared))
     return out
+
+
+#: sm_120's per-SM limits, which is what the occupancy column is the minimum of. The card
+#: has 48 warp slots and 100 KiB of shared memory per SM, and one block more than the
+#: register file holds cannot be resident.
+REGS_PER_SM = 65536
+SMEM_PER_SM = 100 * 1024
+WARPS_PER_SM = 48
+
+
+def occupancy(regs: int, spills: int, smem: int) -> str:
+    """Return the resident blocks per SM and the percentage of warp slots they fill.
+
+    THE LIMIT, NOT AN ACHIEVED COUNT. This host has no Nsight Compute and no CUPTI
+    occupancy counter, so what is reported is the arithmetic the launch's own register and
+    shared-memory allocation allows — the ceiling an achieved number would sit under. The
+    measured throughput beside it (bytes counted over the measured milliseconds) is what
+    says whether that ceiling is the thing costing time.
+    """
+    by_regs = REGS_PER_SM // max(1, regs * 32 * kb.WARPS)
+    by_smem = SMEM_PER_SM // max(1, smem)
+    by_warps = WARPS_PER_SM // kb.WARPS
+    limits = {"registers": by_regs, "shared": by_smem, "warps": by_warps}
+    bound = min(limits, key=lambda name: limits[name])
+    blocks = max(1, limits[bound])
+    return f"{blocks} blk/SM ({100 * blocks * kb.WARPS / WARPS_PER_SM:.0f}% warps, {bound}-bound)"
 
 
 def main() -> int:
@@ -253,9 +279,12 @@ def main() -> int:
 
     stats = kernel_stats()
     if stats:
-        print("\nkernel registers (spills are the refused outcome this prints instead of hiding):")
-        for name, (regs, spills) in stats.items():
-            print(f"  {name:9} n_regs={regs:3d} n_spills={spills:4d} bytes")
+        print("\nkernel registers, shared memory and the occupancy they allow:")
+        for name, (regs, spills, smem) in stats.items():
+            print(
+                f"  {name:9} n_regs={regs:3d} n_spills={spills:4d} bytes "
+                f"smem={smem // 1024:3d} KiB  {occupancy(regs, spills, smem)}"
+            )
     return 0
 
 
