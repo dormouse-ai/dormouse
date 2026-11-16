@@ -34,6 +34,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from ..model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from .optim import MixOptimizer
 from .step import CHUNK_TOKENS, CLIP, PreStep, StepResult, chunked_cross_entropy
 
@@ -41,8 +42,10 @@ __all__ = ["StepGraph"]
 
 #: Headroom a capture keeps free beside its private pool. The allocator's fragmentation
 #: and the graph's own bookkeeping are in no count this module can take, and being wrong
-#: costs an OOM inside someone else's kernel.
+#: costs an OOM inside someone else's kernel. The project's rule is the larger of this floor
+#: and 8% of VRAM; refuse below it rather than faulting inside capture.
 MARGIN_BYTES = 384 * 1024 * 1024
+POOL_FRACTION = 0.08
 
 #: Warm-up iterations before a capture: every kernel compiled, every lazy buffer grown, so
 #: the graph's private pool is the step's steady state and not a first-call high-water mark.
@@ -79,6 +82,12 @@ class StepGraph:
         self.model = model
         self.optimizer = optimizer
         self.accum = accum
+        #: A captured forward cannot size its pass loop from `counts.max()`. Switch every
+        #: bank to the fixed, masked loop before warm-up and capture; the eager path keeps
+        #: its data-dependent count. Stored so the eager half can read the overflow flag.
+        self._banks = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        for bank in self._banks:
+            bank.fixed_passes = MAX_DISPATCH_PASSES
         self.rows = ids.shape[0]
         self.seq = ids.shape[1] - 1
         self.ids = ids.clone()
@@ -118,11 +127,12 @@ class StepGraph:
 
     def _capture(self) -> None:
         """Capture `_body` into a graph, naming the op that stopped it."""
-        free, _total = torch.cuda.mem_get_info()
-        if free < MARGIN_BYTES:
+        free, total = torch.cuda.mem_get_info()
+        needed = max(MARGIN_BYTES, int(POOL_FRACTION * total))
+        if free < needed:
             raise LoudError(
-                f"a step graph needs {MARGIN_BYTES / 2**20:.0f} MiB of headroom, "
-                f"{free / 2**20:.0f} MiB is free",
+                f"a step graph needs max(384 MiB, 8% VRAM)={needed / 2**20:.0f} MiB of "
+                f"headroom, {free / 2**20:.0f} MiB is free",
                 "free the card before capturing; the pool is allocated beside the live "
                 "tensors, and an OOM inside the allocator names the wrong op",
             )
@@ -181,6 +191,15 @@ class StepGraph:
     ) -> StepResult:
         """One optimizer step: the replay, then the eager half `train_step` documents."""
         self.replay(ids, counters=counters)
+        for bank in getattr(self, "_banks", ()):
+            if bank.overflowed():
+                raise LoudError(
+                    f"the replayed routing needed more than {MAX_DISPATCH_PASSES} dispatch "
+                    "passes: the router has collapsed",
+                    "the captured loop is fixed at MAX_DISPATCH_PASSES and cannot raise on "
+                    "device; this is the same refusal the eager path makes on counts.max(), "
+                    "checked here because the host read sits outside the capture",
+                )
         loss = self.loss()
         if not math.isfinite(loss):
             self.optimizer.zero_grad(set_to_none=False)

@@ -15,10 +15,11 @@ Three claims, each one a number:
   accumulated it;
 * **skew** — 80% of the rows on one expert is a SECOND pass, not a refusal: the write and
   every expert's gradient are still the loop's, and `moe_dispatch_passes` says 2;
-* **one host read** — the pass count is `ceil(largest group / capacity)`, read once from
-  the histogram on the card (a Python loop cannot be sized by a device value). The
-  forward is therefore not CUDA-graph capturable any more, and the test that used to
-  assert it says so instead of asserting a property the dispatch no longer has.
+* **one host read in eager, none in capture** — the eager pass count is
+  `ceil(largest group / capacity)`, read once from the device histogram; a captured
+  forward instead runs a fixed `MAX_DISPATCH_PASSES` loop with the same write mask
+  (extra passes add exact zeros) and a device overflow flag the eager half checks.
+  Both paths are held to the same write and the same gradients below.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from dormouse_core.counters import Counters
 from torch import nn
 
 from dormouse.model.assemble import assemble
-from dormouse.model.moe import MoEFFN
+from dormouse.model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from dormouse.model.spec import StackSpec
 
 D, F, E, K = 16, 12, 4, 2
@@ -334,3 +335,54 @@ def test_the_forward_reads_the_histogram_once() -> None:
         torch.cuda.set_sync_debug_mode("default")
     syncs = [str(w.message) for w in caught if "synchronizing" in str(w.message)]
     assert len(syncs) == 1, syncs
+
+
+# --- capture: fixed passes, masked, no host read ----------------------------
+
+
+def test_fixed_passes_are_bit_identical_to_the_data_dependent_dispatch() -> None:
+    """The captured loop's extra passes add exact zeros: same write, same gradients."""
+    torch.manual_seed(11)
+    eager = _bank(qb=False, n_shared=0, topk=1)
+    fixed = _bank(qb=False, n_shared=0, topk=1)
+    fixed.load_state_dict(eager.state_dict())
+    eager.eval()
+    fixed.eval()
+    x, index, weight = _skewed()
+    counts = eager.router.count(index)
+
+    got = eager._dispatch(x, index, weight, counts)
+    fixed.fixed_passes = MAX_DISPATCH_PASSES
+    want = fixed._dispatch(x, index, weight, counts)
+    assert torch.equal(got, want), "the masked extra passes must add exact zeros"
+    assert not fixed.overflowed(), "the skew fixture fits inside the fixed slots"
+
+    target = torch.randn_like(got)
+    (got - target).square().mean().backward()
+    (want - target).square().mean().backward()
+    for (name, mine), (_, theirs) in zip(
+        eager.named_parameters(), fixed.named_parameters(), strict=True
+    ):
+        if mine.grad is None or theirs.grad is None:
+            assert mine.grad is None and theirs.grad is None, name
+            continue
+        assert torch.equal(mine.grad, theirs.grad), f"gradient diverged at {name}"
+
+
+def test_fixed_passes_set_the_overflow_flag_on_device() -> None:
+    """A routing past the fixed slots sets a device flag instead of syncing to raise."""
+    torch.manual_seed(12)
+    bank = _bank(
+        qb=False, n_shared=0, topk=1, n_experts=16, capacity_ratio=0.25, dispatch_sigma=0.0
+    )
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    x = torch.randn(100, D)
+    weight = torch.ones(100, 1)
+
+    collapsed = torch.zeros(100, 1, dtype=torch.long)
+    bank._dispatch(x, collapsed, weight, bank.router.count(collapsed))
+    assert bank.overflowed(), "all rows on one expert past four slots must be flagged"
+
+    balanced = torch.arange(100).reshape(-1, 1) % 16
+    bank._dispatch(x, balanced, weight, bank.router.count(balanced))
+    assert not bank.overflowed(), "the flag is reset by the next dispatch"
