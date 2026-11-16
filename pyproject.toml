@@ -59,6 +59,9 @@ ignore = ["D203", "D213", "N818"]
 # `kernels/bank.py`'s docstring is the tile arithmetic of the fused chain; `×`, `σ`,
 # `α` and `−` there are notation, not typos in prose, exactly as in `train/*`.
 "src/dormouse/kernels/bank.py" = ["RUF002", "RUF003"]
+# `kda.py`'s docstring is the chunk algebra of eq. 2-9: `α`, `β`, `Γ`, `Σ`, `⊙` and `ᵀ`
+# there are the paper's notation, which is the point of writing the derivation down.
+"src/dormouse/model/attn_variants/kda.py" = ["RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"
