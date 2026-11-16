@@ -150,9 +150,9 @@ def _mixture(recipe: RunRecipe) -> Mixture:
     """Open the mixture and the byte ratio the loop's accounting divides by."""
     expected = ""
     if recipe.spec.tokenizer:
-        from ..data.tokenizer import load, sha
+        from ..data.tokenizer import sha_file
 
-        expected = sha(load(recipe.spec.tokenizer))
+        expected = sha_file(recipe.spec.tokenizer)
     mix = MixtureStream(
         recipe.sources, stages=recipe.stages, seed=recipe.seed, tokenizer_sha=expected
     )

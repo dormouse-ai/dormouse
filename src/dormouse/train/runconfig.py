@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, cast
@@ -39,7 +40,7 @@ from ..data.mix import Stage as MixStage
 from ..model.spec import StackSpec
 from .recipe import LoopConfig, Stage
 
-__all__ = ["RUN_KEYS", "RunRecipe", "changed", "fresh", "refuse_drift"]
+__all__ = ["RUN_KEYS", "RunRecipe", "changed", "check_tokenizer", "fresh", "refuse_drift"]
 
 #: The keys a run adds to the stack spec. Anything else in the file is a typo, by name.
 RUN_KEYS = frozenset(
@@ -58,6 +59,40 @@ RUN_KEYS = frozenset(
         "seed",
     }
 )
+
+
+def check_tokenizer(spec: StackSpec, sources: Sequence[Source], config: Path) -> None:
+    """Refuse at config load — before any model is allocated — a tokenizer that disagrees.
+
+    The token table and every data manifest must answer to one tokenizer file. The
+    vocabulary is checked first (`cfg.vocab` against the tokenizer's real size), then
+    each source's manifest hash against the file's. Both numbers are printed: a refusal
+    that only says "mismatch" costs an hour to diagnose.
+    """
+    if spec.unit != "bpe":
+        return
+    from ..data.bin import Manifest
+    from ..data.tokenizer import check_vocab, load, sha_file
+
+    if not spec.tokenizer:
+        raise LoudError(
+            f"{config}: unit=bpe names no tokenizer",
+            'set tokenizer = "tokenizer32k.json": the token table and every data '
+            "manifest must answer to one tokenizer, and a run that cannot name it "
+            "has no way to read its own ids back",
+        )
+    token_path = spec.tokenizer
+    check_vocab(load(token_path), spec.vocab)
+    expected = sha_file(token_path)
+    for source in sources:
+        actual = Manifest.read(Path(source.path)).tokenizer_sha
+        if actual != expected:
+            raise LoudError(
+                f"{source.path}: the data's tokenizer is {actual or '(none)'}, "
+                f"the run's {token_path} is {expected}",
+                "tokenize the corpus with this run's tokenizer, or point the config at "
+                "the tokenizer the data was written with; ids from two vocabularies are noise",
+            )
 
 
 @dataclass(frozen=True)
@@ -110,6 +145,7 @@ class RunRecipe:
         )
         stages = cls._stages(raw.get("stage", ()), source)
         sources = cls._sources(raw.get("source", ()), source)
+        check_tokenizer(spec, sources, source)
         if not stages:
             names = list(dict.fromkeys(item.stage for item in sources))
             if len(names) > 1:

@@ -2,12 +2,12 @@
 
 Four numbers decided this module, and each one is a refusal rather than a preference:
 
-* VOCABULARY SIZE. 32 000, and this module is the only place the number lives: the
+* VOCABULARY SIZE. 32 768, and this module is the only place the number lives: the
   model's `vocab` is read from `DEFAULT_VOCAB` and `check_vocab` refuses a tokenizer
   and a model that disagree. MEASURED on our own mixture, 48 000 buys nothing:
   fertility (bytes/token) is 4.423 / 4.418 / 3.433 / 3.518 at 48K for en / ru / math /
   code against 4.395 / 4.337 / 3.424 / 3.505 at 32K — 0.8 % fewer tokens, which the head
-  eats many times over. The head's cost is `2·V·d` MAC: 26.6M at 32K against 40.0M at
+  eats many times over. The head's cost is `2·V·d` MAC: 27.3M at 32K against 40.0M at
   48K, +80 MFLOP/token of training, about 5 % of the whole step, for that 0.8 %. The
   published 43K result is at 3B parameters and 100B tokens and does not transfer: at
   that size the curve is a capacity statement, not a tokenizer one.
@@ -61,6 +61,7 @@ __all__ = [
     "round_trip",
     "save",
     "sha",
+    "sha_file",
     "tokenize",
     "train",
     "write_manifest",
@@ -69,7 +70,7 @@ __all__ = [
 #: The default vocabulary: 32K, where fertility stops paying for the head on our mix
 #: (the module docstring holds the measurement). Everything that needs the number reads
 #: this constant — a literal `32768` or `48000` under `model/` is a second answer.
-DEFAULT_VOCAB = 32_000
+DEFAULT_VOCAB = 32_768
 
 #: The exact alphabet, 256 bytes of it, always in the vocabulary — that is the fallback.
 BYTE_ALPHABET = 256
@@ -158,7 +159,7 @@ def train(
     that shortfall into a refusal where it matters — at the model's token table. A
     2.5 MB sample reaches ~35 000 ids when asked for 48 000; a 100 GB corpus does not.
 
-    The specials are part of that count, not on top of it: `vocab_size=32_000` is 32 000
+    The specials are part of that count, not on top of it: `vocab_size=32_768` is 32 768
     ids *including* `SPECIALS`, which is why `check_specials` runs here — a vocabulary
     that reordered them, or a corpus dense enough to teach BPE the merge that spells
     `<|end|>` from ordinary text, is refused before it is written next to a manifest.
@@ -330,6 +331,16 @@ def sha(tok: Tokenizer) -> str:
     return hashlib.sha256(tok.to_str().encode("utf-8")).hexdigest()
 
 
+def sha_file(path: str | Path) -> str:
+    """Return the identity a data manifest records: sha256 of the tokenizer FILE's bytes.
+
+    Sixteen hex characters, of the raw file — not `tok.to_str()`, which a load/save
+    round can reformat. This is the digest the corpus builder writes into every
+    manifest, so it is the one a run must compare against.
+    """
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
 def save(tok: Tokenizer, path: str | Path) -> Path:
     """Write the tokenizer as one JSON file a run can reload and hash."""
     out = Path(path)
@@ -349,18 +360,22 @@ def load(path: str | Path) -> Tokenizer:
     return Tokenizer.from_file(str(source))
 
 
-def write_manifest(path: str | Path, *, tokens: int, tok: Tokenizer, dtype: str = "uint16") -> Path:
-    """Write the manifest beside a token stream, with the tokenizer's hash in it.
+def write_manifest(
+    path: str | Path, *, tokens: int, tokenizer_path: str | Path, dtype: str = "uint16"
+) -> Path:
+    """Write the manifest beside a token stream, with the tokenizer file's hash in it.
 
     The hash is what makes `mix.MixtureStream` able to refuse a batch of ids that was
     written by another vocabulary; without it the file looks like data and reads as
-    noise.
+    noise. It is `sha_file` — the digest the corpus builder writes — so a manifest from
+    either writer is checked the same way.
     """
     stream = Path(path)
     meta = stream.with_suffix(stream.suffix + ".json")
     meta.write_text(
         json.dumps(
-            {"dtype": dtype, "tokens": int(tokens), "tokenizer_sha": sha(tok)}, sort_keys=True
+            {"dtype": dtype, "tokens": int(tokens), "tokenizer_sha": sha_file(tokenizer_path)},
+            sort_keys=True,
         )
         + "\n",
         encoding="utf-8",
