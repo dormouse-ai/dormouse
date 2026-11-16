@@ -54,6 +54,22 @@ FP32_PARITY = 2e-5
 #: 1.56% — derived, not fitted. The measured worst case on this card is 1.8 ulp.
 BF16_PARITY = 4.0 * 2.0**-8
 
+#: The live f=6144 strip walks 48 f-tiles, against the desk shape's 4, so a gradient
+#: accumulates about sqrt(48/4)=3.5x more bf16 rounding on its longest path. Measured
+#: worst over ten seeds at d=832/f=6144/r=256 is 10.9 ulp (the prior's small denominator
+#: amplifies it); 16 ulp is that with margin. Forward and the weight gradients stay inside
+#: this band; the desk band above is the tighter one and is kept for the desk test.
+LIVE_BF16_PARITY = 16.0 * 2.0**-8
+
+#: The card's per-block shared-memory ceiling (101376 B = 99 KiB), the exact number in
+#: Triton's `OutOfResources` when a tile is too wide. A kernel over this cannot launch.
+SMEM_LIMIT = 101_376
+
+#: The live config's widths (`configs/dormouse_1b.toml`). Shared memory is a function of
+#: the tile constants and these three widths, not of the group count or row count, so the
+#: kernel that refuses at b8 is compiled identically with a small expert count here.
+LIVE_D, LIVE_F, LIVE_R = 832, 6144, 256
+
 
 def _bank(**kwargs: object) -> MoEFFN:
     """A small bank at the rank the fused chain covers, with the parameter floor off."""
@@ -304,6 +320,69 @@ def test_bf16_parity_forward_and_every_gradient() -> None:
     assert float((y1.float() - y0.float()).abs().max()) <= BF16_PARITY * scale
     for name in g0:
         assert _within(g1[name], g0[name], BF16_PARITY), f"gradient {name} left the bf16 ulp band"
+
+
+@ON_CARD
+def test_the_live_widths_compile_under_the_shared_memory_ceiling() -> None:
+    """The reported blocker as a gate: every fused kernel fits, and the path is visible.
+
+    A tile-constant edit that pushes a kernel over the card's 101376 B per-block ceiling
+    used to surface only as a full step that refuses to launch. This pins the arithmetic
+    at d=832/f=6144/r=256, checks the counter says the fused path ran, and checks forward
+    and every gradient against the anchor inside the step's bf16 band.
+    """
+    torch.manual_seed(9)
+    bank = MoEFFN(
+        LIVE_D,
+        LIVE_F,
+        n_experts=4,
+        topk=2,
+        n_shared=0,
+        act="moa",
+        d_ffn_gelu=3 * LIVE_F // 2,
+        expert_tsct_rank=LIVE_R,
+        min_expert_params=0,
+        device="cuda",
+    ).eval()
+    x = torch.randn(64, LIVE_D, device="cuda")
+    proj = torch.randn_like(x)
+
+    def once() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        bank.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            y = bank(x)
+            (y.float() * proj).sum().backward()
+        grads = {
+            name: p.grad.detach().clone()
+            for name, p in bank.named_parameters()
+            if p.grad is not None
+        }
+        return y.detach(), grads
+
+    kb.set_bank(False)
+    anchor = once()
+    kb.set_bank(True)
+    kb.reset_bank_launches()
+    fused = once()
+    launches = kb.bank_launches()
+    kb.set_bank(False)
+
+    assert launches > 0, "the flag was on and no fused kernel launched — the anchor ran"
+    for name in ("prep", "fwd", "bwd_rows", "bwd_cols"):
+        for cache in getattr(kb._KERNELS[name], "device_caches", {}).values():
+            for compiled in cache[0].values():
+                used = int(compiled.metadata.shared)
+                assert used <= SMEM_LIMIT, f"{name} asks {used} B > {SMEM_LIMIT} B"
+
+    y0, g0 = anchor
+    y1, g1 = fused
+    assert torch.isfinite(y1).all() and all(torch.isfinite(g).all() for g in g1.values())
+    assert float((y1.float() - y0.float()).abs().max()) <= LIVE_BF16_PARITY * float(y0.abs().max())
+    assert set(g0) == set(g1)
+    for name in g0:
+        assert _within(g1[name], g0[name], LIVE_BF16_PARITY), (
+            f"gradient {name} left the live-width bf16 band"
+        )
 
 
 @ON_CARD

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch
 
+from dormouse.kernels import bank as kb
 from dormouse.model.assemble import assemble
 from dormouse.model.spec import StackSpec
 from dormouse.train.optim import MixOptimizer
@@ -40,6 +41,10 @@ from dormouse.train.step import chunked_cross_entropy
 #: The card's practical dense bf16 peak, in TFLOP/s. The 350 kB/s projection is written
 #: against this number and it is quoted here so the MFU printed below can be checked.
 PRACTICAL_PEAK_TFLOPS = 52.0
+
+#: Source-text bytes per token from the corpus manifest. Throughput is reported in bytes
+#: of source per second, not in tokens divided by 1000 (which is not a byte rate).
+SOURCE_BYTES_PER_TOKEN = 4.718
 
 
 def build(config: str, batch: int, seq: int | None) -> tuple[StackSpec, object, MixOptimizer]:
@@ -245,6 +250,7 @@ def main() -> int:
         f"b{spec.batch} x s{spec.seq_len} = {tokens_per_step:,} tokens, {args.dtype}"
     )
     ids = torch.randint(0, spec.vocab, (spec.batch, spec.seq_len + 1), device="cuda")
+    kb.reset_bank_launches()
 
     for _ in range(2):
         phases(assembled, optimizer, ids, 1, amp)
@@ -253,6 +259,10 @@ def main() -> int:
     table = phases(assembled, optimizer, ids, args.steps, amp)
     per_step_ms = table["total"]
     rate = tokens_per_step / (per_step_ms * 1e-3)
+    print(
+        f"\nbank path: {'fused' if kb.bank_enabled() else 'anchor'}  "
+        f"(fused launches counted={kb.bank_launches()}; zero while on is the defect)"
+    )
     print(
         f"\npeak VRAM over the timed steps: {torch.cuda.max_memory_allocated() / 2**20:,.0f} MiB "
         f"of {torch.cuda.get_device_properties(0).total_memory / 2**20:,.0f} MiB, "
@@ -269,7 +279,8 @@ def main() -> int:
         f"{100 * (table['total'] - accounted) / per_step_ms:9.1f}%  (host, launch, sync)"
     )
     print(
-        f"  {'total':10} {per_step_ms:9.1f}  {rate:,.0f} tok/s  {rate / 1000:,.1f} kB/s  "
+        f"  {'total':10} {per_step_ms:9.1f}  {rate:,.0f} tok/s  "
+        f"{rate * SOURCE_BYTES_PER_TOKEN:,.0f} B/s source  "
         f"MFU {100 * mfu(rate, bill['active']):.1f}%"
     )
 
