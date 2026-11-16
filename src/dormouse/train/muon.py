@@ -67,8 +67,14 @@ router reads it off the modules rather than off a shape heuristic.
     one launch per bucket, identical arithmetic in fp32, no change to the iteration count,
     coefficients, dtype or direction. The bucket key carries shape, step count and role
     (per-head vs whole), so a Q/K head can never join a whole-matrix bucket, and Muon can
-    never see an AdamW parameter. A Triton fused chain was NOT ported: the box has no CUDA
-    device and no `triton` module, so it cannot compile or pass parity here.
+    never see an AdamW parameter. The five fp32 elementwise ops per iteration (`b·gram`,
+    `c·(gram@gram)`, their add, `a·x`, the final add) are the same scalar op on every
+    stacked group, so they run as `_foreach_mul`/`_foreach_add` over ALL groups in one
+    lockstep chain: five launches per iteration, not five per group. The GEMMs stay one
+    `bmm` per group — only the launches move, no iteration, coefficient, dtype or
+    direction changes. A missing `_foreach_*` op refuses loudly, never a silent fallback.
+    A Triton fused chain was NOT ported: the box has no CUDA device and no `triton`
+    module, so it cannot compile or pass parity here.
 """
 
 from __future__ import annotations
@@ -156,30 +162,81 @@ def spectral_bound(x: torch.Tensor, iters: int = NS_POWER_ITERS) -> torch.Tensor
     return bound
 
 
+def _prescale(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Cast to fp32, bound the spectrum, and put a tall matrix on its short side."""
+    work = x.to(torch.float32)
+    work = work / spectral_bound(work).clamp_min(NS_EPS)
+    transposed = work.shape[-2] > work.shape[-1]
+    return (work.transpose(-2, -1) if transposed else work), transposed
+
+
+def _require_foreach(batch: list[torch.Tensor]) -> None:
+    """Refuse loudly when the fused chain cannot run — never fall back per group."""
+    if not callable(getattr(torch, "_foreach_mul", None)) or not callable(
+        getattr(torch, "_foreach_add", None)
+    ):
+        raise LoudError(
+            "torch._foreach_mul / _foreach_add are missing",
+            "the fused polar chain requires a torch build that ships the _foreach ops",
+        )
+    if not batch:
+        raise LoudError("the fused polar chain was given no matrices", "pass at least one group")
+    for tensor in batch:
+        if tensor.dtype != torch.float32:
+            raise LoudError(
+                f"fused polar requires fp32 work tensors, got {tensor.dtype}",
+                "_prescale casts every input to fp32 before the chain",
+            )
+        if tensor.ndim not in (2, 3):
+            raise LoudError(
+                f"polar takes a matrix or a batch of matrices, got shape {tuple(tensor.shape)}",
+                "a 3-D optimizer state is a batch: view it as [N, m, n] before the chain",
+            )
+        if tensor.device.type not in ("cpu", "cuda"):
+            raise LoudError(
+                f"fused polar needs cpu or cuda tensors, got {tensor.device.type}",
+                "the _foreach kernels are only available on cpu and cuda",
+            )
+
+
+def _polar_many(batch: list[torch.Tensor], steps: int = NS_STEPS) -> list[torch.Tensor]:
+    """Newton–Schulz for every matrix in `batch`, one lockstep chain (§6).
+
+    The GEMMs stay one `bmm`/`mm` per matrix. The five fp32 elementwise ops per
+    iteration — `b·gram`, `c·(gram@gram)`, their add, `a·x`, the final add — run as
+    `_foreach_mul`/`_foreach_add` over all matrices at once, so launches no longer
+    scale with the number of shape groups. Same dtype, coefficients and arithmetic
+    order as `polar` on each matrix; `tests/test_muon_foreach.py` pins the parity.
+    """
+    a, b, c = NS_COEFFS
+    _require_foreach(batch)
+    prepared = [_prescale(x) for x in batch]
+    works = [work for work, _ in prepared]
+    transposed = [flag for _, flag in prepared]
+    for _ in range(steps):
+        grams = [_matmul(work, work.transpose(-2, -1)) for work in works]
+        squares = [_matmul(gram, gram) for gram in grams]
+        bg: list[torch.Tensor] = list(torch._foreach_mul(grams, b))
+        cg: list[torch.Tensor] = list(torch._foreach_mul(squares, c))
+        polys: list[torch.Tensor] = list(torch._foreach_add(bg, cg))
+        projected = [_matmul(poly, work) for poly, work in zip(polys, works, strict=True)]
+        scaled: list[torch.Tensor] = list(torch._foreach_mul(works, a))
+        works = list(torch._foreach_add(scaled, projected))
+    return [
+        work.transpose(-2, -1).contiguous() if flag else work.contiguous()
+        for work, flag in zip(works, transposed, strict=True)
+    ]
+
+
 def polar(x: torch.Tensor, steps: int = NS_STEPS) -> torch.Tensor:
     """Return the orthogonal factor of `x` for `[m, n]` or a batch `[N, m, n]`.
 
     Runs on the **short side**: a tall matrix is transposed first, so the Gram is
     `[min, min]` and a `[128, 832]` costs a `128×128` product per iteration. Exact
-    orthogonality holds to the conditioning of `x` — §3 states the ceiling.
+    orthogonality holds to the conditioning of `x` — §3 states the ceiling. The single
+    matrix is the public form of the fused chain `_polar_many` runs in the optimizer.
     """
-    if x.ndim not in (2, 3):
-        raise LoudError(
-            f"polar takes a matrix or a batch of matrices, got shape {tuple(x.shape)}",
-            "a 3-D optimizer state is a batch: view it as [N, m, n] before the chain",
-        )
-    a, b, c = NS_COEFFS
-    work = x.to(torch.float32)
-    work = work / spectral_bound(work).clamp_min(NS_EPS)
-    transposed = work.shape[-2] > work.shape[-1]
-    if transposed:
-        work = work.transpose(-2, -1)
-    for _ in range(steps):
-        gram = _matmul(work, work.transpose(-2, -1))
-        work = a * work + _matmul(b * gram + c * _matmul(gram, gram), work)
-    if transposed:
-        work = work.transpose(-2, -1)
-    return work.contiguous()
+    return _polar_many([x], steps=steps)[0]
 
 
 def colrow(x: torch.Tensor, eps: float = COLROW_EPS) -> torch.Tensor:
@@ -333,17 +390,30 @@ class Muon(Optimizer):
                         )
                 rows, cols = param.shape
                 plans[param] = (lr, decay, max(1.0, rows / cols) ** 0.5, plan)
-        results: dict[tuple[Any, int, int], torch.Tensor] = {}
+        # One lockstep NS chain per step count: the five elementwise ops per
+        # iteration become five _foreach launches over every stacked group (§6).
+        inputs_by_steps: dict[int, list[torch.Tensor]] = defaultdict(list)
+        owners_by_steps: dict[int, list[tuple[list[tuple[Any, int, int, torch.Tensor]], bool]]] = (
+            defaultdict(list)
+        )
         for (_, steps, _), entries in jobs.items():
             if self.grouped:
-                stacked = torch.stack([entry[3] for entry in entries])
-                out = colrow(polar(stacked, steps=steps))
-                if counters is not None:
-                    counters.count(NS_GROUPED_COUNTER, len(entries))
+                inputs_by_steps[steps].append(torch.stack([entry[3] for entry in entries]))
+                owners_by_steps[steps].append((entries, True))
             else:
-                out = torch.stack([colrow(polar(entry[3], steps=steps)) for entry in entries])
-            for index, (param, region_index, matrix_index, _) in enumerate(entries):
-                results[(param, region_index, matrix_index)] = out[index]
+                for entry in entries:
+                    inputs_by_steps[steps].append(entry[3])
+                    owners_by_steps[steps].append(([entry], False))
+        results: dict[tuple[Any, int, int], torch.Tensor] = {}
+        for steps, inputs in inputs_by_steps.items():
+            outputs = _polar_many(inputs, steps=steps)
+            for out, (entries, is_batch) in zip(outputs, owners_by_steps[steps], strict=True):
+                direction = colrow(out)
+                for index, (param, region_index, matrix_index, _) in enumerate(entries):
+                    value = direction[index] if is_batch else direction
+                    results[(param, region_index, matrix_index)] = value
+                if self.grouped and counters is not None:
+                    counters.count(NS_GROUPED_COUNTER, len(entries))
         grouped_proof = counters.counts[NS_GROUPED_COUNTER] if counters is not None else 1
         if self.grouped and jobs and not grouped_proof:
             raise MissingReport([NS_GROUPED_COUNTER])
