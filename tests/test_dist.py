@@ -52,7 +52,8 @@ TOKENS = ROWS * SEQ
 #: mathematically identical runs differ at the fp32 epsilon (~1.2e-7 relative). An
 #: absolute 1e-6 fails at loss ~10 on a different BLAS build; a relative bar of 1e-6
 #: is still 10x tighter than the drift it must tolerate, and it cannot hide a real bug
-#: (the per-micro-batch-mean control below drifts by 7.7e-3, four orders larger).
+#: (the per-micro-batch-mean control below drifts by 1.46e-4, 280x the honest 5.2e-7;
+#: both measured 2026-11-16 after the tied-head sqrt(d) scale lowered the loss level).
 TOL = 1e-6
 
 
@@ -307,7 +308,13 @@ def test_per_microbatch_mean_fails_the_equivalence_gate(
     """
     buggy = run_job(tmp_path_factory.mktemp("buggy"), world=2, bug=True)
     worst = _worst(buggy.weights[0], single.weights[0])
-    assert worst > 1e-3, "the per-micro-batch mean was not caught: the gate proves nothing"
+    # 2026-11-16, tied-head 1/sqrt(d_model) scale (PR #74): the loss level, and with it
+    # the injected gradient magnitude, fell; the drift went 7.7e-3 -> 1.46e-4. The
+    # honest 2-vs-1 drift is 5.2e-7, so 1e-5 keeps a 14x margin below the injected run
+    # and 19x above reduction noise — the bar tracks the new scale without weakening
+    # the control, which still fails on the injected bug (and the loss-ratio assert
+    # below is an independent proof that the injection ran).
+    assert worst > 1e-5, "the per-micro-batch mean was not caught: the gate proves nothing"
     assert buggy.losses[0] == pytest.approx(single.losses[0] * ACCUM, rel=1e-5)
 
 

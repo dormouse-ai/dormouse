@@ -22,8 +22,15 @@ from test_loop import build, config, lines
 from dormouse.train import loop as loop_mod
 from dormouse.train.step import CLIP, StepResult, train_step
 
-# The 16-step eager sequence, captured from origin/master before the wiring:
-# (step, loss, grad_norm, clip_events, skipped, batch hash, bpb).
+# The 16-step eager sequence: (step, loss, grad_norm, clip_events, skipped, batch
+# hash, bpb). Recaptured 2026-11-16 after the tied-head 1/sqrt(d_model) scale (PR #74,
+# fix/tied-head-scale) moved the loss level: step-0 loss 12.074 -> 3.355, and every
+# grad_norm/bpb fell with it, so fewer grad norms clear CLIP — clip_events drops 7 -> 6
+# at steps 3 and 15 and GOLDEN_COUNTS["clip_events"] follows. That is loss magnitude,
+# not a broken mechanism: step index, skip flags, batch hashes and every other counter
+# (including `tied_head`, opt_* and ema) are bit-identical; test_model.py's independent
+# init-CE ~= ln(V) gate pins the new scale. Remove the sqrt(d) divisor and these floats
+# move back to the old level.
 # One float32 ulp drifts across builds (CPU reduction width / torch wheel):
 # step 7 grad_norm; step 9 loss and bpb; step 10 grad_norm; step 11 loss and
 # bpb; step 14 loss, grad_norm and bpb; step 15 loss and bpb. Running this exact
@@ -32,22 +39,22 @@ from dormouse.train.step import CLIP, StepResult, train_step
 # (about two ulps at these magnitudes); clip events, skip flags, batch hashes,
 # the counter set and every other field stay exact.
 GOLDEN = [
-    (0, 12.074398040771484, 5.131967067718506, 0, False, "45d795f783ff2f73", 4.354918543785109),
-    (1, 10.487138748168945, 4.357778072357178, 1, False, "c3209df410fd9f54", 3.782435766274457),
-    (2, 10.859282493591309, 5.0793280601501465, 5, False, "3264732e96a1ae44", 3.9166582502791294),
-    (3, 10.772439002990723, 4.807574272155762, 7, False, "5ff4c7dcc408993a", 3.8853360819733913),
-    (4, 9.983198165893555, 4.464990615844727, 6, False, "a12f987bdaeea10a", 3.6006776215366068),
-    (5, 9.000713348388672, 4.40773868560791, 7, False, "c72c3647cd0a93ad", 3.2463211280458584),
-    (6, 11.202688217163086, 5.471414566040039, 7, False, "ef88d55d1cd516e3", 4.040515683881602),
-    (7, 7.548826217651367, 3.967719316482544, 7, False, "8c6831a96d97123f", 2.7226635371845544),
-    (8, 8.86369800567627, 5.3084893226623535, 7, False, "774c5e92f22d297f", 3.1969032891816376),
-    (9, 7.7037553787231445, 5.204407691955566, 7, False, "2f40a5e15addf1af", 2.77854242027639),
-    (10, 8.72290325164795, 6.226996421813965, 7, False, "b1c123284c7bbd9c", 3.146122315826678),
-    (11, 7.02910852432251, 5.456736087799072, 7, False, "b0e23bab55edb538", 2.535215002477606),
-    (12, 6.245589256286621, 5.545576095581055, 7, False, "62552c184d0af98d", 2.252620161868524),
-    (13, 4.962966442108154, 5.8926544189453125, 7, False, "7672976ebbe2b914", 1.7900117685319443),
-    (14, 4.510542392730713, 4.228295803070068, 7, False, "2add7dc5cd9bb5fd", 1.6268342854280098),
-    (15, 4.2043023109436035, 4.413464069366455, 7, False, "0b47a29316a0049b", 1.5163815235990865),
+    (0, 3.354806661605835, 1.0694636106491089, 0, False, "45d795f783ff2f73", 1.2099907334599993),
+    (1, 3.0090034008026123, 0.865772545337677, 1, False, "c3209df410fd9f54", 1.0852685710889887),
+    (2, 3.0713627338409424, 1.0557721853256226, 5, False, "3264732e96a1ae44", 1.1077599462208743),
+    (3, 3.0693202018737793, 0.9755256772041321, 6, False, "5ff4c7dcc408993a", 1.1070232585359034),
+    (4, 2.8468103408813477, 0.8700788021087646, 6, False, "a12f987bdaeea10a", 1.026769790285235),
+    (5, 2.68221116065979, 0.8584632277488708, 7, False, "c72c3647cd0a93ad", 0.9674031850252275),
+    (6, 3.1665616035461426, 1.1004821062088013, 7, False, "ef88d55d1cd516e3", 1.142095680526356),
+    (7, 2.309046506881714, 0.7381711006164551, 7, False, "8c6831a96d97123f", 0.8328124861650581),
+    (8, 2.6729798316955566, 1.040021538734436, 7, False, "774c5e92f22d297f", 0.9640736868958489),
+    (9, 2.4285171031951904, 0.9641995429992676, 7, False, "2f40a5e15addf1af", 0.8759023953734331),
+    (10, 2.6522834300994873, 1.2329951524734497, 7, False, "b1c123284c7bbd9c", 0.956609037909125),
+    (11, 2.4393813610076904, 0.9891476035118103, 7, False, "b0e23bab55edb538", 0.8798208480906913),
+    (12, 2.19451642036438, 1.0376875400543213, 7, False, "62552c184d0af98d", 0.7915044892022727),
+    (13, 1.999880313873291, 0.8581827878952026, 7, False, "7672976ebbe2b914", 0.7213043527991152),
+    (14, 1.942959189414978, 0.7194468379020691, 7, False, "2add7dc5cd9bb5fd", 0.7007743968046573),
+    (15, 1.8842633962631226, 0.6673699021339417, 6, False, "0b47a29316a0049b", 0.6796043643793507),
 ]
 GOLDEN_COUNTS = {
     "fwd": 32,
@@ -62,7 +69,7 @@ GOLDEN_COUNTS = {
     "bwd": 32,
     "clip": 1,
     "clip_tensors": 9,
-    "clip_events": 7,
+    "clip_events": 6,
     "opt_muon": 5,
     "opt_adamw": 4,
     "opt_steps": 1,
