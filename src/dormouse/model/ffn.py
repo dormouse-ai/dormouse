@@ -78,11 +78,13 @@ PROJ_STD = 0.02
 #: How many branches the mixture is applied to: the gate only, or gate and up.
 FFN_SIDES: tuple[str, ...] = ("one", "bi")
 
-#: Rows per transient buffer in the mixture: each dictionary entry is evaluated — and
-#: re-evaluated in the backward — on this many rows at a time. At the live
-#: `d_ffn=6144` one such buffer is 50 MiB, so the mixture's transient is a few tens of
-#: MiB whatever `K` says, where an unchunked mixture holds the whole `[rows, d_ffn]`
-#: slab per entry in flight (measured 1.35x vs 1.07x the plain FFN's peak at 8192 rows).
+#: Rows per slice the read runs on: the matmuls of one slice are what the forward keeps,
+#: and the backward recomputes them. At the live `d_ffn=6144` one `[slice, d_ffn]` buffer
+#: is 24 MiB, so an arm's transient is a few tens of MiB whatever the row count says — at
+#: the bank's 24 576 rows the unchunked read retains three 302 MiB slabs per layer, 10.8 GiB
+#: over the twelve layers, and that is what the mixture alone could not fix. The same
+#: number governs the dictionary's transient (measured 1.35x vs 1.07x the plain FFN's peak
+#: at 8192 rows unchunked).
 MIX_CHUNK_ROWS = 2048
 
 
@@ -206,13 +208,66 @@ class _Glu(nn.Module):
         self.gate = project(d_model, d_ffn, tsct_rank, std=PROJ_STD, device=device)
         self.up = project(d_model, d_ffn, tsct_rank, std=PROJ_STD, device=device)
         self.down = project(d_ffn, d_model, tsct_rank, std=write_std, device=device)
+        #: How many of the three matrices are stored as factors: `tsct_fwd` is one read of
+        #: each per row, and the count belongs to the arm's forward, not to a helper that
+        #: a checkpointed region would run twice.
+        self._factorised = sum(
+            isinstance(matrix, FactorLinear) for matrix in (self.gate, self.up, self.down)
+        )
 
-    def _read(
-        self, matrix: nn.Linear | FactorLinear, x: torch.Tensor, counters: Counters | None
-    ) -> torch.Tensor:
+    # ------------------------------------------------------------------ the read
+    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
+        """`x [..., d_model]` → the arm's write, in `MIX_CHUNK_ROWS`-row slices.
+
+        A feed-forward reads each row on its own, so the read runs in slices of
+        `MIX_CHUNK_ROWS` rows and each slice is checkpointed: the forward keeps the slice's
+        input and output, and the backward recomputes the `[slice, d_ffn]` slabs instead of
+        the graph retaining them. At the bank's 24 576 routed rows that is 3 x 302 MiB per
+        call per layer retained before the fix (10.8 GiB over twelve layers) against 3 x
+        24 MiB of transient now.
+
+        THE ARITHMETIC DOES NOT MOVE. Every op in an arm is elementwise or row-independent,
+        so a slice computes the same multiplies in the same order on the same rows: the
+        output and the gradients are `torch.equal` to the unchunked call
+        (`tests/test_ffn_mixture.py`).
+        """
+        y = self._rows(x)
+        if counters is not None:
+            self._count(x, counters)
+        return y
+
+    def _rows(self, x: torch.Tensor) -> torch.Tensor:
+        """Run `_write` over row slices, recomputing rather than retaining each one."""
+        span = x.shape[-2]
+        batch = x.numel() // (span * self.d_model)
+        chunk = max(1, MIX_CHUNK_ROWS // max(batch, 1))
+        if span <= chunk:
+            return self._kept(x)
+        parts = [self._kept(x[..., start : start + chunk, :]) for start in range(0, span, chunk)]
+        return torch.cat(parts, dim=-2)
+
+    def _kept(self, x: torch.Tensor) -> torch.Tensor:
+        """One slice's write, recomputed in the backward when the forward has a graph."""
+        if not (torch.is_grad_enabled() and x.requires_grad):
+            return self._write(x)
+        return checkpoint(self._write, x, use_reentrant=False)
+
+    def _write(self, x: torch.Tensor) -> torch.Tensor:
+        """One slice's arithmetic: what each arm below implements."""
+        raise NotImplementedError(
+            "a _Glu subclass implements _write: the three matrices are its bill, not its behaviour",
+        )
+
+    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+        """Report this call: `ffn_fwd` per row and `tsct_fwd` per factorised matrix."""
+        rows = x.numel() // self.d_model
+        counters.count("ffn_fwd", rows)
+        if self._factorised:
+            counters.count("tsct_fwd", rows * self._factorised)
+
+    @staticmethod
+    def _read(matrix: nn.Linear | FactorLinear, x: torch.Tensor) -> torch.Tensor:
         """One of the three matrices, dense or through its stored rank-`r` factors."""
-        if counters is not None and isinstance(matrix, FactorLinear):
-            counters.count("tsct_fwd", x.shape[0])
         return cast(torch.Tensor, matrix(x))
 
 
@@ -246,13 +301,11 @@ class GatedFFN(_Glu):
         self.sides = sides
         self._fn: Callable[[torch.Tensor], torch.Tensor] = activation(act)
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` → the FFN write, same shape."""
-        g, u = self._read(self.gate, x, counters), self._read(self.up, x, counters)
+    def _write(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the live SwiGLU (or its `bi` control) on one row slice."""
+        g, u = self._read(self.gate, x), self._read(self.up, x)
         h = self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
-        if counters is not None:
-            counters.count("ffn_fwd", x.shape[0] * x.shape[1])
-        return self._read(self.down, h, counters)
+        return self._read(self.down, h)
 
     def extra_repr(self) -> str:
         """Show the shape the parameter bill is quoted for."""
@@ -291,15 +344,17 @@ class LaFFN(_Glu):
         """`Σ cₖ·fₖ(z)` — a running sum, so `K=1` returns `1·f(z)` untouched."""
         return _accumulate(self.coef.expand(*z.shape[:-1], -1), z, self._fns)
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` → the FFN write, same shape."""
-        h = self._mix(self._read(self.gate, x, counters)) * self._read(self.up, x, counters)
-        if counters is not None:
-            tokens = x.shape[0] * x.shape[1]
-            counters.count("ffn_fwd", tokens)
-            counters.count("ffn_la", tokens)
-            counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
-        return self._read(self.down, h, counters)
+    def _write(self, x: torch.Tensor) -> torch.Tensor:
+        """`A(gate(x)) * up(x)` on one row slice."""
+        h = self._mix(self._read(self.gate, x)) * self._read(self.up, x)
+        return self._read(self.down, h)
+
+    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+        """Add the mixture's own two counters to the base read's."""
+        super()._count(x, counters)
+        tokens = x.numel() // self.d_model
+        counters.count("ffn_la", tokens)
+        counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:
         """Report entries that are switched on but received no gradient.
@@ -375,17 +430,19 @@ class MoaFFN(_Glu):
         """`Σₖ wₖ·fₖ(z)` with `w [..., K]` — a running sum, exact at `K=1`."""
         return _accumulate(w, z, self._fns)
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` → the FFN write, same shape."""
+    def _write(self, x: torch.Tensor) -> torch.Tensor:
+        """`down(A(x,g) · A(x,u)?)` of one row slice, weights from the token itself."""
         w = self._weights(x)
-        g, u = self._read(self.gate, x, counters), self._read(self.up, x, counters)
+        g, u = self._read(self.gate, x), self._read(self.up, x)
         h = self._mix(w, g) * (self._mix(w, u) if self.sides == "bi" else u)
-        if counters is not None:
-            tokens = x.shape[0] * x.shape[1]
-            counters.count("moa_fwd", tokens)
-            counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
-            counters.count("ffn_fwd", tokens)
-        return self._read(self.down, h, counters)
+        return self._read(self.down, h)
+
+    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+        """Add the mixture's own counters to the base read's."""
+        super()._count(x, counters)
+        tokens = x.numel() // self.d_model
+        counters.count("moa_fwd", tokens)
+        counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:
         """Report entries switched on but receiving no gradient, through either path.
