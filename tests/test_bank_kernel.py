@@ -373,6 +373,40 @@ def test_the_launch_count_is_two_per_group_forward_and_four_with_the_backward() 
 
 
 @ON_CARD
+def test_the_forward_grid_is_tile_major() -> None:
+    """The fwd grid is ``(tiles, experts)`` so one wave stays on one expert's factors.
+
+    The expert used to be the fast-varying axis (``(experts, tiles)``), which walks every
+    expert of the group before returning to a row tile — each CTA evicts the previous
+    CTA's factor slab from L2. Tile-major is the whole change here; this gate stops a
+    future edit from silently restoring the expert-major walk, which leaves the arithmetic
+    correct but gives back the locality.
+    """
+    torch.manual_seed(11)
+    bank = _bank()
+    x = _inputs(bank)
+    kb.set_bank(True)
+    built = kb._require("forward")
+    real = built["fwd"]
+    seen: dict[str, tuple[int, ...]] = {}
+
+    class Recorder:
+        def __getitem__(self, grid: tuple[int, ...]):  # type: ignore[no-untyped-def]
+            seen["grid"] = tuple(grid)
+            return real[grid]
+
+    built["fwd"] = Recorder()
+    try:
+        bank(x)
+    finally:
+        built["fwd"] = real
+        kb.set_bank(False)
+    e = bank.n_experts
+    tiles = -(-bank.capacity(x.shape[0] * bank.topk) // kb.BM)
+    assert seen["grid"] == (tiles, e), "the fwd grid must walk row tiles fastest"
+
+
+@ON_CARD
 def test_the_counter_reports_the_launches_the_forward_ran() -> None:
     """A flag-on forward with a zero counter is the defect; `bank_ops` must not be zero."""
     from dormouse_core.counters import Counters
