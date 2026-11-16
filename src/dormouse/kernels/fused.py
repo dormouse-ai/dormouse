@@ -69,6 +69,31 @@ BF16_PARITY = 2.0 * 2.0**-8
 #: means Triton is absent, which `_require` acts on rather than falls back from.
 _KERNELS: dict[str, Any] = {}
 
+#: The dictionary entries the mixture kernel knows, as the codes its constexpr branch
+#: reads. A name outside this table is not a mixture the kernel claims, and
+#: `mixture_code` refuses it instead of guessing a formula.
+GELU, SILU, RELU2, LEAKY, TANH, SITU = range(6)
+MIX_CODES: dict[str, int] = {
+    "gelu": GELU,
+    "silu": SILU,
+    "relu2": RELU2,
+    "leaky": LEAKY,
+    "tanh": TANH,
+    "situ": SITU,
+}
+
+#: Entries one fused mixture launch can sum. The live dictionary is six; a seventh
+#: would need a seventh constexpr branch, so a longer one is refused with the count.
+MAX_MIX_ENTRIES = 6
+
+#: Columns one mixture program reads at a time. 1024 keeps a program's working set in
+#: registers for `d_ffn=6144` (six tiles) at any row count.
+MIX_BLOCK = 1024
+
+#: K3's SiTU scale, as `activations.SITU_BETA`; the kernel sits below `model` in the
+#: tree and cannot import it, so the constant is stated against its owner.
+SITU_BETA = 4.0
+
 #: The flag. Off by default: a fused path nobody measured is not a default.
 _FUSED = os.environ.get("DORMOUSE_FUSED", "") not in ("", "0")
 
@@ -127,6 +152,7 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
     try:
         import triton
         import triton.language as tl
+        from triton.language.extra import libdevice
     except ImportError:
         return None
 
@@ -159,7 +185,177 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
         out = g * tl.sigmoid(g) * u
         tl.store(OUT + off, out.to(OUT.dtype.element_ty), mask=mask)
 
-    _KERNELS.update({"triton": triton, "residual_norm": residual_norm_kernel, "glu": glu_kernel})
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
+    def _activate(x, kind: tl.constexpr):  # type: ignore[no-untyped-def]
+        """One dictionary entry, fp32 in and out — the `activations.py` formula, verbatim."""
+        if kind == 0:  # gelu: the erf form, `nn.functional.gelu`'s default
+            return 0.5 * x * (1.0 + libdevice.erf(x * 0.7071067811865476))
+        if kind == 1:  # silu
+            return x * tl.sigmoid(x)
+        if kind == 2:  # relu2
+            relu = tl.maximum(x, 0.0)
+            return relu * relu
+        if kind == 3:  # leaky, PyTorch's default slope
+            return tl.where(x >= 0.0, x, 0.01 * x)
+        if kind == 4:  # tanh
+            return libdevice.tanh(x)
+        # situ: 4·tanh(x/4)·sigmoid(x)
+        return 4.0 * libdevice.tanh(x * 0.25) * tl.sigmoid(x)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
+    def _grad(x, kind: tl.constexpr):  # type: ignore[no-untyped-def]
+        """`d/dx` of `_activate`, derived there rather than by a second forward."""
+        if kind == 0:  # gelu: ½(1+erf(x/√2)) + x·φ(x)
+            return 0.5 * (1.0 + libdevice.erf(x * 0.7071067811865476)) + (
+                0.3989422804014327 * x * libdevice.exp(-0.5 * x * x)
+            )
+        if kind == 1:  # silu: s(1 + x(1-s))
+            sig = tl.sigmoid(x)
+            return sig * (1.0 + x * (1.0 - sig))
+        if kind == 2:  # relu2: 2·relu(x)
+            return 2.0 * tl.maximum(x, 0.0)
+        if kind == 3:  # leaky
+            return tl.where(x >= 0.0, 1.0, 0.01)
+        if kind == 4:  # tanh
+            t = libdevice.tanh(x)
+            return 1.0 - t * t
+        # situ: (1-t²)·s + 4·t·s·(1-s), t = tanh(x/4)
+        sig = tl.sigmoid(x)
+        t = libdevice.tanh(x * 0.25)
+        return (1.0 - t * t) * sig + 4.0 * t * sig * (1.0 - sig)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
+    def _coef(W, which: tl.constexpr, row, K: tl.constexpr, PER_ROW: tl.constexpr):  # type: ignore[no-untyped-def]
+        """Return the k-th coefficient: one row's entry, or one shared entry."""
+        if PER_ROW:
+            return tl.load(W + row * K + which)
+        return tl.load(W + which)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
+    def mix_kernel(  # type: ignore[no-untyped-def]
+        Z,
+        W,
+        OUT,
+        DZ,
+        DW,
+        DOUT,
+        n_cols,
+        K: tl.constexpr,
+        PER_ROW: tl.constexpr,
+        BACK: tl.constexpr,
+        NEED_DW: tl.constexpr,
+        K0: tl.constexpr,
+        K1: tl.constexpr,
+        K2: tl.constexpr,
+        K3: tl.constexpr,
+        K4: tl.constexpr,
+        K5: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """`Σₖ wₖ·fₖ(z)` for one row, or its two gradients, in one pass over `z`.
+
+        One program per row and one pass over the row's `d_ffn` columns: the forward
+        writes the mixture, the backward (`BACK`) writes `dz` and, when the coefficients
+        need a gradient (`NEED_DW`), `dw [rows, K]`. Combining the two directions here
+        keeps ONE copy of each activation formula, which is the thing a second kernel
+        would have had to duplicate and then drift from.
+        """
+        row = tl.program_id(0)
+        dw0 = 0.0
+        dw1 = 0.0
+        dw2 = 0.0
+        dw3 = 0.0
+        dw4 = 0.0
+        dw5 = 0.0
+        for start in range(0, n_cols, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            mask = cols < n_cols
+            z = tl.load(Z + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+            if BACK:
+                d = tl.load(DOUT + row * n_cols + cols, mask=mask, other=0.0).to(tl.float32)
+                dz = tl.zeros([BLOCK], tl.float32)
+            else:
+                acc = tl.zeros([BLOCK], tl.float32)
+            if K > 0:
+                w0 = _coef(W, 0, row, K, PER_ROW)
+                a = _activate(z, K0)
+                if BACK:
+                    dz += w0 * _grad(z, K0) * d
+                    if NEED_DW:
+                        dw0 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w0 * a
+            if K > 1:
+                w1 = _coef(W, 1, row, K, PER_ROW)
+                a = _activate(z, K1)
+                if BACK:
+                    dz += w1 * _grad(z, K1) * d
+                    if NEED_DW:
+                        dw1 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w1 * a
+            if K > 2:
+                w2 = _coef(W, 2, row, K, PER_ROW)
+                a = _activate(z, K2)
+                if BACK:
+                    dz += w2 * _grad(z, K2) * d
+                    if NEED_DW:
+                        dw2 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w2 * a
+            if K > 3:
+                w3 = _coef(W, 3, row, K, PER_ROW)
+                a = _activate(z, K3)
+                if BACK:
+                    dz += w3 * _grad(z, K3) * d
+                    if NEED_DW:
+                        dw3 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w3 * a
+            if K > 4:
+                w4 = _coef(W, 4, row, K, PER_ROW)
+                a = _activate(z, K4)
+                if BACK:
+                    dz += w4 * _grad(z, K4) * d
+                    if NEED_DW:
+                        dw4 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w4 * a
+            if K > 5:
+                w5 = _coef(W, 5, row, K, PER_ROW)
+                a = _activate(z, K5)
+                if BACK:
+                    dz += w5 * _grad(z, K5) * d
+                    if NEED_DW:
+                        dw5 += tl.sum(a * d, axis=0)
+                else:
+                    acc += w5 * a
+            if BACK:
+                tl.store(DZ + row * n_cols + cols, dz.to(DZ.dtype.element_ty), mask=mask)
+            else:
+                tl.store(OUT + row * n_cols + cols, acc.to(OUT.dtype.element_ty), mask=mask)
+        if BACK and NEED_DW:
+            if K > 0:
+                tl.store(DW + row * K + 0, dw0)
+            if K > 1:
+                tl.store(DW + row * K + 1, dw1)
+            if K > 2:
+                tl.store(DW + row * K + 2, dw2)
+            if K > 3:
+                tl.store(DW + row * K + 3, dw3)
+            if K > 4:
+                tl.store(DW + row * K + 4, dw4)
+            if K > 5:
+                tl.store(DW + row * K + 5, dw5)
+
+    _KERNELS.update(
+        {
+            "triton": triton,
+            "residual_norm": residual_norm_kernel,
+            "glu": glu_kernel,
+            "mix": mix_kernel,
+        }
+    )
     return _KERNELS
 
 
@@ -285,6 +481,107 @@ class _Glu(torch.autograd.Function):
         d_up = d * (g * sig)
         shape = ctx.shape
         return d_gate.reshape(shape).to(gate.dtype), d_up.reshape(shape).to(up.dtype)
+
+
+class _Mixture(torch.autograd.Function):
+    """`Σₖ wₖ·fₖ(z)` in one launch, its two gradients in one more.
+
+    `kinds` is a tuple of the codes `MIX_CODES` names — integers, not callables. That is
+    the whole point: the per-entry path handed `torch.utils.checkpoint` a Python function
+    per dictionary entry, and dynamo cannot see through a callable argument (2.13 stops
+    at `lift_tracked_freevar_to_input` on the root subgraph tracer), so the bank's forward
+    was opaque to `torch.compile` and a graph break of six checkpoints per slice. The
+    codes are constants, so the kernel is one static dispatch and the region is traceable.
+    """
+
+    @staticmethod
+    def forward(  # pragma: no cover - device only
+        ctx: Any, z: torch.Tensor, w: torch.Tensor, kinds: tuple[int, ...], per_row: bool
+    ) -> torch.Tensor:  # pragma: no cover - device kernels
+        """Return the mixture on `z`'s shape; `w` is `[rows, K]` or the shared `[K]`."""
+        built = _require("mixture")
+        cols = z.shape[-1]
+        zf = _flat(z, cols)
+        rows, k = zf.shape[0], len(kinds)
+        wf = w.reshape(rows, k).contiguous() if per_row else w.reshape(-1).contiguous()
+        out = torch.empty_like(zf)
+        slots = kinds + (0,) * (MAX_MIX_ENTRIES - k)
+        built["mix"][(rows,)](
+            zf, wf, out, out, out, out, cols, k, per_row, False, False, *slots, MIX_BLOCK
+        )
+        _tally()
+        ctx.save_for_backward(zf, wf)
+        ctx.kinds = kinds
+        ctx.per_row = per_row
+        ctx.shape = z.shape
+        ctx.w_dtype = w.dtype
+        ctx.w_shape = w.shape
+        ctx.need_dw = bool(ctx.needs_input_grad[1])
+        return out.view(z.shape)
+
+    @staticmethod
+    def backward(  # pragma: no cover - device only
+        ctx: Any, d_out: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None, None]:  # pragma: no cover
+        """`dz_j = Σₖ wₖ·fₖ'(z_j)·dy_j`, `dwₖ = Σ_j fₖ(z_j)·dy_j`."""
+        if d_out is None:
+            return None, None, None, None
+        built = _require("mixture")
+        zf, wf = ctx.saved_tensors
+        cols = zf.shape[-1]
+        rows, k = zf.shape[0], len(ctx.kinds)
+        df = _flat(d_out, cols)
+        dz = torch.empty_like(zf)
+        dw = torch.zeros((rows, k), dtype=torch.float32, device=zf.device) if ctx.need_dw else dz
+        slots = ctx.kinds + (0,) * (MAX_MIX_ENTRIES - k)
+        built["mix"][(rows,)](
+            zf, wf, dz, dz, dw, df, cols, k, ctx.per_row, True, ctx.need_dw, *slots, MIX_BLOCK
+        )
+        _tally()
+        grad_w = None
+        if ctx.need_dw:
+            grad_w = dw.reshape(ctx.w_shape) if ctx.per_row else dw.sum(0)
+            grad_w = grad_w.to(ctx.w_dtype)
+        return dz.view(ctx.shape), grad_w, None, None
+
+
+def mixture_code(name: str) -> int:
+    """Return the kernel's code for dictionary entry `name`; an unknown one is refused."""
+    try:
+        return MIX_CODES[name]
+    except KeyError:
+        raise LoudError(
+            f"{name!r} is not a dictionary entry the fused mixture computes",
+            f"the kernel knows: {', '.join(MIX_CODES)}; run with the fused flag off "
+            "for a dictionary it does not",
+        ) from None
+
+
+def mixture(
+    z: torch.Tensor, w: torch.Tensor, kinds: tuple[int, ...], *, per_row: bool
+) -> torch.Tensor:
+    """Return `Σₖ wₖ·fₖ(z)`, one pass over `z` and one launch — the eager chain's twin.
+
+    `per_row` says whether `w` is the `[rows, K]` per-token mixture (`moa`) or one shared
+    `[K]` vector (`la`). The caller is `model.ffn._accumulate`, which keeps the chunked,
+    checkpointed chain behind the same flag-off branch so a step with the flag off is the
+    step it was before this kernel existed.
+    """
+    if not _FUSED:
+        raise LoudError(
+            "fused.mixture ran with the fused flag off",
+            "this is the kernel entry point, not a fallback: call it only when "
+            "fused.fused() is true, or the eager chain reports a launch that never ran",
+        )
+    if not z.is_cuda:
+        _require("mixture")
+    if not 1 <= len(kinds) <= MAX_MIX_ENTRIES:
+        raise LoudError(
+            f"a fused mixture of {len(kinds)} entries",
+            f"the kernel sums 1 to {MAX_MIX_ENTRIES} entries with one constexpr branch "
+            "each; shorten the dictionary or run with the fused flag off",
+        )
+    return cast(torch.Tensor, _Mixture.apply(z, w, tuple(kinds), per_row))
 
 
 def residual_norm(
