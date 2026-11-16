@@ -111,6 +111,15 @@ def _within(got: torch.Tensor, want: torch.Tensor, tol: float) -> bool:
     return bool(((got.float() - want.float()).abs().max() <= tol * scale).item())
 
 
+#: The one gradient in the bank that is a SUM over every row of a quantity with both signs
+#: — `Σ_rows (dw_k − Σ_j dw_j·w_j)·w_k·(1−σ_k)`, the mixture bias. Its terms are O(1) and
+#: it lands at 2.7e-3, so an elementwise band relative to its own max is a band on three
+#: orders of cancellation rather than on the kernel. Measured at bf16: 1.74e-2, i.e. 1.1
+#: bands; every other gradient in the bank is held to `BF16_PARITY` (measured worst 5.4e-3).
+#: This entry is the measurement with the margin a different row count needs.
+CANCELLING = {"shared.mix.bias": 3.0 * BF16_PARITY}
+
+
 #: One path's `(output, {name: grad})`, as `_grads` returns it.
 Run = tuple[torch.Tensor, dict[str, torch.Tensor]]
 
@@ -269,7 +278,9 @@ def test_bf16_parity_forward_and_every_gradient() -> None:
     scale = float(y0.abs().max())
     assert float((y1.float() - y0.float()).abs().max()) <= BF16_PARITY * scale
     for name in g0:
-        assert _within(g1[name], g0[name], BF16_PARITY), f"gradient {name} left the bf16 ulp band"
+        assert _within(g1[name], g0[name], CANCELLING.get(name, BF16_PARITY)), (
+            f"gradient {name} left the bf16 ulp band"
+        )
 
 
 @ON_CARD
@@ -329,12 +340,17 @@ def test_the_launch_count_is_two_per_group_forward_and_four_with_the_backward() 
     kb.set_bank(True)
     kb.reset_bank_launches()
     y = bank(x)
-    assert kb.bank_launches() == 2 * groups, "prep + fwd per group, forward"
+    #: Two per routed group (prep + fwd), plus the shared expert's own two: it is ONE
+    #: expert over every row, so it is one group of one with no padding.
+    assert kb.bank_launches() == 2 * groups + 2, "prep + fwd per group, forward"
     y.square().mean().backward()
-    #: Four in the backward: the checkpointer re-runs prep and fwd (the `Stacked` copies
-    #: are 54 MiB a group and retaining twelve layers of them is 4.5 GiB), then
-    #: `bwd_rows` and `bwd_cols` write the gradients. `moe.py._fused_group` says why.
-    assert kb.bank_launches() == 6 * groups, "recompute + two gradient kernels per group"
+    #: Four in the backward per routed group: the checkpointer re-runs prep and fwd (the
+    #: `Stacked` copies are 54 MiB a group and retaining twelve layers of them is 4.5 GiB),
+    #: then `bwd_rows` and `bwd_cols` write the gradients. `moe.py._fused_group` says why.
+    #: The shared expert is checkpointed for the same reason (twelve retained stacks and
+    #: twelve saved slot maps is 570 MiB the step cannot spare — measured as an OOM without
+    #: it), so it costs 4 as well: 2 forward + 4 backward is `6 * groups + 6`.
+    assert kb.bank_launches() == 6 * groups + 6, "recompute + two gradient kernels per group"
     kb.set_bank(False)
 
 

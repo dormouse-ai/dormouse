@@ -46,6 +46,20 @@ group is past the capacity REFUSES loudly — a device-side assert on the card, 
 on the CPU — because this bank has no drop policy to fall back on; `dispatch_sigma` and
 `CAPACITY_RATIO` are the knobs, and the refusal names the second.
 
+MEASURED: THE PADDING IS NOT WHAT THE BANK COSTS, so a measured maximum buys nothing. At
+b8 x s1024 the assignment's largest group is 317 rows against a mean of 256 (1.24x), so a
+dispatch sized from `counts.max()` would be 20 480 slots against this formula's 32 768.
+Forced both ways at one group size, one layer's fwd+bwd is 106.7 ms at 512 slots and
+107.4 ms at 320 — the tighter layout is 0.7 ms SLOWER, and the same A/B at the real
+step's 12 layers is inside run-to-run noise. The reason is `fwd_kernel`'s first three
+lines: a tile whose rows are all past `cnt` returns before it issues any work, so the
+padding costs the allocation and the grid slots, not the arithmetic. What it would cost
+is the host read: `counts.max()` has to come back from the device before a tensor can be
+sized, twelve times a forward, and that read is the one this path was built to remove
+(`tests/test_moe_dispatch.py::test_the_forward_does_not_synchronise` runs the forward
+under sync-debug mode to keep it removed). Recorded so it is not re-derived: the 2.0x is
+cheap, and the 780 ms that looked like it belonged to the padding was the shared expert.
+
 MEMORY IS ONE GROUP'S SLAB, NOT THE BATCH'S. Two buffers are proportional to the routed
 rows `R = n·topk`: the `[E·capacity, d]` layout (the `[R, d]` gather the loop did per
 group, plus the padding) and the slots it is gathered from. The wide buffers are
@@ -334,12 +348,54 @@ class MoEFFN(nn.Module):
         index, weight, counts = self.router(x, counters)
         y = self._dispatch(x, index, weight, counts, counters)
         if self.shared is not None:
-            y = y + self.shared(x, counters)
+            y = y + self._shared_write(x, counts)
             if counters is not None:
                 counters.count("moe_shared")
+                #: The same read either way: the fused chain is that expert's arithmetic,
+                #: so the row it reports is the row it read (`_Glu.count_read`).
+                cast(MoaFFN, self.shared).count_read(x.shape[0], counters)
         if counters is not None:
             counters.count("moe_fwd")
         return y
+
+    def _shared_write(self, x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+        """Return the always-on expert's write: ONE expert over every row, through the kernel.
+
+        It is one expert, not a bank — `capacity` is exactly `n`, because every row is its
+        own slot and nothing is padded — and running it through the same chain the routed
+        experts use is worth 3.1x: measured at b8 x s1024, the eager arm is 87.5 ms of
+        fwd+bwd per layer against 28.5 ms here, because `MoaFFN._rows` checkpoints every
+        2 048-row slice (the recompute is a second pass over the mixture's `[rows, d_ffn]`
+        slabs) and this path never materialises one. The routed set pays the checkpoint
+        because retaining its factor stacks is 4.5 GiB; the shared expert's is 21 MiB.
+
+        Falls back to the eager arm wherever the fused chain cannot run — the CPU anchor,
+        the dense control — through the same `_fused_ready` predicate the dispatch uses, so
+        the two cannot disagree about whether a kernel ran.
+        """
+        shared = self.shared
+        if shared is None or not self._fused_ready(x):
+            return x if shared is None else cast(torch.Tensor, cast(MoaFFN, shared)(x))
+        n = x.shape[0]
+        stride = torch.arange(n, dtype=torch.int32, device=x.device)
+        live = torch.full((1,), n, dtype=counts.dtype, device=x.device)
+        kinds = cast("MoaFFN", shared)._kinds
+        if kinds is None:  # pragma: no cover - `_fused_ready` read the same field
+            return cast(torch.Tensor, cast(MoaFFN, shared)(x))
+        sides = cast("MoaFFN", shared).sides
+
+        def run(rows: torch.Tensor) -> torch.Tensor:
+            #: The `Stacked` copy is built INSIDE the recomputed region for `_fused_group`'s
+            #: reason: twelve retained copies (21 MiB each) is 252 MiB, and the kernel's
+            #: own saved slot maps are another 320 MiB — neither fits beside a 13.1 GiB
+            #: peak (measured as an OOM when the copy was hoisted out of the checkpoint).
+            return fused_bank.bank(
+                rows, stride, live, n, self._stacked([cast(_Glu, shared)]), kinds=kinds, sides=sides
+            )
+
+        if torch.is_grad_enabled() and x.requires_grad:  # pragma: no cover - launches
+            return checkpoint(run, x, use_reentrant=False, preserve_rng_state=False)
+        return run(x)  # pragma: no cover - launches
 
     def capacity(self, routed: int) -> int:
         """Rows per expert slot: `CAPACITY_RATIO` of the mean, floored by counting noise.
