@@ -95,6 +95,7 @@ __all__ = [
     "NS_GROUPED_COUNTER",
     "NS_POWER_ITERS",
     "NS_STEPS",
+    "ROUTER_LR_COUNTER",
     "Muon",
     "colrow",
     "muon_direction",
@@ -129,6 +130,11 @@ MUON_LR = 0.02
 #: `Muon.step` when grouping is on and a `Counters` object is supplied, so a declared but
 #: absent mechanism fails `Counters.check()` instead of reporting eager timings.
 NS_GROUPED_COUNTER = "ns_grouped"
+
+#: Counter incremented by `Muon.step` when the router's dedicated small-LR group steps.
+#: `MixOptimizer.step` enables the matching mechanism, so a declared split whose group
+#: never stepped fails `Counters.check()`.
+ROUTER_LR_COUNTER = "router_lr_group"
 
 
 def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -370,6 +376,8 @@ class Muon(Optimizer):
             lr = group["lr"]
             decay = group["weight_decay"]
             head_split = group.get("head_split")
+            if group.get("is_router") and counters is not None:
+                counters.count(ROUTER_LR_COUNTER, len(group["params"]))
             for param in group["params"]:
                 if param.grad is None:
                     continue
