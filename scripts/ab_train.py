@@ -68,7 +68,6 @@ def _on_cuda() -> None:
         cls.batch = batch_on_cuda
 
 
-
 def main() -> int:
     """Train one config on the card in bf16 and leave a receipt beside its journal."""
     parser = argparse.ArgumentParser(description=__doc__)

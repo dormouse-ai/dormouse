@@ -62,8 +62,7 @@ def build(
     lines = text.splitlines()
     for key, value in CHANGES[family].items():
         lines = [
-            f"{key} = {value}" if line.split("=", 1)[0].strip() == key else line
-            for line in lines
+            f"{key} = {value}" if line.split("=", 1)[0].strip() == key else line for line in lines
         ]
     head = "\n".join(lines)
     # The stack files declare the full-corpus budget and the shipped batch; the run
