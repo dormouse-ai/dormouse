@@ -240,9 +240,14 @@ def train(
     smoke: bool = False,
     until: int | None = None,
     approve: bool = False,
+    graph: bool = False,
     echo: Callable[[str], None] = print,
 ) -> dict[str, Any]:
-    """Run one config end to end and return its receipt: journal, numbers, artifact."""
+    """Run one config end to end and return its receipt: journal, numbers, artifact.
+
+    `graph` replays a captured whole step after warm-up. It is OFF until the live-shape
+    parity gate passes; a capture that refuses is LOUD, never an eager fallback.
+    """
     recipe = RunRecipe.read(config)
     budget = SMOKE_STEPS if smoke else recipe.steps
     steps = budget if until is None else min(until, budget)
@@ -291,9 +296,12 @@ def train(
             schedule=schedule,
             journal=journal,
             eval_stream=window,
+            use_graph=graph,
         )
     else:
-        trainer = Trainer(assembled.model, stream, optim, schedule, cfg, journal, window)
+        trainer = Trainer(
+            assembled.model, stream, optim, schedule, cfg, journal, window, use_graph=graph
+        )
         stream.mix.record(journal, 0)
     if journal.last("start") is None:
         report.note(
@@ -310,6 +318,7 @@ def train(
             plan_flops=priced,
             plan_source=plan_source,
             step_flops=per_step,
+            graph=graph,
         )
     resumed_from = trainer.step
     echo(f"run {directory}: {steps} steps from {resumed_from}, {recipe.schedule} schedule")
@@ -334,6 +343,8 @@ def train(
         "plan_source": plan_source,
         "step_flops": per_step,
         "resumed_from": resumed_from,
+        "graph": graph,
+        "graph_replays": int(trainer.counters.counts.get("graph_replays", 0)),
     }
     if trainer.step >= budget:
         receipt.update(_finish(recipe, trainer, window, directory, counts, smoke, echo))

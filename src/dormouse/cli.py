@@ -78,6 +78,11 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="a run journal whose eval events measure the quality/data elasticity",
     )
+    plan.add_argument(
+        "--graph",
+        action="store_true",
+        help="show whether a captured whole step is enabled (parity with dorm train --graph)",
+    )
 
     run = sub.add_parser("train", help="run a config: model, mixture, loop, journal, artifact")
     run.add_argument("config", help="path to a run .toml, e.g. configs/dormouse_1b.toml")
@@ -86,6 +91,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--resume", action="store_true", help="continue runs/<id> from the checkpoint")
     run.add_argument("--steps", type=int, default=None, help="absolute horizon, to pause a run")
     run.add_argument("--runs", default="runs", help="the directory run directories live in")
+    run.add_argument(
+        "--graph",
+        action="store_true",
+        help="replay a captured whole step after warm-up (default off until parity passes)",
+    )
 
     score = sub.add_parser("eval", help="score a checkpoint: the harness table and its BPB")
     score.add_argument("checkpoint", help="runs/<id>/final.pt, or the run directory")
@@ -103,7 +113,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "status":
         return _status(args.journal)
     if args.command == "plan":
-        return _plan(args.config, args.journal)
+        return _plan(args.config, args.journal, args.graph)
     if args.command == "train":
         return _train(args)
     if args.command == "eval":
@@ -150,7 +160,7 @@ def _smi() -> str | None:
     return out.stdout.strip() or None
 
 
-def _plan(config: str, journal: str | None = None) -> int:
+def _plan(config: str, journal: str | None = None, graph: bool = False) -> int:
     """Print the plan for a config: the stack, its bill, its step, its levers.
 
     Imported here rather than at module scope: `plan` is the only command that needs
@@ -162,6 +172,11 @@ def _plan(config: str, journal: str | None = None) -> int:
     elasticity, source = _elasticity(journal)
     for line in plan_lines(_spec(config), elasticity=elasticity, elasticity_from=source):
         print(line)
+    print(
+        "graph=on (captured whole step after warm-up; a failed capture refuses loudly)"
+        if graph
+        else "graph=off (eager step; pass --graph to both plan and train to enable replay)"
+    )
     return 0
 
 
@@ -180,6 +195,7 @@ def _train(args: argparse.Namespace) -> int:
         smoke=args.smoke,
         until=args.steps,
         approve=args.yes,
+        graph=args.graph,
         echo=print,
     )
     print(
