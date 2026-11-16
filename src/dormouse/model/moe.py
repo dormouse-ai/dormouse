@@ -62,16 +62,17 @@ transient is bounded by an expert group's slab and never by `E·capacity·f` —
 2.0 bank the old docstring refused, 1.38 GiB at b24 in fp32. At b8 in fp32 the group is
 32 experts (2 groups per call), at b16 17 (4), and the slab in flight is ~250 MiB.
 
-ONE HOST READ REMAINS, AND IT IS THE PASS COUNT. `capacity` comes from the batch's shape
-and costs nothing; but how many passes a dropless dispatch needs is a function of the
-routing's own histogram (`ceil(largest group / capacity)`), and no device value can size a
-Python loop. So `_passes` reads `counts.max()` once per forward — the same read the
-overflow guard made on the CPU, now used to decide instead of only to assert. That is the
-one device→host synchronisation in this path, and it is unavoidable while the dispatch is
-both dropless and shape-static: the alternative is a fixed number of passes, which either
-pays 2x on every uniform step or drops a row on a skewed one. The consequence is stated
-rather than hidden: a forward is no longer CUDA-graph capturable, because its control flow
-depends on a device value (`train/graph.py` says what a host read does to a capture).
+ONE HOST READ REMAINS IN EAGER, NONE IN CAPTURE. `capacity` comes from the batch's
+shape and costs nothing; the passes a dropless dispatch needs is a function of the
+routing's own histogram. The eager forward reads `counts.max()` once to size its
+Python loop — one device→host sync, a hard error inside a CUDA graph. So `StepGraph`
+sets `fixed_passes`: the loop runs `MAX_DISPATCH_PASSES` times with the same write
+mask, and a pass that owns no rows contributes an exact zero (the masked gather is
+zeroed and multiplied by `keep=False`). Every row is still owned by one slot, so the
+fixed loop is bit-identical to the eager one for every routing the eager path
+accepts. A routing wider than the fixed slots cannot raise inside the graph; it sets
+`overflow` on device, and the eager half after the replay refuses the step. No host
+value decides control flow inside the capture and no row is dropped silently.
 
 COUNTERS (a zero must be a measurement, not a default):
 
@@ -257,6 +258,8 @@ class MoEFFN(nn.Module):
     guess which axis the tokens are on. Flatten at the call site.
     """
 
+    _overflow: torch.Tensor
+
     def __init__(
         self,
         d_model: int = 832,
@@ -332,6 +335,18 @@ class MoEFFN(nn.Module):
         self.shared = (
             self.expert_spec.build(write_std=write_std, device=device) if n_shared else None
         )
+        #: A captured forward cannot size its Python loop from a device value. `StepGraph`
+        #: sets this to `MAX_DISPATCH_PASSES`; the eager path leaves it None and keeps the
+        #: data-dependent count. The non-persistent buffer moves with `.to()` but stays out
+        #: of `state_dict`, so a checkpoint does not inherit a stale overflow from capture.
+        self.fixed_passes: int | None = None
+        self.register_buffer(
+            "_overflow", torch.zeros((), dtype=torch.bool, device=device), persistent=False
+        )
+
+    def overflowed(self) -> bool:
+        """Whether the last fixed-pass dispatch left a routed row with no slot."""
+        return bool(self._overflow)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`x [n, d]` → the bank's write, same shape: routed assignments + shared."""
@@ -415,7 +430,16 @@ class MoEFFN(nn.Module):
         #: of rows the experts before it took. Device-only, like everything below.
         starts = counts.cumsum(0) - counts
         local = torch.arange(routed, device=x.device) - starts.index_select(0, expert)
-        passes = self._passes(counts, capacity, routed)
+        passes = (
+            self.fixed_passes
+            if self.fixed_passes is not None
+            else self._passes(counts, capacity, routed)
+        )
+        if self.fixed_passes is not None:
+            #: The graph cannot raise, so record overflow on device; the eager half after
+            #: the replay reads the flag and refuses. No `.item()` lives inside the capture.
+            over: torch.Tensor = (local >= passes * capacity).any()
+            self._overflow.copy_(over)
         pad = self.n_experts * capacity
         #: One row past the bank: rows this pass does not own are summed there and never
         #: read (`out[trash]` is zeroed). `index_copy_` needs unique slots and the rows of
