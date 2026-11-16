@@ -176,3 +176,61 @@ def test_widths_and_kernel_sizes_are_validated() -> None:
 
 def test_the_repr_names_the_kernel() -> None:
     assert "chunk=8" in repr(KDA(D_MODEL, N_HEADS, HEAD_DIM, chunk=8))
+
+
+def _retained(layer: KDA, x: torch.Tensor) -> int:
+    """Bytes of unique storage kept alive for the backward pass of one forward."""
+    kept: dict[int, int] = {}
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        kept[tensor.untyped_storage().data_ptr()] = tensor.untyped_storage().nbytes()
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        layer.run(x)
+    return sum(kept.values())
+
+
+def test_the_chunk_graph_is_recomputed_not_retained(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpointing the chunk loop: the same forward, the same gradients, less kept.
+
+    The chunk graph is `O(T/chunk)` tensors of `[batch, heads, chunk, chunk, head_dim]` —
+    measured 987 MiB per layer at b1 x s1024, 8.7 GiB over the nine KDA layers, which is
+    the second allocation that does not fit on a 16 GiB card. Recomputing each chunk in
+    the backward keeps the five inputs instead.
+
+    NOTHING ELSE MOVES: the loop is the same arithmetic on the same chunks in the same
+    order, so the write, the final state and every gradient are `torch.equal` to the arm
+    without the checkpoint — this is a recomputation, not a rearrangement.
+    """
+    from dormouse.model.attn_variants import kda as module
+
+    torch.manual_seed(13)
+    layer = KDA(D_MODEL, N_HEADS, HEAD_DIM, chunk=8)
+    x = torch.randn(2, 128, D_MODEL)
+
+    def run(checkpointed: bool) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        monkeypatch.setattr(module, "CHECKPOINT_CHUNKS", checkpointed)
+        for parameter in layer.parameters():
+            parameter.grad = None
+        y, state = layer.run(x)
+        (y.square().mean() + state.square().mean() * 0.1).backward()
+        gradients = {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
+        return y.detach(), state.detach(), gradients
+
+    monkeypatch.setattr(module, "CHECKPOINT_CHUNKS", False)
+    kept = _retained(layer, x)
+    monkeypatch.setattr(module, "CHECKPOINT_CHUNKS", True)
+    recomputed = _retained(layer, x)
+    without = run(False)
+    with_ = run(True)
+    print(f"\nretained for the backward: {kept / 2**20:.2f} MiB -> {recomputed / 2**20:.2f} MiB")
+    assert torch.equal(without[0], with_[0])
+    assert torch.equal(without[1], with_[1])
+    assert sorted(without[2]) == sorted(with_[2])
+    for name, gradient in without[2].items():
+        assert torch.equal(gradient, with_[2][name]), name
+    #: Per-chunk checkpoints keep the carry and each chunk's output too; the graph is
+    #: what must go. At this width that is 3.0x less retained (measured: 1.03 -> 0.36 MiB);
+    #: at b1 x s1024 the same setting is 4.6 GiB of chunk graph against 0.
+    assert recomputed < kept / 2, (recomputed, kept)
