@@ -376,13 +376,22 @@ class MoEFFN(nn.Module):
         shared = self.shared
         if shared is None or not self._fused_ready(x):
             return x if shared is None else cast(torch.Tensor, cast(MoaFFN, shared)(x))
+        return self._shared_kernel(x, counts, cast(MoaFFN, shared))
+
+    def _shared_kernel(  # pragma: no cover - launches the kernels
+        self, x: torch.Tensor, counts: torch.Tensor, shared: MoaFFN
+    ) -> torch.Tensor:
+        """Run the given expert's factorised chain over every row as one unpadded group."""
         n = x.shape[0]
         stride = torch.arange(n, dtype=torch.int32, device=x.device)
         live = torch.full((1,), n, dtype=counts.dtype, device=x.device)
-        kinds = cast("MoaFFN", shared)._kinds
-        if kinds is None:  # pragma: no cover - `_fused_ready` read the same field
-            return cast(torch.Tensor, cast(MoaFFN, shared)(x))
-        sides = cast("MoaFFN", shared).sides
+        kinds = shared._kinds
+        if kinds is None:
+            raise LoudError(
+                f"the fused chain cannot mix {getattr(shared, 'dictionary', ())}",
+                "`_fused_ready` reads the same field, so this is the anchor path's job",
+            )
+        sides = shared.sides
 
         def run(rows: torch.Tensor) -> torch.Tensor:
             #: The `Stacked` copy is built INSIDE the recomputed region for `_fused_group`'s
@@ -393,9 +402,9 @@ class MoEFFN(nn.Module):
                 rows, stride, live, n, self._stacked([cast(_Glu, shared)]), kinds=kinds, sides=sides
             )
 
-        if torch.is_grad_enabled() and x.requires_grad:  # pragma: no cover - launches
+        if torch.is_grad_enabled() and x.requires_grad:
             return checkpoint(run, x, use_reentrant=False, preserve_rng_state=False)
-        return run(x)  # pragma: no cover - launches
+        return run(x)
 
     def capacity(self, routed: int) -> int:
         """Rows per expert slot: `CAPACITY_RATIO` of the mean, floored by counting noise.
