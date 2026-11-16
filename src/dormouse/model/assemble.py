@@ -35,6 +35,8 @@ from dormouse_core.plan import Plan
 from torch import nn
 
 from .. import economics
+from ..train import compiled
+from ..train.graph import StepGraph
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
 from . import quant, registry
@@ -88,6 +90,10 @@ class Assembled:
         self.model = model
         self.pieces = pieces
         self.bank = bank
+        #: One `Counters` for the life of the stack. A fresh one per step changes a Python
+        #: object's identity between compiled calls, which makes dynamo guard and recompile
+        #: the whole step every time — a compile loop reported as a compiled run.
+        self.counters = Counters()
 
     # ------------------------------------------------------------------ the bill
     def report(self) -> dict[str, int]:
@@ -122,20 +128,57 @@ class Assembled:
         *,
         optimizer: MixOptimizer,
         accum: int = 1,
+        graph: StepGraph | None = None,
     ) -> tuple[StepResult, Counters]:
         """One optimizer step, with the objective's counter declared where it is read.
 
-        `ntp_loss` is counted after `train_step` and enabled last on purpose: the
-        stack's own `Counters.check()` runs inside its forward, so a counter the step
-        produces must not be enabled before the forward has had its chance to finish.
+        `graph` replaces the forward/backward half with a replay of a captured one
+        (`train/graph.py`); the clip, the firewall and `optimizer.step()` are the same
+        eager statements either way. `ntp_loss` is counted after the step and enabled
+        last on purpose: the stack's own `Counters.check()` runs inside its forward, so a
+        counter the step produces must not be enabled before that forward has finished.
         """
-        counters = Counters()
-        result = train_step(self.model, ids, optimizer=optimizer, accum=accum, counters=counters)
+        counters = self.counters
+        counters.counts.clear()
+        counters.enabled.clear()
+        counters.required.clear()
+        if graph is not None:
+            counters.enable(
+                "graph",
+                counter="graph_replays",
+                why="the step must replay a captured graph, not run eager",
+            )
+            result = graph.run(ids, counters=counters)
+        else:
+            result = train_step(
+                self.model,
+                ids,
+                optimizer=optimizer,
+                accum=accum,
+                #: A `Counters` is a Python object dynamo specialises on and its `count`
+                #: calls are side effects it cannot trace: under compile the step counts
+                #: what it can see from outside (graphs, replays) and the mechanism
+                #: counters stay the eager path's own, where they can still add up.
+                counters=None if compiled.enabled() else counters,
+            )
         if not result.skipped:
             counters.count("ntp_loss")
         counters.enable("ntp", counter="ntp_loss", why="the step computes the NTP loss")
+        if compiled.enabled():
+            #: Enabled and counted after the step, and zero is a hard error: a compile that
+            #: built no graph ran the eager path under a compiled name.
+            counters.enable(
+                "compile",
+                counter=compiled.COUNTER,
+                why="torch_compile=true: the step must build a graph, not fall back to eager",
+            )
+            counters.count(compiled.COUNTER, compiled.unique_graphs())
         counters.check()
         return result, counters
+
+    def capture(self, ids: torch.Tensor, *, optimizer: MixOptimizer, accum: int = 1) -> StepGraph:
+        """Capture one step's forward/backward at `ids`'s shape; see `train/graph.py`."""
+        return StepGraph(self.model, optimizer, ids, accum=accum)
 
 
 def assemble(
@@ -169,6 +212,8 @@ def assemble(
         device=device,
     )
     _quantize(model, spec)
+    if spec.torch_compile:
+        compiled.checked(model)
     return Assembled(spec=spec, model=model, pieces=pieces, bank=bank)
 
 
