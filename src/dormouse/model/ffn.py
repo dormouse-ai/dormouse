@@ -53,11 +53,21 @@ reason the bank OOM'd on a 16 GiB card. `_accumulate` sums into one buffer in ro
 chunks and lets the backward recompute each entry, which measures 0.96x that FFN's
 peak; the output and every gradient stay `torch.equal` to the chain
 (`tests/test_ffn_mixture.py` holds the memory gate and that proof).
+
+THE FUSED PATH IS THE SAME SUM IN ONE LAUNCH. With `DORMOUSE_FUSED` on, `_accumulate`
+hands `Σₖ wₖ·fₖ(z)` to `kernels/fused.mixture`: integer codes for the dictionary, not the
+`fns` callables, because a callable argument to `torch.utils.checkpoint` is what kept
+dynamo from tracing this module at all. That one kernel replaces 6 checkpoints and ~25
+pointwise launches per slice, and it keeps `z` and `w` where the chain's graph kept `K`
+slabs of `z`. The flag off is the chain above, bit for bit — the two are held against
+each other in `tests/test_kernels.py`, fp32 at the kernel's own bound and bf16 at the
+chain's rounding.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -66,10 +76,15 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ..kernels import fused
 from .activations import DEFAULT_DICTIONARY, activation, resolve
 from .tsct import FactorLinear, project
 
-__concepts__ = ("GatedFFN", "LaFFN", "MoaFFN")
+__concepts__ = ("GatedFFN", "LaFFN", "MoaFFN", "Stacked")
+
+#: One matrix of the batched read, as the pair the storage gives it: `x·a·b`, and
+#: `b is None` on the dense arm (`a` is then the transposed `[in, out]` weight).
+Matrix = tuple[torch.Tensor, torch.Tensor | None]
 
 #: Std of the two `d -> d_ffn` halves; the residual-writing `down` takes the
 #: caller's `write_std` (the depth-dependent scale, see `model.Transformer`).
@@ -86,6 +101,60 @@ FFN_SIDES: tuple[str, ...] = ("one", "bi")
 #: number governs the dictionary's transient (measured 1.35x vs 1.07x the plain FFN's peak
 #: at 8192 rows unchunked).
 MIX_CHUNK_ROWS = 2048
+
+
+@dataclass(frozen=True)
+class Stacked:
+    """A GROUP of experts' parameters, as the `[group, ...]` batches the dispatch reads.
+
+    One expert's matrix is `u [in, r]`/`v [r, out]` (or a dense `W [out, in]`), so a
+    group of `g` of them is a 3-D batch and its read is one `matmul` per matrix instead
+    of `g` module calls — the difference between 4 900 dispatches and ~40 per bank call.
+
+    `mix` is the `d → K` gate as `([group, d, K]`, `[group, K])` — the module's weight
+    transposed, because the read is `x·Wᵀ` — and `coef` is the `[group, K]` priors; both
+    are `None` on the arms that have none. Nothing here checks a row's expert id: a
+    group's rows are already contiguous and the caller masks padding.
+    """
+
+    gate: Matrix
+    up: Matrix
+    down: Matrix
+    mix: tuple[torch.Tensor, torch.Tensor] | None = None
+    coef: torch.Tensor | None = None
+
+
+def _apply(matrix: Matrix, x: torch.Tensor) -> torch.Tensor:
+    """`x [..., in] · matrix` — one `matmul` dense, two through the rank-`r` factors."""
+    a, b = matrix
+    return x @ a if b is None else (x @ a) @ b
+
+
+def stack_matrices(matrices: Sequence[nn.Linear | FactorLinear]) -> Matrix:
+    """Stack one matrix of a group of experts into the batched read's form.
+
+    `g` factors `[d, r]`/`[r, f]` become one `[g, d, r]`/`[g, r, f]` batch; `g` dense
+    weights `[f, d]` become one `[g, d, f]` batch (transposed, because the read is
+    `x·Wᵀ`). The stack is a COPY of that group's parameters, made once per bank call:
+    at the live bank the whole 342.9M-parameter routed set is ~3 ms of copy, against the
+    20 s a step spent on kernel launches.
+    """
+    if isinstance(matrices[0], FactorLinear):
+        factors = cast("Sequence[FactorLinear]", matrices)
+        return torch.stack([m.u for m in factors]), torch.stack([m.v for m in factors])
+    dense = cast("Sequence[nn.Linear]", matrices)
+    return torch.stack([m.weight for m in dense]).transpose(1, 2), None
+
+
+def _batched(value: torch.Tensor | None, what: str) -> torch.Tensor:
+    """Return a `Stacked` field an arm needs; a missing one is a construction bug."""
+    if value is None:
+        raise LoudError(
+            f"the batched read of a mixture needs its {what}",
+            "build the group's `Stacked` through `MoEFFN._stacked`, which takes it from "
+            "the arms themselves",
+        )
+    return value
 
 
 def neutral_width(d_ffn_gelu: int) -> int:
@@ -114,12 +183,32 @@ def _entry(
     return w * fn(z)
 
 
+def _codes(dictionary: Sequence[str]) -> tuple[int, ...] | None:
+    """Return the fused kernel's codes for a dictionary, or `None` if it does not know it.
+
+    `None` is not a fallback: with the flag on, `_accumulate` refuses it by name. With
+    the flag off the codes are never read, so a dictionary outside the kernel's table is
+    still a mixture the eager chain runs.
+    """
+    try:
+        return tuple(fused.mixture_code(name) for name in dictionary)
+    except LoudError:
+        return None
+
+
 def _accumulate(
     w: torch.Tensor,
     z: torch.Tensor,
     fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
+    kinds: tuple[int, ...] | None,
+    per_row: bool,
 ) -> torch.Tensor:
-    """`Σₖ wₖ·fₖ(z)` into one buffer, in row chunks, entries recomputed not kept.
+    """`Σₖ wₖ·fₖ(z)`: one fused launch when the flag is on, else the chunked chain.
+
+    `per_row` is where `w` lives: `[rows, K]` for a per-token mixture (`moa`), `[K]` for
+    one shared vector (`la`). The fused branch hands the kernel integer codes, never the
+    `fns` callables — a callable argument to `torch.utils.checkpoint` is what stopped
+    `torch.compile` reaching the bank's forward at all (see `kernels/fused.py`).
 
     WHY NOT THE PLAIN SUM. A chain of `K` multiplies keeps every `fₖ(z)` alive for
     backward: `K` copies of a `[rows, d_ffn]` buffer, 604 MiB each at the live
@@ -144,6 +233,17 @@ def _accumulate(
     `w` carries the trailing `K`, so `w[..., k:k+1]` is per token, not per channel —
     which is why a chunk of rows is a chunk of both.
     """
+    if fused.fused():
+        if kinds is None:
+            raise LoudError(
+                f"a {len(fns)}-entry dictionary is not one the fused mixture computes",
+                "run with DORMOUSE_FUSED=0, or use entries from "
+                "kernels.fused.MIX_CODES; a flag that runs the chain instead reports a "
+                "kernel that never executed",
+            )
+        return fused.mixture(z, w, kinds, per_row=per_row)
+    if not per_row:
+        w = w.expand(*z.shape[:-1], -1)
     rows = z.shape[-2]
     if rows <= MIX_CHUNK_ROWS:
         return _mix_rows(w, z, fns)
@@ -166,9 +266,11 @@ def _mix_rows(
     fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
 ) -> torch.Tensor:
     """One chunk's mixture: the accumulation `_accumulate` splits the rows into."""
-    out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False)
+    out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False, preserve_rng_state=False)
     for k in range(1, len(fns)):
-        part = checkpoint(_entry, fns[k], w[..., k : k + 1], z, use_reentrant=False)
+        part = checkpoint(
+            _entry, fns[k], w[..., k : k + 1], z, use_reentrant=False, preserve_rng_state=False
+        )
         out = out + part
     return out
 
@@ -185,6 +287,11 @@ class _Glu(nn.Module):
     `d·r + r·f` and runs two matmuls (`tsct.py`). At zero they are the dense control
     arm — `n·f` parameters, one matmul — and nothing else about the arm changes.
     """
+
+    #: The fused mixture's codes for the arm's dictionary, or `None` when the kernel does
+    #: not compute it. Only the two mixture arms set it; the default is what
+    #: `kernels/bank.py` reads to decide whether the fused chain may run this arm at all.
+    _kinds: tuple[int, ...] | None = None
 
     def __init__(
         self,
@@ -250,7 +357,7 @@ class _Glu(nn.Module):
         """One slice's write, recomputed in the backward when the forward has a graph."""
         if not (torch.is_grad_enabled() and x.requires_grad):
             return self._write(x)
-        return checkpoint(self._write, x, use_reentrant=False)
+        return checkpoint(self._write, x, use_reentrant=False, preserve_rng_state=False)
 
     def _write(self, x: torch.Tensor) -> torch.Tensor:
         """One slice's arithmetic: what each arm below implements."""
@@ -258,9 +365,53 @@ class _Glu(nn.Module):
             "a _Glu subclass implements _write: the three matrices are its bill, not its behaviour",
         )
 
+    # ------------------------------------------------------------ the batched read
+    def batch_write(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`x [group, rows, d_model]` → the same shape: `group` experts in one read.
+
+        The dispatch's layout, not a second arithmetic: `_write` runs one expert's rows
+        through three matrices, this runs `group` experts' rows through the same three as
+        a 3-D batch (`Stacked`), and `_hidden` is the mixture each arm below already has.
+
+        THE MIXTURE RUNS ON FLAT ROWS. Between the reads the three matmuls' `[group, rows,
+        ·]` slabs are VIEWED as `[group·rows, ·]` (`the same bytes, one dimension`), so
+        `_accumulate` chunks the mixture at `MIX_CHUNK_ROWS` rows however many experts the
+        slab holds — the padded path's transient is then the arm's own slice bound and not
+        `group·capacity` slabs of `d_ffn`. That is 50 MiB at the live width instead of
+        380 MiB at b8's capacity.
+        """
+        g = _apply(stacked.gate, x)
+        u = _apply(stacked.up, x)
+        weights = self.batch_weights(stacked, x)
+        rows = x.shape[0] * x.shape[1]
+        h = self._hidden(
+            weights.reshape(rows, -1) if weights is not None else None,
+            g.reshape(rows, -1),
+            u.reshape(rows, -1),
+        )
+        return _apply(stacked.down, h.reshape(x.shape[0], -1, h.shape[-1]))
+
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor | None:
+        """Return `[group, rows, K]` per-token mixture weights, or `None` if there are none."""
+        return None
+
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """Return the arm's mixture on `[group·rows, d_ffn]`: the batched twin of `_write`."""
+        raise NotImplementedError(
+            "a _Glu subclass implements _hidden: the batched twin of its _write",
+        )
+
     def _count(self, x: torch.Tensor, counters: Counters) -> None:
         """Report this call: `ffn_fwd` per row and `tsct_fwd` per factorised matrix."""
-        rows = x.numel() // self.d_model
+        self.count_read(x.numel() // self.d_model, counters)
+
+    def count_read(self, rows: int, counters: Counters) -> None:
+        """Report `rows` rows of this arm's read, however many modules ran them.
+
+        The bank's dispatch reads a whole expert group in one batched call, so the rows it
+        read are not the rows of one `forward` — the count belongs to the arm (its bill,
+        its factors) and not to the call site that happened to run it.
+        """
         counters.count("ffn_fwd", rows)
         if self._factorised:
             counters.count("tsct_fwd", rows * self._factorised)
@@ -307,6 +458,10 @@ class GatedFFN(_Glu):
         h = self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
         return self._read(self.down, h)
 
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`act(g) · act?(u)` on `[rows, d_ffn]`."""
+        return self._fn(g) * (self._fn(u) if self.sides == "bi" else u)
+
     def extra_repr(self) -> str:
         """Show the shape the parameter bill is quoted for."""
         return f"d_model={self.d_model}, d_ffn={self.d_ffn}, act={self.act}, sides={self.sides}"
@@ -338,22 +493,35 @@ class LaFFN(_Glu):
         self._fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...] = tuple(
             activation(name) for name in self.dictionary
         )
+        #: The fused kernel's codes for the same dictionary, or `None` when it does not
+        #: compute one of these entries; read only while the fused flag is on.
+        self._kinds = _codes(self.dictionary)
         self.coef = nn.Parameter(torch.ones(len(self.dictionary), device=device))
 
     def _mix(self, z: torch.Tensor) -> torch.Tensor:
         """`Σ cₖ·fₖ(z)` — a running sum, so `K=1` returns `1·f(z)` untouched."""
-        return _accumulate(self.coef.expand(*z.shape[:-1], -1), z, self._fns)
+        return _accumulate(self.coef, z, self._fns, self._kinds, per_row=False)
 
     def _write(self, x: torch.Tensor) -> torch.Tensor:
         """`A(gate(x)) * up(x)` on one row slice."""
         h = self._mix(self._read(self.gate, x)) * self._read(self.up, x)
         return self._read(self.down, h)
 
-    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`cₖ` on a group: the same prior for every row, `[group, rows, K]`."""
+        coef = _batched(stacked.coef, "dictionary coefficients")
+        return coef.unsqueeze(1).expand(x.shape[0], x.shape[1], -1)
+
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`Σ cₖ·fₖ(gate) * up` on `[rows, d_ffn]`."""
+        return (
+            _accumulate(_batched(w, "dictionary coefficients"), g, self._fns, self._kinds, True) * u
+        )
+
+    def count_read(self, rows: int, counters: Counters) -> None:
         """Add the mixture's own two counters to the base read's."""
-        super()._count(x, counters)
-        tokens = x.numel() // self.d_model
-        counters.count("ffn_la", tokens)
+        super().count_read(rows, counters)
+        counters.count("ffn_la", rows)
         counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:
@@ -414,6 +582,8 @@ class MoaFFN(_Glu):
         self._fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...] = tuple(
             activation(name) for name in self.dictionary
         )
+        #: The fused kernel's codes, or `None`; see `LaFFN._kinds`.
+        self._kinds = _codes(self.dictionary)
         self.sides = sides
         k = len(self.dictionary)
         self.mix = nn.Linear(d_model, k, bias=True, device=device)
@@ -428,7 +598,7 @@ class MoaFFN(_Glu):
 
     def _mix(self, w: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """`Σₖ wₖ·fₖ(z)` with `w [..., K]` — a running sum, exact at `K=1`."""
-        return _accumulate(w, z, self._fns)
+        return _accumulate(w, z, self._fns, self._kinds, per_row=True)
 
     def _write(self, x: torch.Tensor) -> torch.Tensor:
         """`down(A(x,g) · A(x,u)?)` of one row slice, weights from the token itself."""
@@ -437,11 +607,30 @@ class MoaFFN(_Glu):
         h = self._mix(w, g) * (self._mix(w, u) if self.sides == "bi" else u)
         return self._read(self.down, h)
 
-    def _count(self, x: torch.Tensor, counters: Counters) -> None:
+    def _hidden(self, w: torch.Tensor | None, g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """`A(x,g) · A(x,u)?` on `[rows, d_ffn]`."""
+        weights = _batched(w, "per-token mixture weights")
+        return _accumulate(weights, g, self._fns, self._kinds, True) * (
+            _accumulate(weights, u, self._fns, self._kinds, True) if self.sides == "bi" else u
+        )
+
+    def batch_weights(self, stacked: Stacked, x: torch.Tensor) -> torch.Tensor:
+        """`_weights` on a group: `[group, rows, K]`, normalised by the token's own sum."""
+        if stacked.mix is None:
+            raise LoudError(
+                "a MoA expert's batched read has no `d → K` gate",
+                "build the group's `Stacked` through `MoEFFN._stacked`, which takes it "
+                "from the arms themselves",
+            )
+        mix, bias = stacked.mix
+        coef = _batched(stacked.coef, "dictionary coefficients").unsqueeze(1)
+        w = torch.sigmoid(x @ mix + bias.unsqueeze(1)) * coef
+        return w / w.sum(-1, keepdim=True)
+
+    def count_read(self, rows: int, counters: Counters) -> None:
         """Add the mixture's own counters to the base read's."""
-        super()._count(x, counters)
-        tokens = x.numel() // self.d_model
-        counters.count("moa_fwd", tokens)
+        super().count_read(rows, counters)
+        counters.count("moa_fwd", rows)
         counters.count("ffn_dict_entries_used", len(_enabled(self.coef)))
 
     def dead_entries(self) -> tuple[str, ...]:

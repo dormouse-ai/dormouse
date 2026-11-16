@@ -243,3 +243,152 @@ def test_the_module_reports_its_state_without_a_device() -> None:
         assert k.fused_ops() == 0, "the flag alone must not claim a launch"
     finally:
         k.set_fused(was)
+
+
+# ------------------------------------------------------- the mixture, one pass over z
+#
+# The mixture is the kernel that mattered: the chain ran one `torch.utils.checkpoint` per
+# dictionary entry with a Python CALLABLE as the checkpointed function, and dynamo cannot
+# trace through a callable argument (2.13 stops at `lift_tracked_freevar_to_input`), so
+# the bank's whole forward was opaque to `torch.compile`. These tests hold the kernel to
+# the chain it replaced: bit-identical with the flag off, inside the fp32 bound on the
+# card, and a counted launch rather than an eager path under a fused name.
+
+
+def _moa(seed: int = 3, dictionary: tuple[str, ...] = ("gelu", "silu", "relu2", "tanh")):
+    """A seeded `MoaFFN` at a width a CI test can afford, on the card when there is one."""
+    from dormouse.model.ffn import MoaFFN
+
+    torch.manual_seed(seed)
+    arm = MoaFFN(32, 48, dictionary=dictionary, device="cuda" if REQUIRES_CARD else "cpu")
+    x = torch.randn(3, 7, 32, generator=torch.Generator().manual_seed(seed + 1))
+    return arm, x.to(next(arm.parameters()).device)
+
+
+def test_mixture_with_the_flag_off_is_the_chain_bit_for_bit() -> None:
+    """Flag off is the per-entry chain, `torch.equal` — the baseline cannot move."""
+    fused.set_fused(False)
+    arm, x = _moa()
+    with torch.no_grad():
+        got = arm(x)
+        g, u = arm.gate(x), arm.up(x)
+        weights = arm._weights(x)
+        hidden = None
+        for k, fn in enumerate(arm._fns):
+            part = weights[..., k : k + 1] * fn(g)
+            hidden = part if hidden is None else hidden + part
+        other = None
+        for k, fn in enumerate(arm._fns):
+            part = weights[..., k : k + 1] * fn(u)
+            other = part if other is None else other + part
+        expected = arm.down(hidden * other)
+    assert torch.equal(got, expected)
+
+
+def test_the_fused_mixture_matches_the_chain_in_fp32() -> None:
+    """The kernel computes the same sum to fp32 accuracy, forward and both gradients."""
+    if not REQUIRES_CARD:
+        return
+    arm, x = _moa()
+    slow = {name: p.detach().clone() for name, p in arm.named_parameters()}
+
+    fused.set_fused(False)
+    torch.manual_seed(7)
+    coarse = x.detach().clone().requires_grad_(True)
+    out_slow = arm(coarse)
+    weight = torch.linspace(-1.0, 1.0, out_slow.numel(), device=x.device).view_as(out_slow)
+    (out_slow * weight).sum()
+    out_slow.square().sum().backward()
+    grads_slow = {n: p.grad.clone() for n, p in arm.named_parameters() if p.grad is not None}
+
+    for name, p in arm.named_parameters():
+        p.data.copy_(slow[name])
+        p.grad = None
+    fused.reset_fused_ops()
+    fused.set_fused(True)
+    try:
+        fast = x.detach().clone().requires_grad_(True)
+        out_fast = arm(fast)
+        out_fast.square().sum().backward()
+        assert fused.fused_ops() == 4, (
+            f"one forward and one backward over two mixed sides is 4 launches, "
+            f"got {fused.fused_ops()}"
+        )
+    finally:
+        fused.set_fused(False)
+
+    scale = float(out_slow.detach().abs().max())
+    worst = float((out_fast.detach() - out_slow.detach()).abs().max())
+    assert worst <= 1e-6 * scale, f"max|delta| {worst:.3e} on a scale of {scale:.3f}"
+    for name, param in arm.named_parameters():
+        assert param.grad is not None, f"{name} received no gradient through the kernel"
+        assert bool(torch.isfinite(param.grad).all()), f"{name}'s gradient is not finite"
+        delta = float((param.grad - grads_slow[name]).abs().max())
+        edge = float(grads_slow[name].abs().max())
+        assert delta <= 1e-6 * edge, f"{name}: {delta:.3e} on a scale of {edge:.3e}"
+    assert float(arm.coef.grad.abs().sum()) > 0.0, "the coefficients got no gradient"
+
+
+def test_the_fused_mixture_matches_the_chain_in_bf16() -> None:
+    """A bf16 stream: the chain's own rounding is the difference, and fp32 is the floor.
+
+    The kernel accumulates in fp32 where the chain rounds every partial sum to bf16, so
+    it is the *more* accurate of the two and cannot be bit-identical to the chain. The
+    gate is therefore two of the chain's own ulp, and it is paired with the fp32 test
+    above so a wrong formula cannot hide inside a bf16 tolerance.
+    """
+    if not REQUIRES_CARD:
+        return
+    arm, x = _moa(seed=4)
+    arm = arm.bfloat16()
+    slow = {name: p.detach().clone() for name, p in arm.named_parameters()}
+    bf16 = x.bfloat16()
+    fused.set_fused(False)
+    out_slow = arm(bf16.detach().clone())
+    for name, p in arm.named_parameters():
+        p.data.copy_(slow[name])
+    fused.set_fused(True)
+    try:
+        out_fast = arm(bf16.detach().clone())
+    finally:
+        fused.set_fused(False)
+    scale = float(out_slow.detach().abs().max())
+    worst = float((out_fast.detach() - out_slow.detach()).abs().max())
+    assert worst <= 4 * fused.BF16_PARITY * scale, (
+        f"max|delta| {worst:.3e} > {4 * fused.BF16_PARITY * scale:.3e} "
+        f"({fused.BF16_PARITY:.0e} x {scale:.2f})"
+    )
+
+
+def test_the_fused_mixture_retains_no_more_than_the_chain() -> None:
+    """The memory gate: the kernel keeps `z` and `w`, where the chain's graph kept `K`."""
+    if not REQUIRES_CARD:
+        return
+    from dormouse.model.ffn import MoaFFN
+
+    rows, width, ffn = 2048, 64, 512
+
+    def peak(flag: bool) -> int:
+        torch.manual_seed(5)
+        arm = MoaFFN(width, ffn, device="cuda")
+        x = torch.randn(rows, width, device="cuda", requires_grad=True)
+        fused.set_fused(flag)
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            arm(x).sum().backward()
+            torch.cuda.synchronize()
+            return int(torch.cuda.max_memory_allocated())
+        finally:
+            fused.set_fused(False)
+            del arm, x
+            torch.cuda.empty_cache()
+
+    chain, kernel = peak(False), peak(True)
+    assert kernel <= chain, f"fused peak {kernel / 2**20:.0f} MiB > chain {chain / 2**20:.0f} MiB"
+
+
+def test_an_unknown_entry_is_refused_rather_than_guessed() -> None:
+    """The kernel answers for six formulas; a seventh is a refusal, not a default."""
+    with pytest.raises(LoudError, match="not a dictionary entry"):
+        fused.mixture_code("swish-ish")

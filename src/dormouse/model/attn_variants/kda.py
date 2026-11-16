@@ -40,9 +40,11 @@ values `y` (Kimi eq. 4-7; their Γ^{i→r} ⊙ K is exactly (a_r / a_i) ⊙ k):
 
 The one departure from the paper's algebra is numerical, not mathematical: eq. 6
 and 9 divide by Γ, and §3.2 names that division as the reason the DPLR
-formulation needs secondary chunking in fp32. Here the ratio `a_t / a_i ≤ 1` is
-formed directly on the strictly-lower pairs (one CxCxd_k tensor per chunk), so no
-`1/Γ` is ever materialised: same number, without the exponent range.
+formulation needs secondary chunking in fp32. Here the division is taken INSIDE one
+chunk, where `a` spans at most `chunk` decays (`0.982⁶⁴ ≈ 0.31` at the init, so
+`1/a ≤ 3.2`), and it reaches the arithmetic as a matmul operand — `gram = (a ⊙ k)·(k/a)ᵀ`
+— rather than as a pairwise `[chunk, chunk, head_dim]` tensor. Same number, no exponent
+range, and no 5-D tensor at any size.
 
 `recurrent` is eq. 1 verbatim, one token at a time. It is the anchor the chunk
 path is tested against, and it is what a sampler runs.
@@ -68,12 +70,15 @@ from .projections import LatentProjections
 #: that grows with the window (the bounded-state gate measures exactly this).
 A_BIAS_INIT = -4.0
 
-#: Recompute the chunk graph in the backward instead of retaining it. The graph is
-#: `O(T/chunk)` tensors of `[batch, heads, chunk, chunk, head_dim]` — measured 987 MiB
-#: per layer at b1 x s1024, 8.7 GiB over the nine KDA layers, which is what does not fit
-#: on a 16 GiB card; the trade is one extra forward of the chunk loop in the backward
-#: (`tests/test_kda.py` pins the arithmetic under both settings).
-CHECKPOINT_CHUNKS = True
+#: Recompute the batched core in the backward instead of retaining it. OFF by default, and
+#: that is a change of regime rather than of taste: the graph the per-chunk form could not
+#: retain was `[batch, heads, chunk, chunk, head_dim]` PER CHUNK — measured 987 MiB per
+#: layer at b1 x s1024, 8.7 GiB over the nine KDA layers. The batched core's graph is
+#: `[batch, heads, chunks, chunk, chunk]`: 67 MiB per layer at b8 x s1024, 0.4 GiB over the
+#: nine, so keeping it costs 0.4 GiB of peak and saves one recomputed forward per layer
+#: (measured at b8 x s1024: 81.1 ms per layer recomputing, 53.6 ms retaining). Turn it on
+#: for a card that cannot spare those 0.4 GiB.
+CHECKPOINT_CHUNKS = False
 
 
 class KDA(LatentProjections):
@@ -285,74 +290,100 @@ class KDA(LatentProjections):
         alpha: torch.Tensor,
         beta: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Eq. 2-9 in a loop over chunks: matmuls inside, one carry between."""
-        batch, heads, seq, width = q.shape
+        """Eq. 2-9 with the chunk axis batched: the matmuls once, the carry per chunk.
+
+        WHY BATCHED AND NOT A LOOP. The only sequential part of the chunk form is the
+        state carry; every other term is a function of one chunk alone. Written per
+        chunk, the Γ ratio `a_t/a_i` materialises as a `[batch, heads, chunk, chunk,
+        head_dim]` tensor that is multiplied, masked and summed several times inside
+        every chunk — measured at b8 x s1024: 27 GB of elementwise traffic per layer,
+        164 ms of a 6.1 s step for one of the nine KDA layers, 3 133 launches. Batched,
+        the same term is `(a ⊙ k) @ (k / a)ᵀ`: one matmul per chunk, and no
+        `[·, chunk, chunk, head_dim]` tensor exists at any size.
+        """
+        batch, heads, _, _ = q.shape
         chunk = self.chunk
+        count = q.shape[2] // chunk
+
+        def split(tile: torch.Tensor) -> torch.Tensor:
+            """`[b, h, seq, ·]` → `[b, h, chunks, chunk, ·]`, a view."""
+            return tile.reshape(*tile.shape[:2], count, chunk, tile.shape[-1])
+
+        gates = beta.reshape(batch, heads, count, chunk)
+        core = (split(q), split(k), split(v), split(alpha), gates)
+        keep = CHECKPOINT_CHUNKS and torch.is_grad_enabled() and q.requires_grad
+        #: ONE CHECKPOINT FOR THE BATCHED CORE, not one per chunk. It retains the five
+        #: inputs; what the backward recomputes is a handful of matmuls, where the
+        #: per-chunk form recomputed thirteen elementwise passes over a 5-D tensor per
+        #: chunk. The graph it removes is `[b, h, chunks, chunk, chunk]` (16.8 MiB at the
+        #: live shape) instead of the 5-D tensor (8.7 GiB over the nine layers).
+        written: torch.Tensor
+        state: torch.Tensor
+        if keep:
+            written, state = checkpoint(
+                self._chunks, *core, use_reentrant=False, preserve_rng_state=False
+            )
+        else:
+            written, state = self._chunks(*core)
+        return written.reshape(batch, heads, -1, written.shape[-1]), state
+
+    def _chunks(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Eq. 2-9 over every chunk at once, with the carry as the one loop.
+
+        `q, k, v, alpha` are `[batch, heads, chunks, chunk, head_dim]`, `beta` is
+        `[batch, heads, chunks, chunk]`. With `a_t = ∏_{i≤t} α_i`:
+
+            A[t, i] = β_t ⟨a_t ⊙ k_t, k_i / a_i⟩          strictly lower, unit diagonal
+            pseudo  = A⁻¹ · β(v - (a ⊙ k) S_0)             eq. 7, linear in S_0
+            o_t     = (a_t ⊙ q_t) S_0 + A_qt · pseudo      eq. 9
+            S_C     = Diag(a_C) S_0 + Σ_i Diag(a_C/a_i) k_i y_iᵀ   eq. 8
+
+        The paper's Γ appears here as `1/a_i`, and it is bounded because it is taken
+        inside ONE chunk: `a` spans at most `chunk` decays (0.982⁶⁴ ≈ 0.31 at the init),
+        so `1/a <= 3.2` and no exponent range is reached. The 1e-12 floor is the guard
+        the logged form carried, so a fully decayed channel still gives a finite ratio
+        and an exact `a_t/a_i = 1` pair instead of `-inf - (-inf)`.
+        """
+        chunk = q.shape[-2]
         incl = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
         strict = torch.tril(incl, -1)
-        #: `masked_fill` does not right-align a 2-D mask against a 4-D/5-D
-        #: operand, so the masks carry their broadcast axes explicitly.
-        keep_pair = incl.view(1, 1, chunk, chunk)
-        keep_strict = strict.view(1, 1, chunk, chunk)
-        keep_ratio = incl.view(1, 1, chunk, chunk, 1)
-        state = q.new_zeros(batch, heads, width, width)
-        #: ONE CHECKPOINT PER CHUNK, not one for the loop. The forward keeps the five
-        #: inputs and the carry; the backward recomputes a chunk's graph, backprops
-        #: through it, and frees it before the next — a whole-loop checkpoint would
-        #: rebuild all `seq/chunk` chunk graphs at once in the backward and move the peak
-        #: there instead of removing it (measured at b8 x s1024: 2.0 GiB of `ratio` live
-        #: with the loop-wide form, and the per-chunk transient is 134 MiB).
-        keep = CHECKPOINT_CHUNKS and torch.is_grad_enabled() and q.requires_grad
-        masks = (keep_ratio, keep_pair, keep_strict)
-        out = []
-        for start in range(0, seq, chunk):
-            window = slice(start, start + chunk)
-            rows = (state, q[..., window, :], k[..., window, :], v[..., window, :])
-            gates = (alpha[..., window, :], beta[..., window].unsqueeze(-1))
-            if keep:
-                carried_out, state = checkpoint(
-                    self._chunk, *rows, *gates, *masks, use_reentrant=False
-                )
-            else:
-                carried_out, state = self._chunk(*rows, *gates, *masks)
-            out.append(carried_out)
-        return torch.cat(out, dim=2), state
-
-    def _chunk(
-        self,
-        state: torch.Tensor,
-        qi: torch.Tensor,
-        ki: torch.Tensor,
-        vi: torch.Tensor,
-        alpha: torch.Tensor,
-        step: torch.Tensor,
-        keep_ratio: torch.Tensor,
-        keep_pair: torch.Tensor,
-        keep_strict: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One chunk of eq. 2-9: `(o_chunk, S_next)` from `(S_in, q, k, v, a, β)`."""
         a = torch.cumprod(alpha, dim=-2)
-        #: The floor is 1e-12 so that a fully decayed channel gives a finite
-        #: log and an exact `a_t/a_i = 1` pair instead of `-inf - (-inf)`.
-        log_a = torch.log(a.clamp_min(1e-12))
-        diff = (log_a.unsqueeze(-2) - log_a.unsqueeze(-3)).masked_fill(~keep_ratio, 0.0)
-        #: `a_t / a_i ≤ 1` on the lower triangle: the paper's Γ ratio, taken
-        #: pairwise so that no `1/Γ` reaches a matmul (see the module docstring).
-        ratio = diff.exp().masked_fill(~keep_ratio, 0.0)
-        keyed = a * ki
-        as_key = ki.unsqueeze(-3)  # [b, h, 1, i, d]
-        gram = (ratio * ki.unsqueeze(-2) * as_key).sum(-1)
-        qk = (ratio * qi.unsqueeze(-2) * as_key).sum(-1).masked_fill(~keep_pair, 0.0)
-        lower = step * gram.masked_fill(~keep_strict, 0.0)
-        pseudo = torch.linalg.solve_triangular(
-            lower,
-            step * (vi - keyed @ state),
-            upper=False,
-            unitriangular=True,
-        )
-        written = (a * qi) @ state + qk @ pseudo
-        carried = torch.exp(log_a[..., -1:, :] - log_a)
-        next_state = a[..., -1, :].unsqueeze(-1) * state + torch.einsum(
-            "bhtd,bhtv->bhdv", carried * ki, pseudo
-        )
-        return written, next_state
+        #: `k_i / a_i`: the Γ division, bounded inside one chunk, and the operand that
+        #: turns the pairwise ratio into a matmul (see the module docstring).
+        divided = k * a.clamp_min(1e-12).reciprocal()
+        keyed = a * k  # `a_t ⊙ k_t`, the left operand of the Γ gram
+        as_query = a * q
+        divided_t = divided.transpose(-1, -2)
+        gram = (keyed @ divided_t).masked_fill(~strict, 0.0)
+        qk = (as_query @ divided_t).masked_fill(~incl, 0.0)
+        #: `(a_C / a_i) ⊙ k_i`: the carry's operand, per chunk, `[b, h, chunks, chunk, d]`.
+        carried = a[..., -1, :].unsqueeze(-2) * divided
+        last = a[..., -1, :]
+        width = q.shape[-1]
+        state = q.new_zeros(*q.shape[:2], width, width)
+        #: The solve runs in at least fp32, which is what Kimi §3.2 asks of this
+        #: arithmetic and what `triangular_solve` has a kernel for in every backend. The
+        #: carry itself stays in the stream's dtype, as it was before.
+        work = torch.promote_types(q.dtype, torch.float32)
+        out: list[torch.Tensor] = []
+        for index in range(q.shape[-3]):
+            step = beta[..., index, :, None]
+            qi, vi, ki = as_query[..., index, :, :], v[..., index, :, :], keyed[..., index, :, :]
+            pseudo = torch.linalg.solve_triangular(
+                (step * gram[..., index, :, :]).to(work),
+                (step * (vi - ki @ state)).to(work),
+                upper=False,
+                unitriangular=True,
+            ).to(q.dtype)
+            out.append(qi @ state + qk[..., index, :, :] @ pseudo)
+            state = last[..., index, :].unsqueeze(-1) * state + torch.einsum(
+                "bhtd,bhtv->bhdv", carried[..., index, :, :], pseudo
+            )
+        return torch.stack(out, dim=-3), state

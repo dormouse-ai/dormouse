@@ -55,6 +55,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ...kernels import sparse
 from ..blocks import PROJ_STD
 from .dsa_indexer import LightningIndexer
 from .projections import LatentProjections
@@ -333,10 +334,17 @@ class DSA(LatentProjections):
     ) -> torch.Tensor:
         """Exact causal attention over the gathered positions, then the write.
 
-        The gather is over QUERIES, in slabs of `GATHER_ELEMENTS` elements, and each slab
-        is checkpointed: the backward recomputes its gather instead of the forward
-        retaining `[batch, heads, seq, k+window, head_dim]` of K and V per layer (measured
-        1.25 GiB each at s1024, 3 DSA layers = 7.5 GiB of the step).
+        On the card the read is `kernels/sparse.py`: one program per query, reading its
+        `keep` key rows THROUGH the index map and writing one output row, so the
+        `[batch, heads, seq, k+window, head_dim]` slab this docstring describes below
+        never exists — 5.4 GiB per tensor per layer at b8, and the 1.5 s/step the
+        profiler billed as `_index_put_impl_` plus `indexing_backward_kernel`.
+
+        The eager path stays for the CPU job and for the parity anchor. It is the one
+        described here: the gather is over QUERIES, in slabs of `GATHER_ELEMENTS`
+        elements, and each slab is checkpointed: the backward recomputes its gather
+        instead of the forward retaining `[batch, heads, seq, k+window, head_dim]` of K
+        and V per layer (measured 1.25 GiB each at s1024, 3 DSA layers = 7.5 GiB).
 
         THE ARITHMETIC DOES NOT MOVE. Every slab runs `_gathered` on the same gathered
         rows in the same order — the chunk axis is not a reduction axis, so each output
@@ -345,6 +353,9 @@ class DSA(LatentProjections):
         gradients).
         """
         batch, seq, heads, width = q.shape
+        if sparse.enabled() and q.is_cuda:
+            out = sparse.attention(q, key, value, at, visible, scale=self.scale)
+            return cast(torch.Tensor, self.proj(out.reshape(batch, seq, self.d_kv)))
         keep = at.shape[-1]
         per_query = max(1, batch * heads * keep * width)
         chunk = max(1, GATHER_ELEMENTS // per_query)
@@ -353,7 +364,9 @@ class DSA(LatentProjections):
             slab = (q[:, start : start + chunk], at[:, start : start + chunk])
             rows = (key, value, *slab, visible[:, start : start + chunk])
             if torch.is_grad_enabled():
-                parts.append(checkpoint(self._gathered, *rows, use_reentrant=False))
+                parts.append(
+                    checkpoint(self._gathered, *rows, use_reentrant=False, preserve_rng_state=False)
+                )
             else:
                 parts.append(self._gathered(*rows))
         out = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]

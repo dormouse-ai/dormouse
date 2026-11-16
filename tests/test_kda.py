@@ -191,6 +191,87 @@ def _retained(layer: KDA, x: torch.Tensor) -> int:
     return sum(kept.values())
 
 
+def _pairwise_chunkwise(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eq. 2-9 with the Γ ratio written pairwise: the anchor for the batched form.
+
+    `ratio[t, i, d] = a_t,d / a_i,d` is materialised, multiplied and reduced once per
+    term — the shape the batched form replaces with two matmuls. It is here, not in the
+    package, because it is the arithmetic being replaced and a fast kernel is not
+    evidence that it computes the same number.
+    """
+    batch, heads, seq, width = q.shape
+    incl = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
+    strict = torch.tril(incl, -1)
+    state = q.new_zeros(batch, heads, width, width)
+    out = []
+    for start in range(0, seq, chunk):
+        window = slice(start, start + chunk)
+        qi, ki, vi, ai = (tile[..., window, :] for tile in (q, k, v, alpha))
+        step = beta[..., window].unsqueeze(-1)
+        a = torch.cumprod(ai, dim=-2)
+        log_a = torch.log(a.clamp_min(1e-12))
+        ratio = (log_a.unsqueeze(-2) - log_a.unsqueeze(-3)).exp()
+        ratio = ratio.masked_fill(~incl.view(1, 1, chunk, chunk, 1), 0.0)
+        keyed = a * ki
+        gram = (ratio * ki.unsqueeze(-2) * ki.unsqueeze(-3)).sum(-1).masked_fill(~strict, 0.0)
+        qk = (ratio * qi.unsqueeze(-2) * ki.unsqueeze(-3)).sum(-1).masked_fill(~incl, 0.0)
+        pseudo = torch.linalg.solve_triangular(
+            step * gram, step * (vi - keyed @ state), upper=False, unitriangular=True
+        )
+        out.append((a * qi) @ state + qk @ pseudo)
+        carried = torch.exp(log_a[..., -1:, :] - log_a)
+        state = a[..., -1, :].unsqueeze(-1) * state + torch.einsum(
+            "bhtd,bhtv->bhdv", carried * ki, pseudo
+        )
+    return torch.cat(out, dim=2), state
+
+
+def test_the_batched_chunks_are_the_pairwise_ratio_form() -> None:
+    """The matmul Γ is the pairwise Γ: same write, same state, same every gradient.
+
+    In float64, where the two forms differ only by rounding: `(a ⊙ k)·(k/a)ᵀ` is
+    term-by-term `Σ_d (a_t,d/a_i,d) k_t,d k_i,d`. The gradients are compared too, because
+    a form that agrees in the forward can disagree through the solve.
+    """
+    torch.manual_seed(17)
+    layer = KDA(D_MODEL, N_HEADS, HEAD_DIM, chunk=8, n_kv_heads=1, c_lat=16).double()
+
+    def run(batched: bool) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        for parameter in layer.parameters():
+            parameter.grad = None
+        #: The projections run inside the measured graph: a form that matches in the
+        #: kernel but not through `project` would pass a kernel-only comparison.
+        torch.manual_seed(23)
+        x = torch.randn(2, 32, D_MODEL, dtype=torch.float64)
+        q, k, v, alpha, beta = layer._project(x)
+        #: GQA: `run` broadcasts the shared key/value head to its query heads before the
+        #: kernel, so the parity case does the same rather than relying on broadcasting.
+        k, v = k.repeat_interleave(2, dim=2), v.repeat_interleave(2, dim=2)
+        args = (*[tile.transpose(1, 2) for tile in (q, k, v, alpha)], beta.transpose(1, 2))
+        write, state = layer._chunkwise(*args) if batched else _pairwise_chunkwise(*args, chunk=8)
+        (write.square().mean() + state.square().mean()).backward()
+        grads = {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
+        return write, state, grads
+
+    fast_write, fast_state, fast_grads = run(True)
+    slow_write, slow_state, slow_grads = run(False)
+    assert torch.allclose(fast_write, slow_write, atol=1e-12, rtol=0)
+    assert torch.allclose(fast_state, slow_state, atol=1e-12, rtol=0)
+    assert sorted(fast_grads) == sorted(slow_grads)
+    for name, gradient in fast_grads.items():
+        assert torch.allclose(gradient, slow_grads[name], atol=1e-12, rtol=0), (
+            name,
+            float((gradient - slow_grads[name]).abs().max()),
+        )
+
+
 def test_the_chunk_graph_is_recomputed_not_retained(monkeypatch: pytest.MonkeyPatch) -> None:
     """Checkpointing the chunk loop: the same forward, the same gradients, less kept.
 
@@ -231,6 +312,9 @@ def test_the_chunk_graph_is_recomputed_not_retained(monkeypatch: pytest.MonkeyPa
     for name, gradient in without[2].items():
         assert torch.equal(gradient, with_[2][name]), name
     #: Per-chunk checkpoints keep the carry and each chunk's output too; the graph is
-    #: what must go. At this width that is 3.0x less retained (measured: 1.03 -> 0.36 MiB);
-    #: at b1 x s1024 the same setting is 4.6 GiB of chunk graph against 0.
-    assert recomputed < kept / 2, (recomputed, kept)
+    #: what must go. The margin is narrower than it was when this test was written
+    #: (1.03 -> 0.36 MiB, a 5-D `[b, h, chunk, chunk, head_dim]` graph per chunk removed):
+    #: the batched core retains `[b, h, chunks, chunk, chunk]`, so what the checkpoint
+    #: still buys is the six intermediates against the five inputs — strictly less, which
+    #: is the claim, at the measured 0.56 -> 0.34 MiB here and ~0.4 GiB at b8 x s1024.
+    assert recomputed < kept, (recomputed, kept)
