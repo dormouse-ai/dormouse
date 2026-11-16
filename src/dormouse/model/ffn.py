@@ -226,6 +226,12 @@ def _accumulate(
     (1.10x); at 1024 rows the ratio is 1.46x, because a chunk there is the whole
     input and the fixed per-entry transient dominates 25 MiB buffers.
 
+    The per-entry boundary STAYS on purpose: one region around the whole accumulation
+    saved `K-1` checkpoint nodes but raised the 8192-row peak from 1.22x to 1.34x the
+    plain FFN (gate 1.25x), because the checkpoint then retains every `fₖ(z)` in its
+    packed saved set. Recomputing each ENTRY is the selective boundary that keeps only
+    the wide `[rows, f]` intermediates out of the retained graph.
+
     THE ARITHMETIC DOES NOT MOVE. Every op here is elementwise and row-independent, so
     chunking and recomputing re-run the same multiplies in the same order: the output
     and the gradients are `torch.equal` to the chain, and `K=1` is still `1·f(z)`.
@@ -265,7 +271,13 @@ def _mix_rows(
     z: torch.Tensor,
     fns: tuple[Callable[[torch.Tensor], torch.Tensor], ...],
 ) -> torch.Tensor:
-    """One chunk's mixture: the accumulation `_accumulate` splits the rows into."""
+    """One chunk's mixture: the accumulation `_accumulate` splits the rows into.
+
+    One checkpoint per ENTRY, not per chunk: it makes each `fₖ(z)` a recomputed wide
+    intermediate, so the graph keeps only the `wₖ·fₖ(z)` contributions. Collapsing
+    this into one region measurably raised the peak (1.22x → 1.34x of the plain FFN),
+    so the extra regions are the cheaper side of the trade.
+    """
     out = checkpoint(_entry, fns[0], w[..., 0:1], z, use_reentrant=False, preserve_rng_state=False)
     for k in range(1, len(fns)):
         part = checkpoint(
@@ -332,6 +344,11 @@ class _Glu(nn.Module):
         the graph retaining them. At the bank's 24 576 routed rows that is 3 x 302 MiB per
         call per layer retained before the fix (10.8 GiB over twelve layers) against 3 x
         24 MiB of transient now.
+
+        Per-slice, not one region for the whole read: a single checkpoint around all
+        slices retains every slice's wide intermediates in its packed saved set. Measured
+        on CPU at 8192 rows it raised the plain arm's peak from 687 to 1285 MiB, over the
+        1152 MiB absolute ceiling, so the selective per-slice boundary stays.
 
         THE ARITHMETIC DOES NOT MOVE. Every op in an arm is elementwise or row-independent,
         so a slice computes the same multiplies in the same order on the same rows: the
