@@ -288,6 +288,11 @@ class _Glu(nn.Module):
     arm — `n·f` parameters, one matmul — and nothing else about the arm changes.
     """
 
+    #: The fused mixture's codes for the arm's dictionary, or `None` when the kernel does
+    #: not compute it. Only the two mixture arms set it; the default is what
+    #: `kernels/bank.py` reads to decide whether the fused chain may run this arm at all.
+    _kinds: tuple[int, ...] | None = None
+
     def __init__(
         self,
         d_model: int,

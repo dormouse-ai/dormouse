@@ -91,6 +91,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ..kernels import bank as fused_bank
 from .ffn import PROJ_STD, LaFFN, MoaFFN, Stacked, _Glu, stack_matrices
 from .ffn_spec import FFNSpec
 from .router import Router
@@ -181,8 +182,50 @@ def _group_write(bank: MoEFFN, arms: list[_Glu], slab: torch.Tensor) -> torch.Te
     `E·r·d_ffn` (470 MiB) — measured as 10 GiB of `torch.stack` blocks over twelve layers
     before this was moved in — where recomputing them keeps one group's slab as the
     graph's whole routed activation.
+
+    This is the ANCHOR: the `[rows, d_ffn]` slabs above are exactly what
+    `kernels/bank.py` deletes, and the fused path runs instead whenever a kernel can
+    (`_fused_group`). The anchor is kept because it is the thing the kernel is checked
+    against, on the card and at every shape a test can reach.
     """
     return arms[0].batch_write(bank._stacked(arms), slab)
+
+
+def _fused_group(
+    bank: MoEFFN,
+    arms: list[_Glu],
+    x: torch.Tensor,
+    tok: torch.Tensor,
+    counts: torch.Tensor,
+    capacity: int,
+) -> torch.Tensor:
+    """One expert group through the fused chain: the kernel path's recompute boundary.
+
+    `checkpoint` for the same reason `_group_write` has one: the `Stacked` copy of the
+    group's factors is `3·(d·r + r·f)·group` parameters (~54 MiB at the live group) and
+    retaining it for every layer's backward is 4.5 GiB. The recomputed region is the
+    stack and the chain; the `[rows, r]` scratches the chain saves are one group's.
+    """
+    first = arms[0]
+    kinds = first._kinds
+    if kinds is None:
+        raise LoudError(
+            f"the fused bank cannot mix {getattr(first, 'dictionary', ())}",
+            "the kernel knows kernels.fused.MIX_CODES; run with DORMOUSE_BANK=0 for a "
+            "dictionary it does not",
+        )
+    sides = cast("MoaFFN", first).sides
+
+    def run(  # pragma: no cover - launches the kernels
+        group: list[_Glu], rows: torch.Tensor
+    ) -> torch.Tensor:
+        return fused_bank.bank(
+            rows, tok, counts, capacity, bank._stacked(group), kinds=kinds, sides=sides
+        )
+
+    if torch.is_grad_enabled() and x.requires_grad:  # pragma: no cover - launches
+        return checkpoint(run, arms, x, use_reentrant=False, preserve_rng_state=False)
+    return run(arms, x)  # pragma: no cover - launches
 
 
 class MoEFFN(nn.Module):
@@ -287,7 +330,7 @@ class MoEFFN(nn.Module):
                 "skip empty micro-batches; an all-empty step is not a training step",
             )
         if counters is not None:
-            self._enable(counters)
+            self._enable(counters, x)
         index, weight, counts = self.router(x, counters)
         y = self._dispatch(x, index, weight, counts, counters)
         if self.shared is not None:
@@ -348,27 +391,39 @@ class MoEFFN(nn.Module):
         )
         self._refuse_overflow(counts, capacity, routed)
         pad = self.n_experts * capacity
-        bank = x.new_zeros((pad, x.shape[1]))
-        bank.index_copy_(0, slot, x.index_select(0, tokens))
+        fused = self._fused_ready(x)
+        if fused:  # pragma: no cover - the fused branch needs a device
+            #: The slot -> row index map the kernel reads. The `[E·capacity, d]` gather is
+            #: what the fused chain does not build: `tok` is `[pad]` int32, 128 KiB.
+            tok = torch.zeros(pad, dtype=torch.int32, device=x.device)
+            tok.index_copy_(0, slot, tokens.to(torch.int32))
+            bank = x.new_zeros((0, x.shape[1]))
+        else:
+            bank = x.new_zeros((pad, x.shape[1]))
+            bank.index_copy_(0, slot, x.index_select(0, tokens))
         out = x.new_empty((pad, x.shape[1]))
         group = self.group(capacity, x.element_size())
+        launches = fused_bank.bank_launches()
         for start in range(0, self.n_experts, group):
             stop = min(start + group, self.n_experts)
             span = slice(start * capacity, stop * capacity)
             arms = self._arms(start, stop)
-            slab = bank[span].view(stop - start, capacity, x.shape[1])
-            written = (
-                checkpoint(
-                    _group_write,
-                    self,
-                    arms,
-                    slab,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
+            if fused:
+                written = _fused_group(self, arms, x, tok[span], counts[start:stop], capacity)
+            else:
+                slab = bank[span].view(stop - start, capacity, x.shape[1])
+                written = (
+                    checkpoint(
+                        _group_write,
+                        self,
+                        arms,
+                        slab,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                    if torch.is_grad_enabled() and slab.requires_grad
+                    else _group_write(self, arms, slab)
                 )
-                if torch.is_grad_enabled() and slab.requires_grad
-                else _group_write(self, arms, slab)
-            )
             out[span] = written.view(-1, x.shape[1])
         y = torch.zeros_like(x)
         y.index_add_(0, tokens, out.index_select(0, slot) * gates.unsqueeze(1))
@@ -379,10 +434,37 @@ class MoEFFN(nn.Module):
             counters.count("moe_capacity", capacity)
             counters.count("moe_pad_rows", pad)
             counters.count("moe_dropped", 0)
+            if fused:
+                counters.count("bank_ops", fused_bank.bank_launches() - launches)
             #: The read belongs to the arm, so it reports the rows the DISPATCH read — the
             #: assignments, not their padding (that is `moe_pad_rows`).
             self._arms(0, 1)[0].count_read(routed, counters)
         return y
+
+    def _fused_ready(self, x: torch.Tensor) -> bool:
+        """Whether this bank can run the fused chain, and refuse loudly if it was asked to.
+
+        Four conditions, and each one has an escape named where it fails: a CUDA tensor
+        under a Triton build (a CPU tensor on a CUDA host is the anchor path — a Triton
+        program cannot read host memory, and `tests/test_assemble.py` runs three CPU steps
+        on this card), a factorised arm (the dense `rank=0` control has no rank-space tiles
+        to hold), and a per-row mixture the kernel knows the codes for. A bank that was
+        asked for the fused chain and cannot run it REFUSES — the alternative is the anchor
+        running under a flag that reports a kernel.
+        """
+        requested = self.expert_tsct_rank > 0 and fused_bank.bank_enabled() and x.is_cuda
+        if not requested:
+            return False
+        first = self.experts[0]
+        if not isinstance(first, MoaFFN) or first._kinds is None:
+            raise LoudError(
+                f"the fused bank cannot read {type(first).__name__} experts over "
+                f"{getattr(first, 'dictionary', ())}",
+                "the fused chain is the rank-r MoA expert (per-token coefficients, "
+                "dictionary in kernels.fused.MIX_CODES); run with DORMOUSE_BANK=0 for "
+                "any other arm",
+            )
+        return True
 
     def _arms(self, start: int, stop: int) -> list[_Glu]:
         """Return experts `[start, stop)` as the arms they are: one `nn.ModuleList` slice."""
@@ -438,8 +520,13 @@ class MoEFFN(nn.Module):
         elif int(counts.max()) > capacity:
             raise LoudError(what, escape)
 
-    def _enable(self, counters: Counters) -> None:
-        """Declare the mechanisms this forward runs, so silence becomes an error."""
+    def _enable(self, counters: Counters, x: torch.Tensor) -> None:
+        """Declare the mechanisms this forward runs, so silence becomes an error.
+
+        `x` decides one of them: a CPU tensor on a CUDA host runs the anchor, so the
+        fused-chain counter must not be enabled for it — an enabled counter that reports
+        nothing is `MissingReport`, which is the gate doing its job.
+        """
         counters.enable("moe", counter="moe_fwd", why="the routed bank runs")
         counters.enable("moe_dropless", counter="moe_rows_run", why="every assignment is executed")
         counters.enable("moe_experts", counter="moe_experts_used", why="every expert slot ran")
@@ -447,6 +534,10 @@ class MoEFFN(nn.Module):
             "moe_bank", counter="moe_bank_builds", why="the expert-group slab was built"
         )
         counters.enable("moe_capacity", counter="moe_capacity", why="the capacity sized")
+        if self.expert_tsct_rank > 0 and fused_bank.bank_enabled() and x.is_cuda:
+            #: A flag-on forward that reports no fused launch is the defect `bank_ops`
+            #: exists for: the anchor would otherwise run under the kernel's name.
+            counters.enable("moe_bank_fused", counter="bank_ops", why="the fused chain ran")
         if self.shared is not None:
             counters.enable("moe_shared", counter="moe_shared", why="the shared expert")
         if self.router.qb and self.training:

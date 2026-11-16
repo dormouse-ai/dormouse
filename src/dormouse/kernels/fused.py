@@ -350,7 +350,10 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
 
     _KERNELS.update(
         {
-            "triton": triton,
+            # `activate`/`grad` are the dictionary, written once: `kernels/bank.py`'s
+            # epilogue calls them rather than restating six formulas that would drift.
+            "activate": _activate,
+            "grad": _grad,
             "residual_norm": residual_norm_kernel,
             "glu": glu_kernel,
             "mix": mix_kernel,

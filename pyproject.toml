@@ -56,6 +56,9 @@ ignore = ["D203", "D213", "N818"]
 # `tsct.py` holds the variance derivation that fixes the init scale; `σ`, `√` and `Σ`
 # are the notation of it.
 "src/dormouse/model/tsct.py" = ["RUF002", "RUF003"]
+# `kernels/bank.py`'s docstring is the tile arithmetic of the fused chain; `×`, `σ`,
+# `α` and `−` there are notation, not typos in prose, exactly as in `train/*`.
+"src/dormouse/kernels/bank.py" = ["RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"
