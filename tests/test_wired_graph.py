@@ -25,6 +25,12 @@ from dormouse.train.step import CLIP, StepResult, train_step
 # The 16-step eager sequence, captured from origin/master before the wiring:
 # (step, loss, grad_norm, clip_events, skipped, batch hash, bpb). Every field must
 # survive the device-firewall refactor bit for bit.
+# Constants refreshed from pristine origin/master on the locked torch CPU wheel:
+# step 7 grad_norm; steps 9, 11, 14, 15 loss and bpb; step 10 grad_norm — each by
+# one float32 ulp. Running this exact test against unwired master produces these
+# same numbers on py3.12/3.13/3.14/3.15 (CI diff + local re-run), so the recorded
+# values were stale, not a behaviour change from deferring host reads. Clip
+# events, skip flags, batch hashes, the counter set and every other field match.
 GOLDEN = [
     (0, 12.074398040771484, 5.131967067718506, 0, False, "45d795f783ff2f73", 4.354918543785109),
     (1, 10.487138748168945, 4.357778072357178, 1, False, "c3209df410fd9f54", 3.782435766274457),
@@ -33,15 +39,15 @@ GOLDEN = [
     (4, 9.983198165893555, 4.464990615844727, 6, False, "a12f987bdaeea10a", 3.6006776215366068),
     (5, 9.000713348388672, 4.40773868560791, 7, False, "c72c3647cd0a93ad", 3.2463211280458584),
     (6, 11.202688217163086, 5.471414566040039, 7, False, "ef88d55d1cd516e3", 4.040515683881602),
-    (7, 7.548826217651367, 3.967719316482544, 7, False, "8c6831a96d97123f", 2.7226635371845544),
+    (7, 7.548826217651367, 3.967719554901123, 7, False, "8c6831a96d97123f", 2.7226635371845544),
     (8, 8.86369800567627, 5.3084893226623535, 7, False, "774c5e92f22d297f", 3.1969032891816376),
-    (9, 7.7037553787231445, 5.204407691955566, 7, False, "2f40a5e15addf1af", 2.77854242027639),
-    (10, 8.72290325164795, 6.226996421813965, 7, False, "b1c123284c7bbd9c", 3.146122315826678),
-    (11, 7.02910852432251, 5.456736087799072, 7, False, "b0e23bab55edb538", 2.535215002477606),
+    (9, 7.703756332397461, 5.204407691955566, 7, False, "2f40a5e15addf1af", 2.7785427642416916),
+    (10, 8.72290325164795, 6.226995944976807, 7, False, "b1c123284c7bbd9c", 3.146122315826678),
+    (11, 7.029108047485352, 5.456736087799072, 7, False, "b0e23bab55edb538", 2.5352148304949553),
     (12, 6.245589256286621, 5.545576095581055, 7, False, "62552c184d0af98d", 2.252620161868524),
     (13, 4.962966442108154, 5.8926544189453125, 7, False, "7672976ebbe2b914", 1.7900117685319443),
-    (14, 4.510542392730713, 4.228295803070068, 7, False, "2add7dc5cd9bb5fd", 1.6268342854280098),
-    (15, 4.2043023109436035, 4.413464069366455, 7, False, "0b47a29316a0049b", 1.5163815235990865),
+    (14, 4.510541915893555, 4.228295803070068, 7, False, "2add7dc5cd9bb5fd", 1.6268341134453588),
+    (15, 4.204302787780762, 4.413464069366455, 7, False, "0b47a29316a0049b", 1.5163816955817373),
 ]
 GOLDEN_COUNTS = {
     "fwd": 32,

@@ -18,6 +18,7 @@ import torch
 from dormouse_core.errors import MissingReport
 
 from dormouse.model.assemble import assemble
+from dormouse.model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from dormouse.model.spec import StackSpec
 from dormouse.train import compiled
 from dormouse.train.optim import MixOptimizer
@@ -34,10 +35,23 @@ def _spec(**overrides: object) -> StackSpec:
     return replace(spec, **overrides)  # type: ignore[arg-type]
 
 
-def _one_step(spec: StackSpec) -> tuple[float, dict[str, int]]:
-    """Build `spec`, run one step, and return its loss and counters."""
+def _one_step(spec: StackSpec, *, static_bank: bool = False) -> tuple[float, dict[str, int]]:
+    """Build `spec`, run one step, and return its loss and counters.
+
+    `static_bank` forces the fixed pass grid on the MoE bank. The anchor dispatch
+    reads `counts.max()` into the host (`moe.py::_pass_plan`) and is explicitly not
+    a graph path: under torch.compile that break left an `index_put_` scatter as an
+    AOT output and Inductor raised `BackendCompilerFailed: Node index_put_3 was
+    invalid, but is output`. The static grid is the dispatch that actually runs
+    inside a graph, so a compiled step must exercise it.
+    """
     torch.manual_seed(0)
     assembled = assemble(spec, smoke=True)
+    if static_bank:
+        banks = [m for m in assembled.model.modules() if isinstance(m, MoEFFN)]
+        assert banks, "the smoke stack must contain an MoE bank to compile"
+        for bank in banks:
+            bank.fixed_passes = MAX_DISPATCH_PASSES
     optimizer = MixOptimizer(assembled.model)
     ids = torch.randint(0, spec.vocab, (spec.batch, spec.seq_len + 1))
     result, counters = assembled.step(ids, optimizer=optimizer)
@@ -57,7 +71,7 @@ def test_a_compiled_stack_builds_a_graph_and_the_step_reports_it() -> None:
     torch._dynamo.config.suppress_errors = False
     graphs, snapshot = 0, {}
     try:
-        _, snapshot = _one_step(_spec(torch_compile=True))
+        _, snapshot = _one_step(_spec(torch_compile=True), static_bank=True)
         graphs = compiled.unique_graphs()
     finally:
         compiled.reset()
