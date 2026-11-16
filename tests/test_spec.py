@@ -168,10 +168,12 @@ def test_the_other_config_files_are_gone() -> None:
 
     `smoke.toml` is not a second architecture — it is the CI seam test's stack, at the
     smallest widths the arms accept, and `train/entry.py` prices its step from the bill
-    because it sits below the expert floor `dorm plan` refuses to price.
+    because it sits below the expert floor `dorm plan` refuses to price. The A/B arm is
+    this same file with two values changed; `test_ab_configs.py` holds that line.
     """
     assert sorted(p.name for p in CONFIGS.glob("*.toml")) == [
         "dormouse_1b.toml",
+        "dormouse_1b_top1_r192.toml",
         "smoke.toml",
     ]
 
