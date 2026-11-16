@@ -27,8 +27,6 @@ defect class `dormouse_core.counters` exists for.
 
 from __future__ import annotations
 
-import math
-
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
@@ -36,7 +34,15 @@ from torch import nn
 
 from ..model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from .optim import MixOptimizer
-from .step import CHUNK_TOKENS, CLIP, PreStep, StepResult, chunked_cross_entropy
+from .step import (
+    CHUNK_TOKENS,
+    CLIP,
+    PreStep,
+    StepResult,
+    chunked_cross_entropy,
+    commit_step,
+    host_scalar,
+)
 
 __all__ = ["StepGraph"]
 
@@ -174,8 +180,8 @@ class StepGraph:
             counters.count("graph_replays")
 
     def loss(self) -> float:
-        """Return the last replay's loss, read back to the host — outside the capture."""
-        return float(self._loss)
+        """Return the last replay's loss through the one declared host-read seam."""
+        return host_scalar(self._loss)
 
     def replays(self) -> int:
         """How many times the graph has been replayed; zero means it never ran."""
@@ -200,32 +206,14 @@ class StepGraph:
                     "device; this is the same refusal the eager path makes on counts.max(), "
                     "checked here because the host read sits outside the capture",
                 )
-        loss = self.loss()
-        if not math.isfinite(loss):
-            self.optimizer.zero_grad(set_to_none=False)
-            if counters is not None:
-                counters.count("nan_guard")
-                counters.check()
-            return StepResult(loss=loss, grad_norm=float("nan"), skipped=True)
-        norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip))
-        if counters is not None:
-            counters.count("clip")
-        if not math.isfinite(norm):
-            self.optimizer.zero_grad(set_to_none=False)
-            if counters is not None:
-                counters.count("nan_guard")
-                counters.check()
-            return StepResult(loss=loss, grad_norm=norm, skipped=True)
-        if pre_step is not None and not pre_step(loss):
-            self.optimizer.zero_grad(set_to_none=False)
-            return StepResult(loss=loss, grad_norm=norm, skipped=True)
-        sizes = self.optimizer.sizes
-        self.optimizer.step()
-        if counters is not None:
-            counters.count("opt_muon", sizes["muon"])
-            counters.count("opt_adamw", sizes["adamw"])
-            counters.check()
-        return StepResult(loss=loss, grad_norm=norm, skipped=False)
+        return commit_step(
+            self.model,
+            self.optimizer,
+            self._loss,
+            counters=counters,
+            clip=clip,
+            pre_step=pre_step,
+        )
 
     def __repr__(self) -> str:
         """Print the shape the graph was built at and how often it has run."""

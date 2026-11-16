@@ -24,15 +24,19 @@ Three claims, each one a number:
 
 from __future__ import annotations
 
+import builtins
 import warnings
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 from dormouse_core.counters import Counters
+from dormouse_core.errors import MissingReport
 from torch import nn
 
+import dormouse.model.moe as moe_mod
 from dormouse.model.assemble import assemble
 from dormouse.model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from dormouse.model.spec import StackSpec
@@ -386,3 +390,207 @@ def test_fixed_passes_set_the_overflow_flag_on_device() -> None:
     balanced = torch.arange(100).reshape(-1, 1) % 16
     bank._dispatch(x, balanced, weight, bank.router.count(balanced))
     assert not bank.overflowed(), "the flag is reset by the next dispatch"
+
+
+# --- static grid: the fused default, its proof counter, and zero host reads --
+
+
+def _no_tensor_int() -> Any:
+    """A `builtins.int` that allows Python ints and refuses anything device-backed."""
+    real = builtins.int
+
+    def guarded(value: object, *args: object, **kwargs: object) -> int:
+        if isinstance(value, torch.Tensor):
+            raise AssertionError("a device value was read into the host")
+        return real(value, *args, **kwargs)  # type: ignore[arg-type, call-arg]
+
+    return guarded
+
+
+def _no_host_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every Python-side device read raise inside the patched context."""
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a device value was read into the host")
+
+    monkeypatch.setattr(torch.Tensor, "item", boom)
+    monkeypatch.setattr(torch.Tensor, "tolist", boom)
+    monkeypatch.setattr(builtins, "int", _no_tensor_int())
+
+
+def test_the_fused_plan_is_a_fixed_grid_and_reads_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`fused=True` plans MAX_DISPATCH_PASSES slots without touching the histogram."""
+    bank = _bank(qb=False, n_shared=0, capacity_ratio=1.0, dispatch_sigma=0.0)
+    counts = torch.tensor([50, 50, 0, 0])  # a two-slot routing at capacity 30
+    assert bank._pass_plan(counts, 30, 100, False) == (2, False)
+    assert bank._pass_plan(counts, 30, 100, True) == (MAX_DISPATCH_PASSES, True)
+    bank.fixed_passes = 3
+    assert bank._pass_plan(counts, 30, 100, False) == (3, True)
+
+    bank.fixed_passes = None
+    with monkeypatch.context() as patch:
+        _no_host_read(patch)
+        assert bank._pass_plan(counts, 30, 100, True) == (MAX_DISPATCH_PASSES, True)
+
+
+@pytest.mark.parametrize("n_experts,topk", [(1, 1), (4, 2)])
+def test_static_grid_is_the_data_dependent_path_bit_for_bit(n_experts: int, topk: int) -> None:
+    """Live-width shapes, duplicates and one expert: same write, same gradients, finite.
+
+    The gate is bf16 epsilon (the card's stream); this fp32 CPU run is `torch.equal`,
+    which is the stronger claim and costs nothing to assert.
+    """
+    torch.manual_seed(20 + n_experts)
+    settings: dict[str, object] = {"n_experts": n_experts, "topk": topk, "expert_tsct_rank": 8}
+    eager = _bank(qb=False, n_shared=0, **settings)  # type: ignore[arg-type]
+    fixed = _bank(qb=False, n_shared=0, **settings)  # type: ignore[arg-type]
+    fixed.load_state_dict(eager.state_dict())
+    eager.eval()
+    fixed.eval()
+    x = torch.randn(96, D)
+    x[5] = x[1]
+    x[9] = x[1]
+    x.requires_grad_(True)
+    index, weight, counts = eager.router(x)
+
+    got = eager._dispatch(x, index, weight, counts)
+    fixed.fixed_passes = MAX_DISPATCH_PASSES
+    fi, fw, fc = fixed.router(x)
+    want = fixed._dispatch(x, fi, fw, fc)
+    assert torch.allclose(got, want, rtol=0, atol=0.0039)
+    assert torch.equal(got, want), "extra masked slots add exact zeros"
+    assert bool(torch.isfinite(got).all())
+
+    target = torch.randn_like(got)
+    (got - target).square().mean().backward(retain_graph=True)
+    (want - target).square().mean().backward()
+    for (name, mine), (_, theirs) in zip(
+        eager.named_parameters(), fixed.named_parameters(), strict=True
+    ):
+        if mine.grad is None or theirs.grad is None:
+            assert mine.grad is None and theirs.grad is None, name
+            continue
+        assert bool(torch.isfinite(mine.grad).all()), name
+        assert torch.allclose(mine.grad, theirs.grad, rtol=0, atol=0.0039), name
+        assert torch.equal(mine.grad, theirs.grad), f"gradient diverged at {name}"
+
+
+def test_five_static_forwards_read_nothing_from_the_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`.item()`, `.tolist()` and `int(tensor)` all raise for five consecutive forwards."""
+    torch.manual_seed(21)
+    bank = _bank(qb=False, n_shared=0)
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    x = torch.randn(64, D, requires_grad=True)
+    with monkeypatch.context() as patch:
+        _no_host_read(patch)
+        for _ in range(5):
+            y = bank(x)
+    assert bool(torch.isfinite(y).all())
+
+
+def test_the_static_counter_proves_the_grid_ran() -> None:
+    """A static forward counts its slots; `check()` is what reads the proof."""
+    torch.manual_seed(22)
+    bank = _bank(qb=False, n_shared=0)
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    counter = Counters()
+    bank(torch.randn(48, D), counter)
+    assert counter.snapshot()["moe_static_passes"] == MAX_DISPATCH_PASSES
+    assert "moe_static" in counter.enabled
+    assert "moe_static_passes" in counter.required.values()
+    counter.check()
+
+
+def test_a_static_flag_with_no_counter_is_a_missing_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enabling run must increment its proof, or the step gate fails loudly."""
+    torch.manual_seed(23)
+    bank = _bank(qb=False, n_shared=0)
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    counter = Counters()
+    real_count = counter.count
+
+    def drop_proof(key: str, n: int = 1) -> None:
+        if key != "moe_static_passes":
+            real_count(key, n)
+
+    monkeypatch.setattr(counter, "count", drop_proof)
+    bank(torch.randn(48, D), counter)
+    assert "moe_static" in counter.enabled
+    assert counter.snapshot().get("moe_static_passes", 0) == 0
+    with pytest.raises(MissingReport, match="moe_static"):
+        counter.check()
+
+
+def test_the_bank_is_one_checkpoint_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapsed from passes x groups to one region for the whole bank call."""
+    real = moe_mod.checkpoint
+    calls: list[int] = []
+
+    def counted(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(1)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(moe_mod, "checkpoint", counted)
+    bank = _bank(qb=False, n_shared=0)
+    x = torch.randn(64, D, requires_grad=True)
+    bank(x).square().mean().backward()
+    assert len(calls) == 1, len(calls)
+
+
+def test_a_forward_backward_is_sync_debug_clean() -> None:
+    """Static forward+backward raises nothing under `set_sync_debug_mode('error')`.
+
+    The CPU wheel has no CUDA, so the host-read guard above is the CPU-side gate and
+    the card probe below is the same claim on a device.
+    """
+    torch.manual_seed(24)
+    bank = _bank(qb=False, n_shared=0)
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    x = torch.randn(64, D, requires_grad=True)
+
+    def run() -> None:
+        bank(x).square().mean().backward()
+
+    if torch.cuda.is_available():
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    else:
+        run()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a free card")
+def test_cuda_graph_capture_probe_on_a_free_card() -> None:
+    """Ready-to-run card probe — do NOT run while another job holds the card.
+
+        DORMOUSE_BANK=0 pytest -q tests/test_moe_dispatch.py -k cuda_graph_capture_probe
+
+    The anchor is deliberate: the fused kernel's own backward gather
+    (`kernels/bank.py:718`) still indexes with a device tensor and is a separate lane.
+    This probe isolates the scheduling change owned by moe.py/ffn.py.
+    """
+    bank = _bank(qb=False, n_shared=0)
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    bank = bank.to("cuda")
+    x = torch.randn(64, D, device="cuda", requires_grad=True)
+    for _ in range(3):
+        bank(x).square().mean().backward()
+        x.grad = None
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.cuda.graph(graph):
+            loss = bank(x).square().mean()
+            loss.backward()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    graph.replay()
+    assert bool(torch.isfinite(loss).all())
+    assert bank.overflowed() is False

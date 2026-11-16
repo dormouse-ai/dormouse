@@ -37,6 +37,8 @@
 #   active     top-2 + shared = 3 experts =  16,072,704  (ffn active)
 
 unit = "bpe"
+# Shared with the control: the corpus and both token tables answer to one file.
+tokenizer = "tokenizer32k.json"
 attn = "hybrid"
 optimizer = "muon"
 objective = "ntp"

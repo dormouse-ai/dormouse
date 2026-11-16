@@ -3,6 +3,10 @@
 Verdict comments may be added after the measurement; an assignment may not. Both
 checks are here so a third tuned field turns the test red instead of an unnoticed
 confound in the BPB delta.
+
+`tokenizer` is also an assignment, but it is a shared one: both arms must read
+ids cut with the same 32,768-id file or the BPB delta is meaningless. It is
+asserted equal in both arms rather than allowed as a third tuned difference.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ def test_only_topk_and_rank_differ_as_assignments() -> None:
     control, arm = _assignments(CONTROL), _assignments(ARM)
     changed = {key for key in control.keys() | arm.keys() if control.get(key) != arm.get(key)}
     assert changed == {"topk", "expert_tsct_rank"}, changed
+    assert control["tokenizer"] == arm["tokenizer"] == '"tokenizer32k.json"'
     assert control["topk"] == "2" and arm["topk"] == "1"
     assert control["expert_tsct_rank"].replace("_", "") == "256"
     assert arm["expert_tsct_rank"].replace("_", "") == "192"
@@ -39,5 +44,6 @@ def test_the_parsed_configs_differ_in_exactly_two_keys() -> None:
     assert control.keys() == arm.keys()
     changed = {key for key in control if control[key] != arm[key]}
     assert changed == {"topk", "expert_tsct_rank"}, changed
+    assert control["tokenizer"] == arm["tokenizer"] == "tokenizer32k.json"
     assert (control["topk"], arm["topk"]) == (2, 1)
     assert (control["expert_tsct_rank"], arm["expert_tsct_rank"]) == (256, 192)

@@ -20,23 +20,27 @@ gradient is the mean over the whole batch rather than `accum` times it. The equa
 is a refusal, not a rounding: an uneven split would make the last micro-batch a
 different-sized estimator under the same 1/accum.
 
-THE NaN FIREWALL. A loss that is not finite, or a gradient whose global norm is not
-finite, means the step cannot be taken: the moments and the momentum would be poisoned
-by one bad batch and every later step would be wrong. So the step is **skipped**, the
-weights are untouched (gradients are cleared), the event is counted as `nan_guard`, and
-it is logged at ERROR. It is not raised, because one bad batch in a 10 GB stream is a
-data event, not a programming defect; the policy for how many skips end a run belongs
-to the loop, and returning `skipped=True` is what lets that loop exist.
+THE NaN FIREWALL IS A DEVICE DECISION. A loss that is not finite, or a gradient whose
+global norm is not finite, means the step cannot be taken: the moments and the momentum
+would be poisoned by one bad batch and every later step would be wrong. All of that is
+decided here on the device — `torch.where` masks the backward seed, `nan_to_num_` and
+a multiply-by-zero gate the gradients, and `isfinite` on the norm builds one 0/1 flag.
+The host reads that scalar ONCE, through `_host_scalar`, and never reads a loss or a
+norm from inside the step. That single seam is what makes a whole step capturable: no
+`bool(tensor)`/`float(tensor)` branch survives in the arithmetic. On a healthy step the
+mask and the gate are exact identities (`where(True, x, 0) == x`, `x * 1.0 == x`), so
+the numpicked parameters are bit-identical to the eager step this replaces.
 
 COUNTERS. `fwd`, `bwd`, `clip`, `opt_muon`, `opt_adamw`, `nan_guard` — and each is
 enabled only when the mechanism is about to run, so a firewalled step reports
-`nan_guard` instead of claiming an optimizer step that never happened. `check()` closes
-the step; an enabled mechanism with a zero counter raises `MissingReport`.
+`nan_guard` instead of claiming an optimizer step that never happened. `check()`
+closes the step; an enabled mechanism with a zero counter raises `MissingReport`.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -48,7 +52,14 @@ from torch.nn import functional
 
 from .optim import MixOptimizer
 
-__all__ = ["PreStep", "StepResult", "chunked_cross_entropy", "train_step"]
+__all__ = [
+    "PreStep",
+    "StepResult",
+    "chunked_cross_entropy",
+    "commit_step",
+    "host_scalar",
+    "train_step",
+]
 
 _LOG = logging.getLogger(__name__)
 
@@ -67,18 +78,32 @@ CLIP = 1.0
 PreStep = Callable[[float], bool]
 
 
+def host_scalar(value: torch.Tensor) -> float:
+    """Return the ONE declared host read of a step scalar, shared by both paths.
+
+    Everything the step *decides* is device-resident; this is the auditable crossing
+    where an already-decided scalar reaches the host. A 0-sync gate patches this one
+    seam (and grants it the cadence read) instead of chasing reads across modules.
+    """
+    return float(value)
+
+
 @dataclass(frozen=True)
 class StepResult:
     """What one step did: the loss it saw, the norm it clipped, and whether it ran.
 
     `skipped=True` means the NaN firewall fired and **no parameter changed**. `loss`
     is then the non-finite value that tripped it, and `grad_norm` is NaN because the
-    norm was never computed — a skipped step has no norm to report.
+    norm was never computed — a skipped step has no norm to report. The two `*_device`
+    fields are the same numbers before the seam crosses them: a log at a slower cadence
+    reads those instead of re-running the step.
     """
 
     loss: float
     grad_norm: float
     skipped: bool
+    loss_device: torch.Tensor | None = None
+    norm_device: torch.Tensor | None = None
 
 
 def chunked_cross_entropy(
@@ -105,7 +130,9 @@ def chunked_cross_entropy(
     return total / flat.shape[0]
 
 
-def _skip(counters: Counters | None, loss: float, why: str) -> StepResult:
+def _skip(
+    counters: Counters | None, loss: float, why: str, grad_norm: float = float("nan")
+) -> StepResult:
     """Log, count and report a step the firewall refused."""
     _LOG.error(
         "NaN firewall: %s (loss=%r). The optimizer step is skipped and no parameter "
@@ -116,7 +143,73 @@ def _skip(counters: Counters | None, loss: float, why: str) -> StepResult:
     if counters is not None:
         counters.count("nan_guard")
         counters.check()
-    return StepResult(loss=loss, grad_norm=float("nan"), skipped=True)
+    return StepResult(loss=loss, grad_norm=grad_norm, skipped=True)
+
+
+def commit_step(
+    model: nn.Module,
+    optimizer: MixOptimizer,
+    loss: torch.Tensor,
+    *,
+    counters: Counters | None = None,
+    clip: float = CLIP,
+    pre_step: PreStep | None = None,
+    read: bool = True,
+) -> StepResult:
+    """Run the device firewall, the clip and the step for eager and replayed steps.
+
+    `loss` is a device scalar that already carries every micro-batch's contribution.
+    Nothing here reads it to the host except through `host_scalar`, and the step/no-step
+    decision is a device flag crossed once. With `read=False` the reported numbers stay
+    device-resident on the result and the caller reads them at log cadence — the step
+    itself still crosses the single flag, because a skip must not move a moment.
+    """
+    if counters is not None:
+        counters.enable("clip", counter="clip", why="the gradient norm is bounded")
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    if counters is not None:
+        counters.count("clip")
+    finite = torch.isfinite(loss.detach()).all() & torch.isfinite(norm)
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    # A NaN that came through an activation leaves a NaN gradient even when the loss
+    # seed was masked. Sanitise first, then gate: *1.0 is the identity on a healthy
+    # step, *0 makes every direction exactly zero on a skipped one.
+    for grad in grads:
+        grad.nan_to_num_(0.0, 0.0, 0.0)
+    gate = finite.to(loss.dtype)
+    for grad in grads:
+        grad.mul_(gate)
+    ok = host_scalar(finite.to(torch.float32)) > 0.5
+    loss_value = host_scalar(loss.detach()) if read else 0.0
+    norm_value = host_scalar(norm) if read else 0.0
+    if not ok:
+        optimizer.zero_grad(set_to_none=True)
+        bad_loss = not math.isfinite(loss_value)
+        why = "the loss is not finite" if bad_loss else f"the gradient norm is {norm_value}"
+        # A NaN loss has no norm to report (NaN); an inf norm is itself the receipt.
+        return _skip(counters, loss_value, why, float("nan") if bad_loss else norm_value)
+    if pre_step is not None and not pre_step(loss_value):
+        # The policy refused the step: the gradients go, the weights and the moments stay.
+        optimizer.zero_grad(set_to_none=True)
+        return StepResult(loss=loss_value, grad_norm=norm_value, skipped=True)
+    sizes = optimizer.sizes
+    if counters is not None:
+        if sizes["muon"]:
+            counters.enable("opt_muon", counter="opt_muon", why="matrices step under Muon")
+        if sizes["adamw"]:
+            counters.enable("opt_adamw", counter="opt_adamw", why="vectors step under AdamW")
+    optimizer.step()
+    if counters is not None:
+        counters.count("opt_muon", sizes["muon"])
+        counters.count("opt_adamw", sizes["adamw"])
+        counters.check()
+    return StepResult(
+        loss=loss_value,
+        grad_norm=norm_value,
+        skipped=False,
+        loss_device=loss.detach() if not read else None,
+        norm_device=norm if not read else None,
+    )
 
 
 def train_step(
@@ -128,6 +221,7 @@ def train_step(
     clip: float = CLIP,
     counters: Counters | None = None,
     pre_step: PreStep | None = None,
+    read: bool = True,
 ) -> StepResult:
     """One optimizer step over `ids [accum·batch, seq+1]`, as the docstring orders it.
 
@@ -135,6 +229,10 @@ def train_step(
     `optimizer.step()`: it may scale the gradients in place (the loop's per-tensor clip)
     and returns `False` to refuse the step, which clears the gradients and leaves every
     parameter and moment untouched — a skip, not a rollback.
+
+    The forward/backward half accumulates the loss on the device. The firewall, the
+    norm and the step decision are `commit_step`'s, so the eager step and a replayed
+    `StepGraph` cannot drift apart in what "take a step" means.
     """
     if ids.dim() != 2:
         raise LoudError(
@@ -160,7 +258,7 @@ def train_step(
     inputs, targets = ids[:, :-1], ids[:, 1:]
     rows = ids.shape[0] // accum
     optimizer.zero_grad(set_to_none=True)
-    loss_total = 0.0
+    loss_total = torch.zeros((), dtype=torch.float32, device=ids.device)
     for micro in range(accum):
         x = inputs[micro * rows : (micro + 1) * rows]
         y = targets[micro * rows : (micro + 1) * rows]
@@ -171,37 +269,24 @@ def train_step(
             counters.count("fwd", x.numel())
         logits = model(x, counters)
         loss = chunked_cross_entropy(logits, y)
-        if not torch.isfinite(loss):
-            optimizer.zero_grad(set_to_none=True)
-            return _skip(counters, float(loss.detach()), "the loss is not finite")
+        # The reported sum keeps the raw value (a NaN step reports NaN). The backward
+        # seed is masked: on a finite step `where(True, loss, 0)` is bit-identical to
+        # `loss`, on a bad one the seed is exactly zero and no gradient is injected.
+        loss_total = loss_total + loss.detach() / accum
+        finite = torch.isfinite(loss.detach()).all()
+        seed = torch.where(finite, loss, torch.zeros_like(loss))
         if counters is not None:
             counters.enable("bwd", counter="bwd", why="the backward runs in the step")
         # torch's stub for `Tensor.backward` is unannotated, and this is the call.
-        (loss / accum).backward()  # type: ignore[no-untyped-call]
+        (seed / accum).backward()  # type: ignore[no-untyped-call]
         if counters is not None:
             counters.count("bwd", x.numel())
-        loss_total += float(loss.detach()) / accum
-    if counters is not None:
-        counters.enable("clip", counter="clip", why="the gradient norm is bounded")
-    norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip))
-    if counters is not None:
-        counters.count("clip")
-    if not torch.isfinite(torch.tensor(norm)):
-        optimizer.zero_grad(set_to_none=True)
-        return _skip(counters, loss_total, f"the gradient norm is {norm}")
-    if pre_step is not None and not pre_step(loss_total):
-        # The policy refused the step: the gradients go, the weights and the moments stay.
-        optimizer.zero_grad(set_to_none=True)
-        return StepResult(loss=loss_total, grad_norm=norm, skipped=True)
-    sizes = optimizer.sizes
-    if counters is not None:
-        if sizes["muon"]:
-            counters.enable("opt_muon", counter="opt_muon", why="matrices step under Muon")
-        if sizes["adamw"]:
-            counters.enable("opt_adamw", counter="opt_adamw", why="vectors step under AdamW")
-    optimizer.step()
-    if counters is not None:
-        counters.count("opt_muon", sizes["muon"])
-        counters.count("opt_adamw", sizes["adamw"])
-        counters.check()
-    return StepResult(loss=loss_total, grad_norm=norm, skipped=False)
+    return commit_step(
+        model,
+        optimizer,
+        loss_total,
+        counters=counters,
+        clip=clip,
+        pre_step=pre_step,
+        read=read,
+    )

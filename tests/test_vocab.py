@@ -1,8 +1,8 @@
-"""The vocabulary is 32 000, and the number lives in exactly one place.
+"""The vocabulary is 32 768, and the number lives in exactly one place.
 
 The tokenizer experiment settled the size: 48 000 moved fertility from 4.395/4.337/3.424/
 3.505 to 4.423/4.418/3.433/3.518 (en/ru/math/code), which is 0.8 % fewer tokens, while the
-head's `2·V·d` MAC went from 26.6M to 40.0M — roughly 5 % of the training step. The
+head's `2·V·d` MAC went from 27.3M to 40.0M — roughly 5 % of the training step. The
 model-layer rule is therefore that `model/` holds no copy of the number at all: it reads
 `data.tokenizer.DEFAULT_VOCAB`, and this file is what enforces that rather than a review.
 """
@@ -25,7 +25,9 @@ LITERAL = re.compile(r"\b(?:32768|32_768|48000|48_000|32_000)\b")
 
 
 def test_the_default_is_the_measured_size() -> None:
-    assert DEFAULT_VOCAB == 32_000
+    # Owner's decision: 32k means 2**15. tokenizer32k.json has 32768 ids and the
+    # corpus holds ids up to 32767, so a decimal 32000 table would crash on step 1.
+    assert DEFAULT_VOCAB == 32_768
 
 
 def test_the_number_lives_in_exactly_one_place() -> None:
