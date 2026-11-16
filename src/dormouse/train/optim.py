@@ -36,6 +36,7 @@ from copy import deepcopy
 from typing import Any
 
 import torch
+from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
@@ -97,6 +98,7 @@ class MixOptimizer:
         sf_warmup: int = 0,
         sf_weight_decay: float = SF_WEIGHT_DECAY,
         sf_final_decay_frac: float = 0.05,
+        muon_grouped: bool = True,
     ) -> None:
         """Route `model`'s parameters, then build the arm pair `schedule` names.
 
@@ -167,6 +169,7 @@ class MixOptimizer:
             momentum=momentum,
             steps=steps,
             weight_decay=muon_weight_decay,
+            grouped=muon_grouped,
         )
         self.adamw = AdamW(
             [p for _, p in vectors], lr=lr_adamw, betas=betas, eps=eps, weight_decay=weight_decay
@@ -185,9 +188,16 @@ class MixOptimizer:
         self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
 
-    def step(self) -> None:
-        """Run both arms; the routing already decided which parameter is where."""
-        self.muon.step()
+    def step(self, *, counters: Counters | None = None) -> None:
+        """Run both arms; the routing already decided which parameter is where.
+
+        `counters` is passed only to Muon's scheduled arm: that is where the grouped
+        polar runs, and the SF arm has its own (untouched) chain.
+        """
+        if isinstance(self.muon, Muon):
+            self.muon.step(counters=counters)
+        else:
+            self.muon.step()
         self.adamw.step()
 
     @property
