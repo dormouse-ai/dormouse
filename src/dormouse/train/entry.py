@@ -173,6 +173,7 @@ def _optimizer(
         schedule=recipe.schedule,
         lr_muon=recipe.lr_muon,
         lr_adamw=recipe.lr_adamw,
+        lr_router=recipe.lr_router,
         sf_warmup=cfg.warmup_steps,
     )
     if recipe.schedule != "cosine":

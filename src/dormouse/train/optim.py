@@ -48,6 +48,7 @@ from .muon import (
     NS_EPS,
     NS_POWER_ITERS,
     NS_STEPS,
+    ROUTER_LR_COUNTER,
     Muon,
     colrow,
     muon_direction,
@@ -63,6 +64,7 @@ __all__ = [
     "NS_EPS",
     "NS_POWER_ITERS",
     "NS_STEPS",
+    "ROUTER_LR_COUNTER",
     "AdamW",
     "MixOptimizer",
     "Muon",
@@ -88,6 +90,7 @@ class MixOptimizer:
         schedule: str = "cosine",
         lr_muon: float | None = None,
         lr_adamw: float | None = None,
+        lr_router: float | None = None,
         momentum: float = 0.95,
         steps: int = NS_STEPS,
         betas: tuple[float, float] = (0.9, 0.95),
@@ -106,6 +109,13 @@ class MixOptimizer:
         `lr_adamw=0.003`; under `sf` it keeps the paper's single `η = 0.01` for both,
         because a schedule-free run at the scheduled rate is 6× the tuned one and
         reports the divergence as a property of the method.
+
+        A router's `*.router.weight` gets its own Muon group at `lr_router`, by default
+        `lr_muon / √d_model` (read off the row width, ≈7e-4 at d=832). Muon sets every
+        row's update magnitude to exactly the group's lr, so at the recipe's 0.02 a
+        single step moves a row by the whole init scale `√d·0.02`; the split keeps the
+        router's direction and makes its step a small fraction of that scale. Router
+        stays in Muon (not AdamW) so the polar direction it inherits is preserved.
         """
         if schedule not in SCHEDULES:
             raise LoudError(
@@ -126,15 +136,25 @@ class MixOptimizer:
                 ADAMW_LR if lr_adamw is None else lr_adamw,
             )
         )
-        matmuls = [(name, p) for name, p in model.named_parameters() if self.table[name] == "muon"]
-        vectors = [(name, p) for name, p in model.named_parameters() if self.table[name] == "adamw"]
+        # Sorting by name makes the split deterministic: adding the router can never
+        # silently reorder the other matrices inside their head-split groups.
+        matmuls = sorted(
+            ((name, p) for name, p in model.named_parameters() if self.table[name] == "muon"),
+            key=lambda item: item[0],
+        )
+        vectors = sorted(
+            ((name, p) for name, p in model.named_parameters() if self.table[name] == "adamw"),
+            key=lambda item: item[0],
+        )
         if not matmuls:
             raise LoudError(
                 "no parameter routed to Muon: the router or the model is wrong",
                 "a stack of matrices must have at least one 2-D non-embedding weight",
             )
+        routers = [(name, p) for name, p in matmuls if _is_router(name)]
+        others = [(name, p) for name, p in matmuls if not _is_router(name)]
         groups: list[dict[str, Any]] = []
-        for name, param in matmuls:
+        for name, param in others:
             split = _head_split(model, name, param)
             for group in groups:
                 if group["head_split"] == split:
@@ -142,6 +162,24 @@ class MixOptimizer:
                     break
             else:
                 groups.append({"params": [param], "head_split": split})
+        # The reader's explicit override wins; the default comes off the router row
+        # width, so a config that names no rate still gets lr_muon / sqrt(d_model).
+        d_router = routers[0][1].shape[1] if routers else 0
+        self.base_lr_router = (
+            (lr_router if lr_router is not None else self.base_lr[0] / d_router**0.5)
+            if routers
+            else (lr_router or 0.0)
+        )
+        self.router_group_enabled = lr_router is not None or bool(routers)
+        if routers:
+            groups.append(
+                {
+                    "params": [p for _, p in routers],
+                    "head_split": None,
+                    "is_router": True,
+                    "lr": self.base_lr_router,
+                }
+            )
         lr_muon, lr_adamw = self.base_lr
         if schedule_free:
             self.muon: Muon | SFNorMuon = SFNorMuon(
@@ -183,6 +221,11 @@ class MixOptimizer:
             "adamw": sum(len(g["params"]) for g in self.adamw.param_groups),
         }
 
+    @property
+    def router_lr(self) -> float:
+        """The router group's peak rate; 0 when the model carries no router."""
+        return self.base_lr_router
+
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear both arms' gradients."""
         self.muon.zero_grad(set_to_none=set_to_none)
@@ -194,6 +237,12 @@ class MixOptimizer:
         `counters` is passed only to Muon's scheduled arm: that is where the grouped
         polar runs, and the SF arm has its own (untouched) chain.
         """
+        if self.router_group_enabled and counters is not None:
+            counters.enable(
+                "router_lr_group",
+                counter=ROUTER_LR_COUNTER,
+                why="router weights step under their own small Muon LR",
+            )
         if isinstance(self.muon, Muon):
             self.muon.step(counters=counters)
         else:
@@ -221,7 +270,8 @@ class MixOptimizer:
                 "a schedule produces [0, 1]; a negative rate climbs the loss",
             )
         for group in self.muon.param_groups:
-            group["lr"] = self.base_lr[0] * fraction
+            base = self.base_lr_router if group.get("is_router") else self.base_lr[0]
+            group["lr"] = base * fraction
         self.adamw.set_lr(self.base_lr[1] * fraction)
 
     def begin_final_decay(self, total: int) -> None:
@@ -318,6 +368,12 @@ def route(name: str, param: torch.Tensor) -> str:
         "rule this shape obeys, or it is a cheap tensor that will be trained at the "
         "wrong scale",
     )
+
+
+def _is_router(name: str) -> bool:
+    """Whether a parameter is a router projection, by its path (not its shape)."""
+    parts = name.split(".")
+    return len(parts) >= 2 and parts[-2:] == ["router", "weight"]
 
 
 def _head_split(model: nn.Module, name: str, param: torch.Tensor) -> tuple[int, int] | None:
