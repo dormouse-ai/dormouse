@@ -388,8 +388,11 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
         a `[BMv, BN]` tile inside one iteration, and the only `[rows, f]`-shaped object in
         the chain — the expert's `v` factors — is an operand, read once per tile.
         """
-        e = tl.program_id(0)
-        m0 = tl.program_id(1) * BMv
+        #: Tile-major: consecutive programs walk the row tiles of ONE expert, so that
+        #: expert's factor slab stays resident in L2 across the whole wave instead of being
+        #: evicted between tiles by the factors of the experts in the next column.
+        e = tl.program_id(1)
+        m0 = tl.program_id(0) * BMv
         cnt = tl.load(CNT + e)
         if m0 >= cnt:
             #: The capacity is `CAPACITY_RATIO` (2x) the mean, so half the grid's tiles are
@@ -784,7 +787,7 @@ class _Bank(torch.autograd.Function):
             num_warps=WARPS,
             num_stages=STAGES,
         )
-        built["fwd"][(e, -(-cap // BM))](
+        built["fwd"][(-(-cap // BM), e)](
             gate_v,
             up_v,
             down_u,
