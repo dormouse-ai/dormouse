@@ -1,0 +1,65 @@
+# dormouse_1b_top1_r192: the FLOPs-per-byte A/B arm.
+#
+# This file is configs/dormouse_1b.toml with EXACTLY two values changed:
+#   topk 2 -> 1  (2 active experts instead of 3: -33% routed bank MAC)
+#   expert_tsct_rank 256 -> 192 (r/f 4.2% -> 3.1%: -25% MAC in each factor)
+# No other assignment differs; tests/test_ab_configs.py enforces that.
+#
+# PRE-REGISTERED DECISION RULE (set before the run):
+#   take the arm only if BOTH (a) speed >= 1.30x at b8 x s1024, AND
+#   (b) held-out BPB loss <= 3% on ALL THREE paired seeds.
+#   Otherwise it stays a config, not a default change.
+# VERDICT (2026-11-16): REFUSE -- stays a config, not a default change.
+#   (a) speed: FAIL. b8x1024 bf16, three runs each: control 4028.0/3872.9/3918.7 ms,
+#       topk1 3404.1/3422.4/3393.9 ms; medians 3918.7 -> 3404.1 ms = 1.151x < 1.30x.
+#       bytes/s (4.72 B/token): 9,860 -> 11,356. Files: runs/ab_top1_r192/speed.jsonl.
+#   (b) BPB: UNMEASURABLE. The 4,000-step real-data run trips moe.py:575's router
+#       guard (past 4 dispatch passes) within ~20-66 steps at the shipped rate, and
+#       the fused bank needs bf16 (fp32 needs 151 KiB > 101 KiB shared memory).
+#       r192 is separately REFUSED by bank.py:675 (rank must be a power of two).
+#   Combined arm therefore fails (a) outright and cannot be scored on (b).
+#
+# 12 layers, attention in a 3:1 pattern of KDA and DSA, both with GQA (2 KV heads per
+# 8 query heads) and a c_lat=512 bottleneck on q/kv; a bank of 64 routed MoA experts of
+# 5.36M stored plus one shared, top-2, dropless, each matrix stored as its rank-256
+# factors; a tied head, chunked cross-entropy, Muon per head with AdamW on the vectors.
+#
+# There is no second config. The two control arms this model is measured against are
+# the SAME file with one width changed (attn="kda" or "dsa" for a uniform stack), and
+# every menu that used to live next to it (full/CSA/DSA/hybrid, gated/la/moa/moe FFNs)
+# is gone: a config that names one of those is refused by name.
+#
+# width arithmetic, so the numbers in the plan are checkable by hand:
+#   attention  q_lat+q_up   = 832·512 + 512·512 =  688,128  (x9 KDA layers)
+#              kv_lat+kv_up = 832·512 + 512·256 =  557,056  (+ gates, conv, proj)
+#   expert     3·(832·256 + 256·6144) = 5,357,568  stored as the rank-256 factors
+#   bank       65 experts + router × 832  ≈ 348,295,168 stored
+#   active     top-2 + shared = 3 experts =  16,072,704  (ffn active)
+
+unit = "bpe"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 1
+n_shared = 1
+expert_tsct_rank = 192
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0
