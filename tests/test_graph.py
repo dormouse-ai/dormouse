@@ -21,9 +21,10 @@ from pathlib import Path
 import pytest
 import torch
 from dormouse_core.counters import Counters
-from dormouse_core.errors import LoudError
+from dormouse_core.errors import LoudError, MissingReport
 
 from dormouse.model.assemble import assemble
+from dormouse.model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from dormouse.model.spec import StackSpec
 from dormouse.train.graph import StepGraph
 from dormouse.train.optim import MixOptimizer
@@ -283,3 +284,23 @@ def test_replay_at_another_shape_and_the_readers_are_pure() -> None:
     assert graph.loss() == pytest.approx(2.5)
     assert graph.replays() == 0
     assert "captured=False" in repr(graph) and "rows=8" in repr(graph)
+
+
+def test_a_declared_graph_with_zero_replays_fails_the_gate() -> None:
+    """`graph_replays` at zero under an enabled graph is MissingReport, not silence."""
+    counter = Counters()
+    counter.enable("graph", counter="graph_replays", why="a step must replay a graph")
+    with pytest.raises(MissingReport, match="graph"):
+        counter.check()
+
+
+def test_a_replayed_overflow_is_refused_in_the_eager_half() -> None:
+    """The fixed capture loop cannot raise on device, so `run` reads its flag and refuses."""
+    graph, _optimizer, ids = _uncaptured()
+    bank = next(m for m in graph.model.modules() if isinstance(m, MoEFFN))
+    bank.fixed_passes = MAX_DISPATCH_PASSES
+    bank._overflow.fill_(True)
+    graph._banks = [bank]
+    graph.replay = lambda ids, counters=None: None  # type: ignore[method-assign]
+    with pytest.raises(LoudError, match=r"more than .* dispatch passes"):
+        graph.run(ids)
