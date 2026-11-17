@@ -113,12 +113,6 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
         return None
 
     @triton.jit  # type: ignore[untyped-decorator]
-    def _rows(K, off, idx, cols, dcol, n, nmask, D: tl.constexpr):  # type: ignore[no-untyped-def]
-        """Load the `[BN, BD]` key rows `idx` names out of the `[bh, s, d]` plane."""
-        ptr = K + off + idx[:, None] * D + cols[None, :]
-        return tl.load(ptr, mask=nmask[:, None] & dcol[None, :], other=0.0)
-
-    @triton.jit  # type: ignore[untyped-decorator]
     def fwd_kernel(  # type: ignore[no-untyped-def]
         Q,
         K,
@@ -162,7 +156,11 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
             nmask = n < KEEP
             idx = tl.load(at_row + n, mask=nmask, other=0)
             vis = tl.load(vis_row + n, mask=nmask, other=0)
-            k = _rows(K, off, idx, cols, dcol, n, nmask, D).to(tl.float32)
+            k = tl.load(
+                K + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
             s = tl.sum(k * q[None, :], 1) * SCALE
             s = tl.where((vis != 0) & nmask, s, float("-inf"))
             new_m = tl.maximum(mx, tl.max(s, 0))
@@ -178,10 +176,18 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
             nmask = n < KEEP
             idx = tl.load(at_row + n, mask=nmask, other=0)
             vis = tl.load(vis_row + n, mask=nmask, other=0)
-            k = _rows(K, off, idx, cols, dcol, n, nmask, D).to(tl.float32)
+            k = tl.load(
+                K + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
             s = tl.sum(k * q[None, :], 1) * SCALE
             p = tl.where((vis != 0) & nmask, tl.exp(s - mx), 0.0)
-            v = _rows(V, off, idx, cols, dcol, n, nmask, D).to(tl.float32)
+            v = tl.load(
+                V + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
             acc += tl.sum(p[:, None] * v, 0)
 
         o = acc / tl.maximum(norm, 1e-30)
@@ -244,8 +250,16 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
             nmask = n < KEEP
             idx = tl.load(at_row + n, mask=nmask, other=0)
             vis = tl.load(vis_row + n, mask=nmask, other=0)
-            k = _rows(K, off, idx, cols, dcol, n, nmask, D).to(tl.float32)
-            v = _rows(V, off, idx, cols, dcol, n, nmask, D).to(tl.float32)
+            k = tl.load(
+                K + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                V + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
             s = tl.sum(k * q[None, :], 1) * SCALE
             p = tl.where((vis != 0) & nmask, tl.exp(s - mx) / tl.maximum(norm, 1e-30), 0.0)
             dl = p * (tl.sum(v * dout[None, :], 1) - delta)
@@ -281,8 +295,11 @@ class _Sparse(torch.autograd.Function):
         kh = key.transpose(1, 2).contiguous()
         vh = value.transpose(1, 2).contiguous()
         flat = (qh, kh, vh)
-        idx = at.to(torch.int32).contiguous()
-        vis = visible.to(torch.uint8).contiguous()
+        # `.clone()` is not redundant: dynamo's higher-order-op capture rejects an
+        # intermediate that aliases the Function's input (`RuntimeError: idx ... aliases
+        # an input`), so the index buffer must own its storage.
+        idx = at.to(torch.int32).contiguous().clone()
+        vis = visible.to(torch.uint8).contiguous().clone()
         out = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
         ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
         _count(1)
