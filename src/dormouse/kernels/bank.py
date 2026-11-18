@@ -145,8 +145,14 @@ def bank_enabled() -> bool:
     return _BANK and torch.cuda.is_available() and _build() is not None
 
 
+@torch._dynamo.disable  # type: ignore[untyped-decorator]
 def bank_launches() -> int:
-    """Return how many Triton launches the bank has issued since the last reset."""
+    """Return how many Triton launches the bank has issued since the last reset.
+
+    Disabled for dynamo: `_launches` changes every step, and tracing this accessor would
+    install a guard on the mutable global (`G['…bank']._launches == N`) and recompile the
+    graph on the next step. The read happens on the host at the counter call site instead.
+    """
     return _launches
 
 
@@ -721,6 +727,97 @@ def gather(
     return out.view(e, cap, x.shape[1])
 
 
+def _bank_compute(  # pragma: no cover - the launches are the card's
+    x: torch.Tensor,
+    tok: torch.Tensor,
+    cnt: torch.Tensor,
+    gate_u: torch.Tensor,
+    gate_v: torch.Tensor,
+    up_u: torch.Tensor,
+    up_v: torch.Tensor,
+    down_u: torch.Tensor,
+    down_v: torch.Tensor,
+    mix_w: torch.Tensor,
+    mix_b: torch.Tensor,
+    coef: torch.Tensor,
+    meta: tuple[int, tuple[int, ...], str, bool],
+) -> tuple[torch.Tensor, ...]:
+    """Issue the prep and forward kernels, returning every tensor the backward needs.
+
+    Both the eager autograd Function and the opaque custom op call this, so the kernel
+    code has one copy and the two paths cannot drift apart.
+    """
+    cap, kinds, sides, bf16 = meta
+    built = _require("forward")
+    e, d, rk = gate_u.shape
+    f = gate_v.shape[2]
+    _validate(rk, d, f, kinds, sides)
+    slots = e * cap
+    dev = x.device
+    dt = torch.bfloat16 if bf16 else x.dtype
+    out = torch.zeros((slots, d), dtype=dt, device=dev)
+    xrg = torch.zeros((slots, rk), dtype=dt, device=dev)
+    xru = torch.zeros_like(xrg)
+    qq = torch.zeros_like(xrg)
+    wgt = torch.zeros((slots, MM), dtype=torch.float32, device=dev)
+    sg = torch.zeros_like(wgt)
+    tile = (e, -(-cap // BM_P))
+    pads = (0,) * (fused.MAX_MIX_ENTRIES - len(kinds))
+    built["prep"][tile](
+        x,
+        tok,
+        cnt,
+        gate_u,
+        up_u,
+        mix_w,
+        mix_b,
+        coef,
+        xrg,
+        xru,
+        wgt,
+        sg,
+        cap,
+        d,
+        rk,
+        BK,
+        MM,
+        len(kinds),
+        BM,
+        bf16,
+        num_warps=WARPS,
+        num_stages=STAGES,
+    )
+    built["fwd"][(-(-cap // BM), e)](
+        gate_v,
+        up_v,
+        down_u,
+        down_v,
+        xrg,
+        xru,
+        wgt,
+        cnt,
+        out,
+        qq,
+        cap,
+        d,
+        f,
+        rk,
+        BN if bf16 else BN_FP32,
+        BK,
+        MM,
+        len(kinds),
+        *kinds,
+        *pads,
+        sides == "bi",
+        BM,
+        bf16,
+        num_warps=WARPS,
+        num_stages=STAGES,
+    )
+    _tally(2)
+    return out, xrg, xru, qq, wgt, sg
+
+
 class _Bank(torch.autograd.Function):
     """The routed bank's forward and backward, per expert group, over the slot layout.
 
@@ -747,74 +844,9 @@ class _Bank(torch.autograd.Function):
         meta,
     ):
         """Return the group's `[group·cap, d]` per-slot write."""
-        cap, kinds, sides, bf16 = meta
-        built = _require("forward")
-        e, d, rk = gate_u.shape
-        f = gate_v.shape[2]
-        _validate(rk, d, f, kinds, sides)
-        slots = e * cap
-        dev = x.device
-        dt = torch.bfloat16 if bf16 else x.dtype
-        out = torch.zeros((slots, d), dtype=dt, device=dev)
-        xrg = torch.zeros((slots, rk), dtype=dt, device=dev)
-        xru = torch.zeros_like(xrg)
-        qq = torch.zeros_like(xrg)
-        wgt = torch.zeros((slots, MM), dtype=torch.float32, device=dev)
-        sg = torch.zeros_like(wgt)
-        tile = (e, -(-cap // BM_P))
-        pads = (0,) * (fused.MAX_MIX_ENTRIES - len(kinds))
-        built["prep"][tile](
-            x,
-            tok,
-            cnt,
-            gate_u,
-            up_u,
-            mix_w,
-            mix_b,
-            coef,
-            xrg,
-            xru,
-            wgt,
-            sg,
-            cap,
-            d,
-            rk,
-            BK,
-            MM,
-            len(kinds),
-            BM,
-            bf16,
-            num_warps=WARPS,
-            num_stages=STAGES,
+        out, xrg, xru, qq, wgt, sg = _bank_compute(
+            x, tok, cnt, gate_u, gate_v, up_u, up_v, down_u, down_v, mix_w, mix_b, coef, meta
         )
-        built["fwd"][(-(-cap // BM), e)](
-            gate_v,
-            up_v,
-            down_u,
-            down_v,
-            xrg,
-            xru,
-            wgt,
-            cnt,
-            out,
-            qq,
-            cap,
-            d,
-            f,
-            rk,
-            BN if bf16 else BN_FP32,
-            BK,
-            MM,
-            len(kinds),
-            *kinds,
-            *pads,
-            sides == "bi",
-            BM,
-            bf16,
-            num_warps=WARPS,
-            num_stages=STAGES,
-        )
-        _tally(2)
         ctx.save_for_backward(
             x,
             tok,
@@ -977,6 +1009,112 @@ class _Bank(torch.autograd.Function):
         )
 
 
+#: The opaque boundary dynamo sees. Hand-written Triton launches stay behind one node, so
+#: a compiled step keeps a single graph instead of breaking at every Python launch site.
+#: The five saved intermediates are extra outputs (unused by the caller) because a custom
+#: op's `setup_context` cannot see attributes set by its implementation under FakeTensor.
+@torch.library.custom_op(
+    "dormouse::bank",
+    mutates_args=(),
+    schema=(
+        "(Tensor x, Tensor tok, Tensor cnt, Tensor gate_u, Tensor gate_v, Tensor up_u, "
+        "Tensor up_v, Tensor down_u, Tensor down_v, Tensor mix_w, Tensor mix_b, "
+        "Tensor coef, int cap, int[] kinds, str sides, bool bf16) -> "
+        "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    ),
+)
+def _bank_op(  # pragma: no cover - the kernels need a card
+    x: torch.Tensor,
+    tok: torch.Tensor,
+    cnt: torch.Tensor,
+    gate_u: torch.Tensor,
+    gate_v: torch.Tensor,
+    up_u: torch.Tensor,
+    up_v: torch.Tensor,
+    down_u: torch.Tensor,
+    down_v: torch.Tensor,
+    mix_w: torch.Tensor,
+    mix_b: torch.Tensor,
+    coef: torch.Tensor,
+    cap: int,
+    kinds: tuple[int, ...],
+    sides: str,
+    bf16: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Run the fused expert chain, returning the write and the backward's saved tensors."""
+    meta = (cap, tuple(kinds), sides, bf16)
+    return _bank_compute(
+        x, tok, cnt, gate_u, gate_v, up_u, up_v, down_u, down_v, mix_w, mix_b, coef, meta
+    )
+
+
+@_bank_op.register_fake
+def _bank_op_fake(  # pragma: no cover - only dynamo's fake path reaches it
+    x: torch.Tensor,
+    tok: torch.Tensor,
+    cnt: torch.Tensor,
+    gate_u: torch.Tensor,
+    gate_v: torch.Tensor,
+    up_u: torch.Tensor,
+    up_v: torch.Tensor,
+    down_u: torch.Tensor,
+    down_v: torch.Tensor,
+    mix_w: torch.Tensor,
+    mix_b: torch.Tensor,
+    coef: torch.Tensor,
+    cap: int,
+    kinds: tuple[int, ...],
+    sides: str,
+    bf16: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Declare the write and the five rank-space buffers without touching data."""
+    del tok, cnt, up_u, up_v, down_u, down_v, mix_w, mix_b, coef, kinds, sides
+    e, d, rk = gate_u.shape
+    f = gate_v.shape[2]
+    del f
+    slots = e * cap
+    dt = torch.bfloat16 if bf16 else x.dtype
+    out = x.new_empty((slots, d), dtype=dt)
+    rank = x.new_empty((slots, rk), dtype=dt)
+    gate = x.new_empty((slots, MM), dtype=torch.float32)
+    return out, rank, rank, rank, gate, gate
+
+
+def _bank_setup(ctx: Any, inputs: tuple[Any, ...], output: tuple[torch.Tensor, ...]) -> None:
+    """Save the operands and the five intermediates in `_Bank.backward`'s exact order."""
+    x, tok, cnt, gate_u, gate_v, up_u, up_v, down_u, down_v, mix_w, mix_b, coef = inputs[:12]
+    cap, kinds, sides, bf16 = inputs[12:]
+    ctx.save_for_backward(
+        x,
+        tok,
+        cnt,
+        gate_u,
+        gate_v,
+        up_u,
+        up_v,
+        down_u,
+        down_v,
+        mix_w,
+        mix_b,
+        coef,
+        output[1],
+        output[2],
+        output[3],
+        output[4],
+        output[5],
+    )
+    ctx.meta = (cap, tuple(kinds), sides, bool(bf16))
+
+
+def _bank_backward(ctx: Any, *grads: torch.Tensor | None) -> tuple[Any, ...]:
+    """Reuse the eager backward; the shape/flag arguments have no gradient."""
+    d_out = cast("torch.Tensor", grads[0])
+    return (*_Bank.backward(ctx, d_out), None, None, None, None)  # type: ignore[no-untyped-call]
+
+
+_bank_op.register_autograd(_bank_backward, setup_context=_bank_setup)
+
+
 def bank(
     x: torch.Tensor,
     tok: torch.Tensor,
@@ -1022,13 +1160,13 @@ def _launch(  # pragma: no cover - the arguments are copied, then the kernels ru
     mix: tuple[torch.Tensor, torch.Tensor],
     stacked: Any,
 ) -> torch.Tensor:
-    """Hand the group to `_Bank`, after making every operand contiguous for the pointer.
+    """Hand the group to the opaque custom op, with every operand contiguous for the pointer.
 
     Split out so the CPU job can cover the checks above without pretending it launched a
     kernel: `gather`'s and the layouts' arithmetic is tested on the CPU, the launch is not.
     """
     mix_w, mix_b = mix
-    meta = (cap, tuple(kinds), sides, bf16_step(x.device))
+    bf16 = bf16_step(x.device)
     #: `.contiguous()` is not cosmetic: a Triton program receives a raw pointer and
     #: indexes with the layouts stated in `_build`, so `Stacked.mix`'s transposed
     #: `[group, d, K]` view (stride `d` on a K-sized last axis) would be read as garbage on
@@ -1050,4 +1188,4 @@ def _launch(  # pragma: no cover - the arguments are copied, then the kernels ru
             stacked.coef,
         )
     ]
-    return _Bank.apply(*tensors, meta)  # type: ignore[no-any-return]
+    return _bank_op(*tensors, cap, tuple(kinds), sides, bf16)[0]  # type: ignore[no-any-return]

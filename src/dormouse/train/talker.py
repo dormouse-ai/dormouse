@@ -55,7 +55,12 @@ class Talker:
         self.decode = decode
 
     def __call__(self, prompt: str, max_tokens: int, stop: Sequence[str]) -> str:
-        """Greedy-decode `max_tokens` ids, stopping as soon as a stop marker appears."""
+        """Greedy-decode `max_tokens` ids, stopping on the end-marker ID.
+
+        The marker is an id, not a decoded substring: the corpus deliberately teaches
+        the marker's spelling as ordinary content, so a string search here would stop
+        generation on a quote of the marker instead of on the control token.
+        """
         ids = list(self.encode(prompt))[-(self.window - 1) :] or [0]
         produced: list[int] = []
         text = ""
@@ -66,11 +71,13 @@ class Talker:
             with torch.no_grad():
                 logits: torch.Tensor = self.model(torch.tensor([padded], dtype=torch.long))
             next_id = int(logits[0, len(context) - 1].argmax())
+            from ..data.tokenizer import END_ID
+
+            if next_id == END_ID:
+                break
             ids.append(next_id)
             produced.append(next_id)
             text = self.decode(produced)
-            if stop and any(marker in text for marker in stop):
-                break
         return text
 
 

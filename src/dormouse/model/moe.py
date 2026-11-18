@@ -445,7 +445,10 @@ class MoEFFN(nn.Module):
         #: row nobody reads, which is what keeps the cost one write and no second sync.
         trash = pad
         group = self.group(capacity, x.element_size())
-        launches = fused_bank.bank_launches()
+        #: The launch tally is a mutable module global. Reading it inside a compiled
+        #: region makes dynamo guard on its value and recompile every step. The compiled
+        #: forward is called with `counters=None` (assemble.py), so skip the read there.
+        launches = fused_bank.bank_launches() if counters is not None else 0
 
         def run(
             x: torch.Tensor,
