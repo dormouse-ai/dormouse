@@ -145,8 +145,14 @@ def bank_enabled() -> bool:
     return _BANK and torch.cuda.is_available() and _build() is not None
 
 
+@torch._dynamo.disable  # type: ignore[untyped-decorator]
 def bank_launches() -> int:
-    """Return how many Triton launches the bank has issued since the last reset."""
+    """Return how many Triton launches the bank has issued since the last reset.
+
+    Disabled for dynamo: `_launches` changes every step, and tracing this accessor would
+    install a guard on the mutable global (`G['…bank']._launches == N`) and recompile the
+    graph on the next step. The read happens on the host at the counter call site instead.
+    """
     return _launches
 
 
