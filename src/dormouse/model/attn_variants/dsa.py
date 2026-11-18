@@ -55,10 +55,17 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from dormouse.verify import register as register_contract
+from dormouse.verify import require as require_contract
+from dormouse.verify.contracts import DSA_CONTRACT
+
 from ...kernels import sparse
 from ..blocks import PROJ_STD
 from .dsa_indexer import LightningIndexer
 from .projections import LatentProjections
+
+#: The counter, degeneration, external anchor and invariants travel with the class.
+register_contract(DSA_CONTRACT)
 
 #: Per-query window, in tokens. The window is what carries locality that a
 #: content score cannot; 128 is a quarter of the k=512 budget.
@@ -166,6 +173,7 @@ class DSA(LatentProjections):
         no previous selection to reuse, because the alternative (silently scanning)
         is MLI being off while the run reports it on.
         """
+        require_contract("dsa")  # no proof, no allocation
         super().__init__(
             d_model,
             n_heads,

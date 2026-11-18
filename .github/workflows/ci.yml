@@ -68,6 +68,9 @@ jobs:
       # non-empty window, and a one-entry dictionary is the plain FFN bit for bit.
       - name: the invariants
         run: uv run --no-sync python -m pytest tests/gates -q
+      # Every mechanism must prove itself: degeneration + external anchor on CPU.
+      - name: the mechanism contracts
+        run: uv run --no-sync python tools/check_contracts.py
 
   regression:
     name: quality regression

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib
 import json
 import platform
 import shutil
@@ -140,7 +141,28 @@ def doctor() -> dict[str, object]:
         report["torch"] = None
     report["disk_free_gb"] = round(shutil.disk_usage(Path.home()).free / 1e9, 1)
     report["nvidia_smi"] = _smi()
+    report["contracts"] = _contract_table()
     return report
+
+
+def _contract_table() -> str:
+    """Import the mechanism modules where torch exists; report their proofs.
+
+    `doctor` still works on a machine with no torch — it just reports no
+    registered contracts rather than failing to render the machine report.
+    """
+    from .verify import registry_table
+
+    for name in (
+        "dormouse.model.attn_variants.kda",
+        "dormouse.model.attn_variants.dsa",
+        "dormouse.model.tsct",
+    ):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            break
+    return registry_table()
 
 
 def _smi() -> str | None:
@@ -168,6 +190,7 @@ def _plan(config: str, journal: str | None = None, graph: bool = False) -> int:
     installed (it reports that instead of failing).
     """
     from .model.assemble import plan_lines
+    from .verify import registry_table
 
     elasticity, source = _elasticity(journal)
     for line in plan_lines(_spec(config), elasticity=elasticity, elasticity_from=source):
@@ -177,6 +200,8 @@ def _plan(config: str, journal: str | None = None, graph: bool = False) -> int:
         if graph
         else "graph=off (eager step; pass --graph to both plan and train to enable replay)"
     )
+    print("contracts (every enabled mechanism must prove itself):")
+    print(registry_table())
     return 0
 
 
