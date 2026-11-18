@@ -36,7 +36,9 @@ from torch import nn
 
 from .. import economics
 from ..train import compiled
+from ..train.aux import LightMTP
 from ..train.graph import StepGraph
+from ..train.jepa import JepaAux, JepaConfig, JepaPair
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
 from ..verify import require as require_contract
@@ -47,6 +49,7 @@ from .attn_variants.kda import KDA
 from .blocks import PROJ_STD, Block
 from .model import Transformer
 from .moe import MoEFFN
+from .residual import MHC, AttnResFull, Residual
 from .spec import StackSpec
 from .tsct import TSCT_RANK
 
@@ -54,6 +57,13 @@ __concepts__ = ("Assembled", "FlatBank")
 
 #: Bytes one stored parameter costs per step: weight + gradient + two moments.
 STATE_BYTES = 16
+
+#: The step-owned slots move more than one counter; the plan prints all of them so a
+#: slot cannot be declared by a counter that never moves.
+STEP_SLOT_COUNTERS: dict[str, tuple[str, ...]] = {
+    "aux": ("aux_fwd", "aux_loss"),
+    "jepa": ("jepa_seen", "jepa_fwd", "jepa_replay_rows", "jepa_memory_size"),
+}
 
 
 class FlatBank(nn.Module):
@@ -86,12 +96,20 @@ class Assembled:
         model: Transformer,
         pieces: tuple[registry.Piece, ...],
         bank: MoEFFN | None,
+        aux: LightMTP | None = None,
+        jepa: JepaAux | None = None,
+        jepa_pair: JepaPair | None = None,
     ) -> None:
-        """Hold the four things a caller needs: the model, the spec, the pieces, the bank."""
+        """Hold the model, the spec, the pieces, the bank, and the two training slots."""
         self.spec = spec
         self.model = model
         self.pieces = pieces
         self.bank = bank
+        self.aux = aux
+        self.jepa = jepa
+        #: The pair stream is a loader, not state: `at(step)` is the fresh batch a run
+        #: packs as `[view A | view B]` before calling `step`.
+        self.jepa_pair = jepa_pair
         #: One `Counters` for the life of the stack. A fresh one per step changes a Python
         #: object's identity between compiled calls, which makes dynamo guard and recompile
         #: the whole step every time — a compile loop reported as a compiled run.
@@ -152,11 +170,18 @@ class Assembled:
             )
             result = graph.run(ids, counters=counters)
         else:
+            pair = None
+            if self.jepa is not None:
+                width = self.jepa.memory.view_b.shape[1]
+                pair = ids[:, width:]
             result = train_step(
                 self.model,
                 ids,
                 optimizer=optimizer,
                 accum=accum,
+                aux=self.aux,
+                jepa=self.jepa,
+                pair=pair,
                 #: A `Counters` is a Python object dynamo specialises on and its `count`
                 #: calls are side effects it cannot trace: under compile the step counts
                 #: what it can see from outside (graphs, replays) and the mechanism
@@ -212,12 +237,48 @@ def assemble(
         max_seq_len=spec.seq_len,
         blocks=blocks,
         declarations=registry.declarations(pieces),
+        mixer=_mixer(spec, device),
         device=device,
     )
     _quantize(model, spec)
+    jepa_config = JepaConfig(
+        jepa=spec.jepa,
+        jepa_lambda=spec.jepa_lambda,
+        jepa_ld=spec.jepa_ld,
+        jepa_memory_size=spec.jepa_memory_size,
+        jepa_replay_frac=spec.jepa_replay_frac,
+        jepa_replay_weight=spec.jepa_replay_weight,
+        jepa_pairs_path=spec.jepa_pairs_path,
+    )
+    aux = None
+    if spec.aux != "none":
+        aux = LightMTP(
+            model,
+            k=spec.aux_k,
+            layer=spec.aux_layer,
+            weight=spec.aux_weight,
+            varreg=spec.aux_varreg,
+        )
+        # A submodule, not a sibling: the optimizer's router and the global clip both
+        # read `model.named_parameters()`. One slot, one head, attached once.
+        aux.attach(model)
+    jepa = jepa_config.aux(spec.d_model, seq_len=spec.seq_len)
+    jepa_pair = jepa_config.pair(batch=spec.batch, seq_len=spec.seq_len)
+    if jepa is not None:
+        # The JEPA predictor is its own head under its own name, so it trains with the
+        # stack without colliding with the LightMTP head on `model.aux`.
+        model.add_module("jepa", jepa.head)
     if spec.torch_compile:
         compiled.checked(model)
-    return Assembled(spec=spec, model=model, pieces=pieces, bank=bank)
+    return Assembled(
+        spec=spec,
+        model=model,
+        pieces=pieces,
+        bank=bank,
+        aux=aux,
+        jepa=jepa,
+        jepa_pair=jepa_pair,
+    )
 
 
 def _attention(
@@ -245,6 +306,15 @@ def _attention(
         write_std=write_std,
         device=device,
     )
+
+
+def _mixer(spec: StackSpec, device: torch.device | str | None) -> Residual | None:
+    """Build the residual mechanism the spec names; `None` is the block's own add."""
+    if spec.residual == "attnres":
+        return AttnResFull(spec.d_model, 2 * spec.n_layers, device=device)
+    if spec.residual == "mhc":
+        return MHC(spec.d_model, spec.mhc_streams, device=device)
+    return None
 
 
 def _bank(
@@ -346,6 +416,15 @@ def plan_lines(
         "mechanisms: "
         + ", ".join(dict.fromkeys(f"{p.mechanism}→{p.counter}" for p in assembled.pieces))
     )
+    slots = []
+    for slot in ("residual", "aux", "jepa"):
+        piece = next((p for p in assembled.pieces if p.slot == slot), None)
+        if piece is None:
+            slots.append(f"{slot}=off→none")
+        else:
+            counters = STEP_SLOT_COUNTERS.get(slot, (piece.counter,))
+            slots.append(f"{piece.slot}={piece.name}→{'+'.join(counters)}")
+    lines.append("slots: " + ", ".join(slots))
     lines.append(f"economics: elasticity {elasticity:.4f} ({elasticity_from})")
     lines.append("  lever | speedup | loss | verdict")
     lines.extend(f"  {lever.row(elasticity)}" for lever in levers(spec))

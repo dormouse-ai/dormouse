@@ -40,6 +40,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 
 from .ffn_spec import FFNSpec
+from .residual import Residual
 
 __concepts__ = ("RMSNorm", "Block")
 
@@ -143,10 +144,26 @@ class Block(nn.Module):
             )
         return spec.build(write_std=write_std, device=device)
 
-    def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [batch, seq, d_model]` in, the residual stream out, same shape."""
-        x = x + self.attn(self.norm1(x, counters), counters)
-        x = x + self.ffn(self.norm2(x, counters), counters)
+    def forward(
+        self,
+        x: torch.Tensor,
+        counters: Counters | None = None,
+        residual: Residual | None = None,
+    ) -> torch.Tensor:
+        """`x [batch, seq, d_model]` in, the residual stream out, same shape.
+
+        `residual` is the stack-level mixer when the spec names one. `None` is the
+        block's own two adds: the exact statements, order and ops every measurement
+        on record was taken against. A mixer takes one write per sublayer (`N = L`),
+        so its identity init can be the plain add bit for bit.
+        """
+        if residual is None:
+            x = x + self.attn(self.norm1(x, counters), counters)
+            x = x + self.ffn(self.norm2(x, counters), counters)
+        else:
+            x = residual.enter(x)
+            x = residual.write(self.attn(self.norm1(x, counters), counters), counters)
+            x = residual.write(self.ffn(self.norm2(x, counters), counters), counters)
         if counters is not None:
             counters.count("block_fwd")
         return x

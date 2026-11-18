@@ -1,0 +1,48 @@
+# All three slots enabled at once: residual=attnres, aux=lightmtp, jepa=replay.
+# Each slot is independent and defaults off; this file is the coexistence A/B, not a
+# new recipe. Widths are the 1B stack's, so `dorm plan` prices the real thing; the
+# CPU integration test shrinks them with `dataclasses.replace`. The paired corpus
+# holds 32 pairs of 1025 tokens (view A and view B) under tests/fixtures/jepa_pairs.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+residual = "attnres"
+aux = "lightmtp"
+aux_k = 8
+aux_layer = 0
+aux_weight = 0.1
+aux_varreg = false
+jepa = "replay"
+jepa_lambda = 1.0
+jepa_ld = 0.0
+jepa_memory_size = 8
+jepa_replay_frac = 0.25
+jepa_replay_weight = 0.5
+jepa_pairs_path = "tests/fixtures/jepa_pairs"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+mhc_streams = 2
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

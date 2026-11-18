@@ -17,8 +17,12 @@ The literals that remain, and the refusal each one carries:
   refusal prints.
 * `optimizer` — `muon` is `MixOptimizer` (matrices under Muon, vectors under AdamW).
   `adamw` is the control arm.
-* `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. `+tst`
-  and `+jepa` have no loss module, so they are refused with that reason.
+* `objective` — `ntp` is the chunked cross-entropy `train/step.py` computes. `+jepa`
+  is still refused here: ER-JEPA is its own `jepa` slot, not a second term folded into
+  this one. `+tst` has no loss module at all.
+* `residual`, `aux`, `jepa` — three independent training slots. `plain`/`none`/`none`
+  is the architecture every number on record was measured on; `attnres`/`mhc`,
+  `lightmtp` and `replay` each turn on one mechanism with its own counter.
 * `weight_qat`, `act_quant`, `torch_compile` — the quantization slots and the compile
   flag, which contradicts `act_quant=int4` (a graph break at every fake-quant
   boundary, measured) and is refused as that pair.
@@ -33,7 +37,7 @@ build" (`assemble.assemble`).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from dormouse_core.config import Config
 from dormouse_core.errors import LoudError
@@ -50,6 +54,10 @@ OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
+#: The residual write: `plain` is the block's own add; the other two are mixers.
+RESIDUALS: tuple[str, ...] = ("plain", "attnres", "mhc")
+#: The second objective. `none` leaves the token loss and the step bit-identical.
+AUXES: tuple[str, ...] = ("none", "lightmtp")
 
 #: The vocab each unit prices the token table at. `bpe` is the tokenizer's own default:
 #: the number exists in `data/tokenizer.py` and nowhere else, so a head priced here and a
@@ -99,6 +107,9 @@ class StackSpec(Config):
     objective: str = "ntp"
     weight_qat: str = "none"
     act_quant: str = "none"
+    residual: str = "plain"
+    aux: str = "none"
+    jepa: str = "none"
 
     # ------------------------------------------------------------------ wiring
     torch_compile: bool = False
@@ -129,6 +140,20 @@ class StackSpec(Config):
     attn_window: int = 128
     seq_len: int = 1024
     batch: int = 24
+    #: mHC's expansion rate: full-width residual lanes, at least two.
+    mhc_streams: int = 2
+    #: LightMTP-S: the horizon, the target block, the weight and the variance penalty.
+    aux_k: int = 8
+    aux_layer: int = 0
+    aux_weight: float = 0.1
+    aux_varreg: bool = False
+    #: ER-JEPA: the mode, λ, dropout rate, store, replay budget and paired corpus.
+    jepa_lambda: float = 1.0
+    jepa_ld: float = 0.0
+    jepa_memory_size: int = 256
+    jepa_replay_frac: float = 0.25
+    jepa_replay_weight: float = 0.5
+    jepa_pairs_path: str = ""
 
     # -------------------------------------------------------------------- plan
     tokens: int = 10_000_000_000
@@ -157,6 +182,10 @@ class StackSpec(Config):
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
+        _literal("residual", self.residual, RESIDUALS)
+        _literal("aux", self.aux, AUXES)
+        _aux_slot(self)
+        _jepa_slot(self)
         if self.vocab != VOCAB[self.unit]:
             raise LoudError(
                 f"vocab={self.vocab} is not the {self.unit} vocabulary ({VOCAB[self.unit]})",
@@ -205,6 +234,13 @@ class StackSpec(Config):
                 "the indexer selects what the window does not already read; keep "
                 "attn_k >= attn_window (512 and 128 is the recipe)",
             )
+        if self.residual == "mhc" and self.mhc_streams < 2:
+            raise LoudError(
+                f"mhc_streams={self.mhc_streams}: one lane is the plain residual with a "
+                "hyper-network bolted on",
+                "use mhc_streams >= 2 (the paper's K = 2 and the measured arm), or "
+                "residual='plain'",
+            )
         if self.n_shared not in (0, 1):
             raise LoudError(
                 f"n_shared={self.n_shared}: the design has ONE always-on expert",
@@ -221,7 +257,8 @@ class StackSpec(Config):
             raise LoudError(
                 f"objective={self.objective!r}: no loss module computes it",
                 "this stack assembles ntp (train/step.py's chunked cross-entropy); a "
-                "tst or jepa term needs a second loss that no branch ships yet",
+                "tst term needs a second loss module; the jepa term lives in its own "
+                "jepa='replay' slot (train/jepa.py), not in this one",
             )
         if self.act_quant == "int4" and self.torch_compile:
             raise LoudError(
@@ -265,3 +302,57 @@ class StackSpec(Config):
     def d_ffn_gelu(self) -> int:
         """The GELU width a mixture's `3·d·d_ffn` bill is checked against."""
         return 3 * self.d_ffn // 2
+
+
+def _aux_slot(spec: StackSpec) -> None:
+    """Refuse an aux horizon with no target, and four numbers nobody reads."""
+    if spec.aux == "none":
+        defaults = {f.name: f.default for f in fields(StackSpec) if f.name.startswith("aux_")}
+        named = [
+            f"{key}={getattr(spec, key)!r}"
+            for key, default in defaults.items()
+            if getattr(spec, key) != default
+        ]
+        if named:
+            raise LoudError(
+                f"aux='none' with {', '.join(named)}: no head is built, so nothing reads them",
+                "drop the aux_* keys, or set aux='lightmtp' so a run trains the second "
+                "objective those numbers describe",
+            )
+        return
+    if spec.aux_k < 1:
+        raise LoudError(
+            f"aux_k={spec.aux_k} looks zero positions ahead",
+            "k=8 is the A/B's horizon; k=1 is a next-state prediction, not the paper's k",
+        )
+    if spec.aux_k >= spec.seq_len:
+        raise LoudError(
+            f"aux_k={spec.aux_k} over seq_len={spec.seq_len} leaves no position with a target",
+            "keep k below seq_len: the aux loss reads position t and target t+k in one window",
+        )
+    if not 0 <= spec.aux_layer <= spec.n_layers:
+        raise LoudError(
+            f"aux_layer={spec.aux_layer} is not a block of this {spec.n_layers}-layer stack",
+            "0 and n_layers both mean the final block's output; 1..n_layers-1 index an "
+            "intermediate block, where the paper takes its targets (l=16 of 24)",
+        )
+    if spec.aux_weight <= 0.0:
+        raise LoudError(
+            f"aux_weight={spec.aux_weight} gives the head a zero or reversed gradient",
+            "0.1 is the paper's λ_MTP, and the head costs parameters whether it learns or not",
+        )
+
+
+def _jepa_slot(spec: StackSpec) -> None:
+    """Refuse a bad JEPA value with the term's own config, not a second copy of its rules."""
+    from ..train.jepa import JepaConfig
+
+    JepaConfig(
+        jepa=spec.jepa,
+        jepa_lambda=spec.jepa_lambda,
+        jepa_ld=spec.jepa_ld,
+        jepa_memory_size=spec.jepa_memory_size,
+        jepa_replay_frac=spec.jepa_replay_frac,
+        jepa_replay_weight=spec.jepa_replay_weight,
+        jepa_pairs_path=spec.jepa_pairs_path,
+    ).validate()

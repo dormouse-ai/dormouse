@@ -31,7 +31,9 @@ from .spec import StackSpec
 #: Slots whose counter the model's forward produces. The rest (optimizer,
 #: objective) are counted by the step, which is why they are not declared on the
 #: stack: a mechanism the forward cannot count would raise `MissingReport` there.
-MODEL_SLOTS = frozenset({"attn", "ffn", "expert", "tsct", "dictionary", "weight_qat", "act_quant"})
+MODEL_SLOTS = frozenset(
+    {"attn", "ffn", "expert", "tsct", "dictionary", "weight_qat", "act_quant", "residual"}
+)
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,50 @@ QUANT: dict[str, Piece] = {
     "int4": Piece("act_quant", "int4", "act_quant", "act_int4", Coeffects(), "int4 activations"),
 }
 
+#: The residual write. `plain` is the block's own add, not a piece with a silent counter.
+RESIDUAL: dict[str, Piece] = {
+    "attnres": Piece(
+        "residual",
+        "attnres",
+        "attnres",
+        "attnres_sources",
+        Coeffects(),
+        "full-depth attention over every earlier sublayer's write",
+    ),
+    "mhc": Piece(
+        "residual",
+        "mhc",
+        "mhc",
+        "mhc_mix",
+        Coeffects(),
+        "n residual lanes mixed by a Sinkhorn-Knopp matrix",
+    ),
+}
+
+#: The two training-only slots. Their counters are produced by the step, not the forward,
+#: so neither slot is in `MODEL_SLOTS`: one head per model, one term per step.
+AUX: dict[str, Piece] = {
+    "lightmtp": Piece(
+        "aux",
+        "lightmtp",
+        "lightmtp",
+        "aux_fwd",
+        Coeffects(),
+        "a head predicts the trunk's state k positions on",
+    ),
+}
+
+JEPA: dict[str, Piece] = {
+    "replay": Piece(
+        "jepa",
+        "replay",
+        "jepa",
+        "jepa_seen",
+        Coeffects(),
+        "paired alignment with an episodic replay memory",
+    ),
+}
+
 
 def pieces(spec: StackSpec, *, ctx: dict[str, str] | None = None) -> tuple[Piece, ...]:
     """Return the arms this spec enables, refusing any whose coeffects do not fit.
@@ -156,6 +202,12 @@ def pieces(spec: StackSpec, *, ctx: dict[str, str] | None = None) -> tuple[Piece
         chosen.append(QAT[spec.weight_qat])
     if spec.act_quant != "none":
         chosen.append(QUANT[spec.act_quant])
+    if spec.residual != "plain":
+        chosen.append(RESIDUAL[spec.residual])
+    if spec.aux != "none":
+        chosen.append(AUX[spec.aux])
+    if spec.jepa != "none":
+        chosen.append(JEPA[spec.jepa])
     _check(chosen, declared)
     return tuple(chosen)
 

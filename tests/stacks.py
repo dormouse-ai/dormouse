@@ -16,11 +16,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import torch
 from reference_attn import Attention
 
 from dormouse.model.blocks import Block
 from dormouse.model.ffn_spec import FFNSpec
 from dormouse.model.model import Transformer
+from dormouse.model.residual import Residual
 
 #: What a reference stack's forward counts, in `(mechanism, counter, why)` form.
 REFERENCE: tuple[tuple[str, str, str], ...] = (
@@ -51,8 +53,12 @@ def reference_stack(
     max_seq_len: int = 32,
     ffn: FFNSpec | None = None,
     declarations: Sequence[tuple[str, str, str]] | None = None,
+    mixer: Residual | None = None,
+    seed: int = 0,
 ) -> Transformer:
     """A `Transformer` whose blocks use the reference attention and `ffn`."""
+    if seed:
+        torch.manual_seed(seed)
     blocks = [
         Block(
             d_model,
@@ -71,4 +77,5 @@ def reference_stack(
         max_seq_len=max_seq_len,
         blocks=blocks,
         declarations=declared,
+        mixer=mixer,
     )

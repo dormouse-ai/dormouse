@@ -1,0 +1,41 @@
+# dormouse_1b with ONE addition: the LightMTP-S auxiliary objective.
+#   aux=lightmtp   the trunk's own hidden state k positions on, stop-gradient, cosine loss
+#   aux_k=8        the paper's best Countdown horizon
+#   aux_layer=0    the final block's output (the next knob is an intermediate layer)
+#   aux_weight=0.1 the paper's lambda_MTP
+#   aux_varreg=false  VarReg improves probing and degrades every LM column; leave it off.
+# The head is 2·d·(d/2) = 692,224 parameters, under the 1% ceiling and reported in `dorm plan`.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+aux = "lightmtp"
+aux_k = 8
+aux_layer = 0
+aux_weight = 0.1
+aux_varreg = false
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

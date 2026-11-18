@@ -171,9 +171,14 @@ def test_the_other_config_files_are_gone() -> None:
     because it sits below the expert floor `dorm plan` refuses to price. The A/B arm is
     this same file with two values changed; `test_ab_configs.py` holds that line.
     """
+    # The two added files are the same stack with training slots switched on, not
+    # second architectures: `lightmtp.toml` adds the aux term, `slots_all.toml` turns
+    # on all three slots for the coexistence A/B.
     assert sorted(p.name for p in CONFIGS.glob("*.toml")) == [
         "dormouse_1b.toml",
         "dormouse_1b_top1_r192.toml",
+        "lightmtp.toml",
+        "slots_all.toml",
         "smoke.toml",
     ]
 

@@ -48,6 +48,7 @@ from torch import nn
 
 from ..data.tokenizer import DEFAULT_VOCAB
 from .blocks import EPS, RMSNorm
+from .residual import Residual
 
 
 class Transformer(nn.Module):
@@ -64,8 +65,13 @@ class Transformer(nn.Module):
         device: torch.device | str | None = None,
         blocks: Sequence[nn.Module],
         declarations: Sequence[tuple[str, str, str]],
+        mixer: Residual | None = None,
     ) -> None:
-        """Build the table, the stack, the final norm and the (tied) head."""
+        """Build the table, the stack, the final norm and the (tied) head.
+
+        `mixer` owns the residual stream when the spec names one; `None` is the
+        block's own two adds and leaves the forward exactly as it was.
+        """
         super().__init__()
         if vocab < 2:
             raise LoudError(
@@ -95,11 +101,55 @@ class Transformer(nn.Module):
         #: forward cannot count is a mechanism nobody can see was skipped.
         self.declarations = tuple(declarations)
         self.blocks = nn.ModuleList(blocks)
+        self.mixer = mixer
         self.norm = RMSNorm(d_model, eps, device=device)
 
     # ------------------------------------------------------------------ forward
     def forward(self, ids: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """`ids [batch, seq]` token ids → `logits [batch, seq, vocab]`."""
+        self._check_ids(ids)
+        if counters is not None:
+            self._enable(counters)
+        _h, logits = self.encode(ids, counters)
+        return logits
+
+    def encode(
+        self, ids: torch.Tensor, counters: Counters | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the logits and the final-normed stream the paired JEPA term reads.
+
+        One forward, one set of counters and one `check()`: the token head and the
+        alignment term must see the same encoder pass, or an A/B would measure two
+        different batches.
+        """
+        self._check_ids(ids)
+        if counters is not None:
+            self._enable(counters)
+        h: torch.Tensor = self.norm(self._blocks(ids, counters), counters)
+        logits = self.head(h, counters)
+        if counters is not None:
+            counters.check()
+        return h, logits
+
+    def hidden(self, ids: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
+        """`ids [batch, seq]` → the final-normed `[batch, seq, d_model]` stream.
+
+        This is the encoder embedding the ER-JEPA term reads: the paired batch is
+        forwarded once, split into its two views, and no `[B, T, V]` logit buffer is
+        allocated for a replay whose logits nobody scores. The head's counters are not
+        enabled here, so this call's `check()` is a statement about the encoder only.
+        """
+        self._check_ids(ids)
+        if counters is not None:
+            self._enable_encoder(counters)
+        h: torch.Tensor = self.norm(self._blocks(ids, counters), counters)
+        if counters is not None:
+            counters.check()
+        return h
+
+    @staticmethod
+    def _check_ids(ids: torch.Tensor) -> None:
+        """Check the one validation the forward and the encoder share."""
         if ids.dim() != 2:
             raise LoudError(
                 f"forward takes ids [batch, seq], got shape {tuple(ids.shape)}",
@@ -110,17 +160,21 @@ class Transformer(nn.Module):
                 "token ids are integers",
                 "cast the batch to torch.long before the forward",
             )
-        if counters is not None:
-            self._enable(counters)
-        h = self.embed(ids)
+
+    def _blocks(self, ids: torch.Tensor, counters: Counters | None) -> torch.Tensor:
+        """Embed and run the stack; the mixer, when set, owns the stream."""
+        h: torch.Tensor = self.embed(ids)
         if counters is not None:
             counters.count("embed_fwd", ids.numel())
-        for block in self.blocks:
-            h = block(h, counters)
-        logits = self.head(self.norm(h, counters), counters)
-        if counters is not None:
-            counters.check()
-        return logits
+        if self.mixer is None:
+            for block in self.blocks:
+                h = block(h, counters)
+        else:
+            self.mixer.begin(h)
+            for block in self.blocks:
+                block(h, counters, self.mixer)
+            h = self.mixer.read()
+        return h
 
     def head(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """Logits from the token table, transposed: no parameter of its own.
@@ -143,11 +197,15 @@ class Transformer(nn.Module):
         loss is ever returned. Only the parts every stack shares are declared here;
         the ones that depend on which arm a block holds come from `declarations`.
         """
+        self._enable_encoder(counters)
+        counters.enable("head", counter="head_fwd", why="logits come from the tied head")
+        counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
+
+    def _enable_encoder(self, counters: Counters) -> None:
+        """Declare what the encoder half runs; `hidden()` checks only these."""
         counters.enable("embedding", counter="embed_fwd", why="the token table is read")
         counters.enable("blocks", counter="block_fwd", why="the residual stack runs")
         counters.enable("norm", counter="norm_fwd", why="two pre-norms per block + final")
-        counters.enable("head", counter="head_fwd", why="logits come from the tied head")
-        counters.enable("tied_head", counter="tied_head", why="the head has no parameter")
         for mechanism, counter, why in self.declarations:
             counters.enable(mechanism, counter=counter, why=why)
 
@@ -160,12 +218,14 @@ class Transformer(nn.Module):
         printing it), and `total`. `total` is summed from `parameters()`, so a group
         that forgets a parameter shows up as a disagreement instead of a lost number.
         """
-        groups = dict.fromkeys(("embedding", "attention", "ffn", "norms", "head"), 0)
+        groups = dict.fromkeys(("embedding", "attention", "ffn", "norms", "residual", "head"), 0)
         for name, param in self.named_parameters():
             if name.startswith("embed."):
                 key = "embedding"
             elif name == "norm.weight" or ".norm" in name:
                 key = "norms"
+            elif name.startswith("mixer."):
+                key = "residual"
             elif ".attn." in name:
                 key = "attention"
             elif ".ffn." in name:
