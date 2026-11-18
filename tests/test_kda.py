@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 from dormouse_core.counters import Counters
@@ -318,3 +319,85 @@ def test_the_chunk_graph_is_recomputed_not_retained(monkeypatch: pytest.MonkeyPa
     #: still buys is the six intermediates against the five inputs — strictly less, which
     #: is the claim, at the measured 0.56 -> 0.34 MiB here and ~0.4 GiB at b8 x s1024.
     assert recomputed < kept, (recomputed, kept)
+
+
+# --- numerical anchor: Kimi eq. 1 written out in numpy fp64 -------------------
+
+
+def _numpy_recurrence(
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    alpha: np.ndarray,
+    beta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The published recurrence, one token at a time, over raw fp64 arrays.
+
+        S_t = (I - β_t k_t k_tᵀ) Diag(α_t) S_{t-1} + β_t k_t v_tᵀ
+        o_t = S_tᵀ q_t
+
+    Nothing here calls a `dormouse` function: the delta term, the diagonal decay
+    and the write are the three moves this anchor pins, written from the paper.
+    """
+    width = q.shape[1]
+    state = np.zeros((width, width), dtype=np.float64)
+    written = []
+    for t in range(q.shape[0]):
+        state = state * alpha[t][:, None]
+        state = (np.eye(width) - beta[t] * np.outer(k[t], k[t])) @ state
+        state = state + beta[t] * np.outer(k[t], v[t])
+        written.append(state.T @ q[t])
+    return np.stack(written), state
+
+
+def _as_kernel(value: np.ndarray) -> torch.Tensor:
+    """A hand-set array as the kernel's `[batch=1, heads=1, seq, width]` input."""
+    return torch.tensor(value, dtype=torch.float64).unsqueeze(0).unsqueeze(0)
+
+
+def anchor_kda_recurrence() -> dict[str, float]:
+    """Compare KDA to the numpy fp64 recurrence on 3 tokens, d=2.
+
+    Inputs are hand-set, not drawn from this repo's projections: a change to the
+    delta term, the decay or the write moves the module away from a number that
+    does not depend on it. The chunk path is anchored to the same reference, so
+    the optimisation cannot drift from eq. 1 either.
+    """
+    q = np.array([[0.5, -0.3], [1.0, 0.2], [-0.7, 0.9]])
+    k = np.array([[0.4, 0.8], [-0.6, 0.5], [0.9, -0.2]])
+    v = np.array([[1.0, 0.5], [-0.5, 2.0], [0.3, -1.0]])
+    alpha = np.array([[0.9, 0.8], [0.95, 0.7], [0.85, 0.6]])
+    beta = np.array([0.5, 0.7, 0.3])
+
+    want_out, want_state = _numpy_recurrence(q, k, v, alpha, beta)
+    # Numbers from the numpy computation above, printed so the anchor is visible.
+    assert want_out[1, 0] == pytest.approx(0.4301, abs=1e-12)
+    assert want_out[2, 1] == pytest.approx(0.97233079, abs=1e-8)
+    assert want_state[0, 0] == pytest.approx(0.34851363, abs=1e-8)
+    assert want_state[1, 1] == pytest.approx(0.52130987, abs=1e-8)
+
+    layer = KDA(8, 1, 2, chunk=3).double()
+    args = (_as_kernel(q), _as_kernel(k), _as_kernel(v), _as_kernel(alpha), _as_kernel(beta))
+    slow_out, slow_state = layer.recurrent(*args)
+    slow_err = float(
+        max(
+            np.abs(slow_out.squeeze(0).squeeze(0).detach().numpy() - want_out).max(),
+            np.abs(slow_state.squeeze(0).squeeze(0).detach().numpy() - want_state).max(),
+        )
+    )
+    assert slow_err < 1e-12, f"recurrent drifted from eq. 1 by {slow_err:.3e}"
+
+    fast_out, fast_state = layer._chunkwise(*args)
+    fast_err = float(
+        max(
+            np.abs(fast_out.squeeze(0).squeeze(0).detach().numpy() - want_out).max(),
+            np.abs(fast_state.squeeze(0).squeeze(0).detach().numpy() - want_state).max(),
+        )
+    )
+    assert fast_err < 1e-12, f"chunkwise drifted from eq. 1 by {fast_err:.3e}"
+    return {"recurrent": slow_err, "chunkwise": fast_err}
+
+
+def test_kda_recurrence_matches_an_independent_numpy_fp64_anchor() -> None:
+    """3 tokens, d=2: eq. 1 by hand in numpy is the number the module must return."""
+    anchor_kda_recurrence()
