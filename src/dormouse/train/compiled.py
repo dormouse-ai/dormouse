@@ -23,8 +23,9 @@ by name — and `counters.check()` fails if the graphs are zero.
 
 from __future__ import annotations
 
+import gc
 import signal
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -41,9 +42,14 @@ COUNTER = "compile_graphs"
 #: NO ARTIFACT — the earlier card probe was killed at 540 s (tools/bench_compile_step.py:33).
 COMPILE_BUDGET_S = 600
 
-#: Set while the model is compiled, so callers can tell a compiled step from an eager one
+#: Set while a region is compiled, so callers can tell a compiled step from an eager one
 #: without inspecting `torch._dynamo`'s globals.
 _ENABLED = False
+
+#: Inductor mode for the bounded step region. `default` builds no CUDA graphs and tries no
+#: kernel variants, so it has the smallest compile-time memory footprint. The two named
+#: alternatives are selectable for a card-side A/B; neither is assumed smaller here.
+DEFAULT_REGION_MODE = "default"
 
 
 def enable(model: nn.Module, *, fullgraph: bool = False, backend: str = "inductor") -> None:
@@ -64,8 +70,33 @@ def enable(model: nn.Module, *, fullgraph: bool = False, backend: str = "inducto
     _ENABLED = True
 
 
+def enable_region(
+    region: Callable[..., Any],
+    *,
+    mode: str | None = DEFAULT_REGION_MODE,
+    fullgraph: bool = False,
+    backend: str = "inductor",
+) -> Callable[..., Any]:
+    """Compile one bounded callable — a step function, not the whole model.
+
+    `torch.compile` on a *function* leaves parameter names intact (no `_orig_mod`
+    wrapper), so the optimizers that route parameters by name still work. Compiling
+    only the step region leaves the clip, the firewall and the optimizer eager, and
+    keeps one graph instead of one per model submodule resident at a time. The caller
+    owns the returned callable and must drop it and call `clear_caches()` before the
+    next compile attempt, so two graphs are never resident.
+    """
+    global _ENABLED
+    reset()
+    compiled_region = torch.compile(
+        region, backend=backend, dynamic=False, mode=mode, fullgraph=fullgraph
+    )
+    _ENABLED = True
+    return compiled_region
+
+
 def enabled() -> bool:
-    """Return whether `enable` has been called in this process."""
+    """Return whether a compile entry point has been called in this process."""
     return _ENABLED
 
 
@@ -75,6 +106,41 @@ def reset() -> None:
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
     _ENABLED = False
+
+
+def clear_caches() -> None:
+    """Drop dynamo, inductor and Triton in-memory caches between compile attempts.
+
+    Two resident compiled graphs are what turned the batch ladder into an OOM. `reset`
+    drops dynamo's graph; this also evicts inductor's code-cache references and the
+    CUDA allocator's cached blocks. Every private API is guarded: a torch version
+    without a given cache has nothing to free there, which is no reason to keep a
+    stale graph. The caller must also drop its compiled callable before calling this.
+    """
+    reset()
+    gc.collect()
+    try:
+        from torch._inductor import codecache
+
+        for owner, attr in (
+            (codecache.FxGraphCache, "clear"),
+            (codecache.CppCodeCache, "cache"),
+            (codecache.PyCodeCache, "modules"),
+        ):
+            target = getattr(owner, attr, None)
+            if target is None:
+                continue
+            if callable(target):
+                target()
+            elif hasattr(target, "clear"):
+                target.clear()
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        pass
+    # ponytail: Triton's JIT cache is process-global with no public eviction hook; the
+    # inductor references above are the compiled graphs we own. Add per-kernel eviction
+    # only if the card still OOMs after both graphs and cached blocks are gone.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _counters() -> Mapping[str, Any]:
