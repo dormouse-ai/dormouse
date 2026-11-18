@@ -16,6 +16,8 @@ is covered where the assembler is (`tests/test_assemble.py`).
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from dormouse_core.counters import Counters
@@ -42,11 +44,12 @@ def test_logits_have_one_row_per_token_and_one_column_per_symbol() -> None:
     assert logits.dtype == torch.float32
 
 
-def test_the_head_is_the_token_table_transposed() -> None:
-    """Tying is the parameterisation: the logits' matrix is `embed.weight` itself."""
+def test_the_head_is_the_token_table_transposed_and_scaled() -> None:
+    """Tying is the parameterisation: the logits' matrix is `embed.weightᵀ/√d`."""
     model = reference_stack()
     h = torch.randn(7, SMALL["d_model"])
-    assert torch.allclose(model.head(h), h @ model.embed.weight.T, atol=1e-6)
+    expected = h @ model.embed.weight.T / math.sqrt(SMALL["d_model"])
+    assert torch.allclose(model.head(h), expected, atol=1e-6)
 
 
 def test_every_enabled_mechanism_reports_itself() -> None:
@@ -132,12 +135,45 @@ def test_the_same_seed_builds_the_same_model() -> None:
     assert torch.equal(a(ids), b(ids))
 
 
-def test_the_embedding_starts_at_unit_rms_and_projections_at_their_std() -> None:
+def test_projections_start_at_their_std() -> None:
     """The init contract the variance argument is written against."""
     model = reference_stack()
-    assert model.embed.weight.std().item() == pytest.approx(1.0, rel=0.2)
     qkv = model.blocks[0].attn.qkv.weight
     assert qkv.std().item() == pytest.approx(0.02, rel=0.2)
+
+
+def test_the_tied_head_starts_at_unit_logit_scale() -> None:
+    """Fresh stack: logit std ~1 and CE < 2 ln(V) — both fail on the unscaled head.
+
+    External anchor, CPU 2026-11-16 at d=832, V=32768, a fresh unit-RMS h independent
+    of W: the raw tied head gave logit std 28.80 and CE 121.9 nats; with the `1/√d`
+    scale std 0.999 and CE 11.04 nats = 1.06·ln(32768) = 10.397. The stack's own
+    forward scores ~0 CE against copy targets at init (a copy artifact of the tie),
+    so the anchor — and this test — use an independent h and random targets.
+    """
+    model = reference_stack()
+    g = torch.Generator().manual_seed(0)
+    h = torch.randn(2048, SMALL["d_model"], generator=g)
+    h = h / h.norm(dim=-1, keepdim=True) * math.sqrt(SMALL["d_model"])
+    logits = model.head(h)
+    assert logits.std().item() == pytest.approx(1.0, rel=0.2)
+    targets = torch.randint(0, SMALL["vocab"], (2048,), generator=g)
+    ce = torch.nn.functional.cross_entropy(logits, targets).item()
+    assert ce < 2 * math.log(SMALL["vocab"])
+
+
+def test_doubling_d_model_keeps_init_ce_within_20_percent_of_ln_vocab() -> None:
+    """The scale tracks d_model: a constant divisor would fail at one of the widths."""
+    for d_model in (SMALL["d_model"], 2 * SMALL["d_model"]):
+        model = reference_stack(d_model=d_model, n_heads=2, head_dim=d_model // 2)
+        g = torch.Generator().manual_seed(0)
+        h = torch.randn(2048, d_model, generator=g)
+        h = h / h.norm(dim=-1, keepdim=True) * math.sqrt(d_model)
+        logits = model.head(h)
+        assert logits.std().item() == pytest.approx(1.0, rel=0.2)
+        targets = torch.randint(0, SMALL["vocab"], (2048,), generator=g)
+        ce = torch.nn.functional.cross_entropy(logits, targets).item()
+        assert ce == pytest.approx(math.log(SMALL["vocab"]), rel=0.2)
 
 
 def test_a_one_symbol_vocabulary_is_refused() -> None:

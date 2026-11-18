@@ -16,7 +16,10 @@ TIED HEAD. The logits' matrix IS the token table, transposed. At the tokenizer's
 "predict token t" separately from "read token t"; for a table this size the two
 gradients belong in one
 matrix, and the head's own bill stays 0 so a translation of the tying to a second
-matrix shows up as a number that moved.
+matrix shows up as a number that moved. The rows are `N(0, 1)` for the embedding READ
+(unit RMS is what RMSNorm expects), but the same rows are the head WRITE, so `head`
+divides by `√d_model`: without it a unit-RMS stream produces logits of std `√d` and
+the init loss is hundreds of nats instead of `ln(vocab)`.
 
 PLAIN TOKEN TABLE, NOT FACTORISED. `vocab·d = 27.3M` is 2.6% of the model; the
 `U·Vᵀ` factorisation would turn a lookup into a rank bottleneck to save half of it,
@@ -39,6 +42,7 @@ position table to disagree with a checkpoint.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -123,16 +127,19 @@ class Transformer(nn.Module):
         return logits
 
     def head(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """Logits from the token table, transposed: no parameter of its own.
+        """Logits from the token table, transposed and scaled: no parameter of its own.
 
         The counter is the proof that the tying is live: a head that quietly grew its
         own matrix would report `head_fwd` and never `tied_head`, which is the defect
-        class `dormouse_core.counters` exists for.
+        class `dormouse_core.counters` exists for. The `1/√d_model` keeps the logit
+        std at 1 for a unit-RMS `x`: the rows are `N(0, 1)` because the embedding
+        reads them, but as the tied head's WRITE they would otherwise give every
+        logit a variance of `d_model`.
         """
         if counters is not None:
             counters.count("head_fwd", x.shape[0] * x.shape[1])
             counters.count("tied_head")
-        return nn.functional.linear(x, self.embed.weight)
+        return nn.functional.linear(x, self.embed.weight) / math.sqrt(self.d_model)
 
     def _enable(self, counters: Counters) -> None:
         """Declare the mechanisms this stack runs, so silence becomes an error.
