@@ -62,6 +62,9 @@ ignore = ["D203", "D213", "N818"]
 # `kda.py`'s docstring is the chunk algebra of eq. 2-9: `α`, `β`, `Γ`, `Σ`, `⊙` and `ᵀ`
 # there are the paper's notation, which is the point of writing the derivation down.
 "src/dormouse/model/attn_variants/kda.py" = ["RUF002", "RUF003"]
+# The anchors print the papers' own equations; `α`, `β`, `σ`, `∪` there are notation,
+# not ambiguous ASCII that should be rewritten.
+"src/dormouse/verify/*" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"

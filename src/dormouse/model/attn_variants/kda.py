@@ -61,6 +61,10 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from dormouse.verify import register as register_contract
+from dormouse.verify import require as require_contract
+from dormouse.verify.contracts import KDA_CONTRACT
+
 from ..blocks import PROJ_STD
 from .projections import LatentProjections
 
@@ -79,6 +83,9 @@ A_BIAS_INIT = -4.0
 #: (measured at b8 x s1024: 81.1 ms per layer recomputing, 53.6 ms retaining). Turn it on
 #: for a card that cannot spare those 0.4 GiB.
 CHECKPOINT_CHUNKS = False
+
+#: The counter, degeneration, external anchor and invariants travel with the class.
+register_contract(KDA_CONTRACT)
 
 
 class KDA(LatentProjections):
@@ -113,6 +120,7 @@ class KDA(LatentProjections):
         only so that the degeneracy is refusable: both `False` values raise here,
         because neither is a configuration of KDA.
         """
+        require_contract("kda")  # no proof, no allocation
         super().__init__(
             d_model,
             n_heads,

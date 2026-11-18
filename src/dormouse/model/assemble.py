@@ -39,6 +39,8 @@ from ..train import compiled
 from ..train.graph import StepGraph
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
+from ..verify import require as require_contract
+from ..verify.contracts import active_names
 from . import quant, registry
 from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
@@ -189,6 +191,7 @@ def assemble(
 ) -> Assembled:
     """Build the stack `spec` names, refusing a contradiction before allocating it."""
     pieces = registry.pieces(spec)
+    require_contract(*active_names(spec.pattern, spec.expert_tsct_rank))
     write_std = PROJ_STD / (2.0 * spec.n_layers) ** 0.5
     bank = _bank(spec, write_std, device, smoke)
     blocks = [

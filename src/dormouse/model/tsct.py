@@ -46,6 +46,13 @@ import torch
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from dormouse.verify import register as register_contract
+from dormouse.verify import require as require_contract
+from dormouse.verify.contracts import TSCT_CONTRACT
+
+#: The counter, degeneration, external anchor and invariants travel with the class.
+register_contract(TSCT_CONTRACT)
+
 #: The rank the one architecture's experts are factorised at.
 TSCT_RANK = 256
 
@@ -79,6 +86,7 @@ class FactorLinear(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         """Validate the rank and draw both factors at `√std·r^{-1/4}`."""
+        require_contract("tsct")  # no proof, no allocation
         super().__init__()
         short = min(in_features, out_features)
         if rank < 1:
