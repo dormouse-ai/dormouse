@@ -18,6 +18,9 @@ This file is only about the block that reads and writes the stream.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import numpy as np
 import pytest
 import torch
 from dormouse_core.errors import LoudError
@@ -119,3 +122,120 @@ def test_the_latent_matrices_are_the_only_thing_the_compression_adds() -> None:
     latent = {n for n, _ in KDA(D, H, HD, chunk=8, n_kv_heads=1, c_lat=8).named_parameters()}
     assert dense - latent == {"qkv.weight"}
     assert latent - dense == {"q_lat.weight", "q_up.weight", "kv_lat.weight", "kv_up.weight"}
+
+
+# --- numerical anchor: the explicit GQA group map -----------------------------
+
+
+#: Two groupings, so `h // groups` is pinned for more than one group size.
+GQA_CASES = ((4, 2), (6, 2))
+#: The map written out by hand, not recomputed from the formula under test.
+GQA_MAPS = {4: [0, 0, 1, 1], 6: [0, 0, 0, 1, 1, 1]}
+
+
+def _final_state(
+    q: np.ndarray,
+    k: np.ndarray,
+    v: np.ndarray,
+    alpha: np.ndarray,
+    beta: np.ndarray,
+) -> np.ndarray:
+    """Final state of Kimi eq. 1 for one head's hand-set sequence, in numpy fp64."""
+    width = q.shape[1]
+    state = np.zeros((width, width), dtype=np.float64)
+    for t in range(q.shape[0]):
+        state = state * alpha[t][:, None]
+        state = (np.eye(width) - beta[t] * np.outer(k[t], k[t])) @ state
+        state = state + beta[t] * np.outer(k[t], v[t])
+    return state
+
+
+def _fake_project(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor
+) -> Callable[[torch.Tensor], tuple[torch.Tensor, ...]]:
+    """Return a `_project` that emits the hand-set tensors regardless of `x`."""
+
+    def project(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return q, k, v, alpha, beta
+
+    return project
+
+
+def _capturing_chunkwise(
+    real: Callable[..., tuple[torch.Tensor, torch.Tensor]], captured: dict[str, torch.Tensor]
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """Wrap a chunk kernel so the broadcast k/v it receives are recorded."""
+
+    def capture(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        captured["k"], captured["v"] = k.detach(), v.detach()
+        return real(q, k, v, alpha, beta)
+
+    return capture
+
+
+def anchor_gqa_group_map() -> dict[str, int]:
+    """Query head `h` reads key/value head `h // (n_heads // n_kv_heads)`.
+
+    The key/value tensors are hand-set so every kv head is distinct; the broadcast
+    is captured where `run` hands it to the kernel, and each query head's final
+    state is recomputed in numpy from the kv head the explicit map names. A
+    different grouping (or a `h % groups` map) swaps heads and fails both checks.
+    """
+    for n_heads, n_kv_heads in GQA_CASES:
+        groups = n_heads // n_kv_heads
+        kv_for_query = [h // groups for h in range(n_heads)]
+        assert kv_for_query == GQA_MAPS[n_heads], kv_for_query
+
+        q = np.stack(
+            [
+                np.array([[0.5 + 0.1 * h, -0.2 + 0.03 * h], [0.9 - 0.05 * h, 0.4 + 0.02 * h]])
+                for h in range(n_heads)
+            ]
+        )
+        k = np.stack(
+            [
+                np.array([[0.4 + 0.2 * j, 0.8 - 0.1 * j], [-0.6 + 0.1 * j, 0.5 + 0.15 * j]])
+                for j in range(n_kv_heads)
+            ]
+        )
+        v = np.stack(
+            [
+                np.array([[1.0 + 0.5 * j, 0.5 - 0.2 * j], [-0.5 + 0.3 * j, 2.0 - 0.4 * j]])
+                for j in range(n_kv_heads)
+            ]
+        )
+        alpha = np.full((n_heads, 2, 2), 0.8)
+        beta = np.full((n_heads, 2), 0.6)
+
+        # `_project`'s contract: q/k/v/alpha [b, s, heads, d], beta [b, s, heads].
+        proj_q = torch.tensor(q.transpose(1, 0, 2)[None], dtype=torch.float64)
+        proj_k = torch.tensor(k.transpose(1, 0, 2)[None], dtype=torch.float64)
+        proj_v = torch.tensor(v.transpose(1, 0, 2)[None], dtype=torch.float64)
+        proj_alpha = torch.tensor(alpha.transpose(1, 0, 2)[None], dtype=torch.float64)
+        proj_beta = torch.tensor(beta.T[None], dtype=torch.float64)
+
+        layer = KDA(8, n_heads, 2, chunk=2, n_kv_heads=n_kv_heads, c_lat=8).double()
+
+        captured: dict[str, torch.Tensor] = {}
+        layer._project = _fake_project(  # type: ignore[method-assign]
+            proj_q, proj_k, proj_v, proj_alpha, proj_beta
+        )
+        layer._chunkwise = _capturing_chunkwise(layer._chunkwise, captured)  # type: ignore[method-assign]
+        _, state = layer.run(torch.zeros(1, 2, 8, dtype=torch.float64))
+
+        assert captured["k"].shape == (1, n_heads, 2, 2)
+        for h in range(n_heads):
+            source = kv_for_query[h]
+            assert torch.equal(captured["k"][0, h], proj_k[0, :, source]), (n_heads, h)
+            assert torch.equal(captured["v"][0, h], proj_v[0, :, source]), (n_heads, h)
+            want = _final_state(q[h], k[source], v[source], alpha[h], beta[h])
+            got = state[0, h].detach().numpy()
+            assert np.abs(got - want).max() < 1e-12, (n_heads, h, np.abs(got - want).max())
+    return {"cases": len(GQA_CASES)}
+
+
+def test_gqa_group_map_matches_an_explicit_h_over_groups() -> None:
+    """The broadcast query heads must read, by hand, their `h // groups` kv head."""
+    anchor_gqa_group_map()

@@ -239,3 +239,97 @@ def test_an_impossible_routing_is_refused_with_an_escape() -> None:
         Router(8, 2, 3)
     assert "Escape:" in str(raised.value)
     assert "n_experts=4" in repr(Router(8, 4, 2))
+
+
+# --- numerical anchors: sqrt-softplus and quantile balancing in numpy ---------
+
+
+#: E in {2, 8, 16} x topk in {1, 2}, the grid the gate runs on CPU.
+ROUTER_CASES = tuple((e, k) for e in (2, 8, 16) for k in (1, 2))
+
+
+def _hand_logits(n_experts: int) -> np.ndarray:
+    """A seeded logit bank whose columns have different spreads and shifts.
+
+    Different column shapes matter: with identical columns the QB quantile level
+    has no observable effect, so a change to `topk / E` would pass. Here it moves
+    the bias by far more than the arithmetic tolerance.
+    """
+    generator = np.random.default_rng(1000 + n_experts)
+    scale = np.linspace(0.4, 2.2, n_experts)
+    shift = np.linspace(1.5, -1.5, n_experts)
+    return generator.standard_normal((4096, n_experts)) * scale + shift
+
+
+def _numpy_qb_bias(logits: np.ndarray, topk: int, bins: int = 256) -> np.ndarray:
+    """Quantile Balancing from the published rule, in numpy, from the logits alone.
+
+    `q_i = quantile(logits[:, i], 1 - topk/E)` located by the same `bins`-wide
+    histogram the router declares, then `b_i = mean(q) - q_i`. The sign and the
+    level are the two things this pins; the histogram only sets the resolution.
+    """
+    n, e = logits.shape
+    quantile_samples = []
+    for expert in range(e):
+        column = logits[:, expert]
+        lo = float(column.min())
+        span = max(float(column.max()) - lo, 1e-12)
+        idx = np.clip(((column - lo) * (bins / span)).astype(np.int64), 0, bins - 1)
+        cdf = np.cumsum(np.bincount(idx, minlength=bins))
+        j = min(max(int((cdf < n * (1.0 - topk / e)).sum()), 0), bins - 1)
+        quantile_samples.append(lo + (j + 1) * span / bins)
+    q = np.asarray(quantile_samples, dtype=np.float64)
+    return q.mean() - q
+
+
+def anchor_router_score(n_experts: int = 8) -> dict[str, float]:
+    """`sqrt(softplus(z))` from numpy, not softmax or a bare softplus.
+
+    The hand-set row includes logits where the root and the exp each move the
+    number by a lot, so a silent substitution cannot hide in the tolerance.
+    """
+    logits = np.linspace(-4.0, 4.0, n_experts) + np.arange(n_experts) * 0.13
+    want = np.sqrt(np.log1p(np.exp(logits)))
+    # A visible number: sqrt(softplus(0)) = sqrt(ln 2).
+    zero = torch.tensor([0.0], dtype=torch.float64)
+    assert float(Router(4, n_experts, 1).scores(zero)[0]) == pytest.approx(0.8325546, abs=1e-7)
+
+    router = Router(4, n_experts, 1)
+    got = router.scores(torch.tensor(logits, dtype=torch.float64)).detach().numpy()
+    err = float(np.abs(got - want).max())
+    assert err < 1e-12, f"score drifted from sqrt(softplus) by {err:.3e}"
+    bare = np.log1p(np.exp(logits))
+    assert float(np.abs(got - bare).max()) > 0.1, "the fixture cannot see a missing root"
+    return {"n_experts": n_experts, "err": err}
+
+
+def anchor_router_qb(n_experts: int, topk: int) -> dict[str, float]:
+    """The QB bias must equal numpy's `mean(q) - q` at level `1 - topk/E`.
+
+    Parametrised over E in {2, 8, 16} and topk in {1, 2}. A wrong quantile level,
+    a flipped sign or a switch to score-space bias all move the number far beyond
+    the float32 round-off this comparison allows.
+    """
+    logits = _hand_logits(n_experts)
+    want = _numpy_qb_bias(logits, topk)
+    other = 2 if topk == 1 else 1
+    wrong_level = _numpy_qb_bias(logits, other)
+    assert float(np.abs(want - wrong_level).max()) > 0.1, "fixture cannot see the level"
+
+    router = Router(4, n_experts, topk)
+    router.qb_update(torch.tensor(logits, dtype=torch.float32))
+    got = router.bias.detach().numpy()
+    err = float(np.abs(got - want).max())
+    assert err < 1e-5, f"E={n_experts} topk={topk}: QB bias drifted by {err:.3e}"
+    assert float(np.abs(got + want).max()) > 0.1, "the sign of mean(q) - q moved"
+    return {"E": n_experts, "topk": topk, "err": err, "spread": float(want.max() - want.min())}
+
+
+@pytest.mark.parametrize("n_experts", [2, 8, 16])
+def test_router_score_matches_an_independent_numpy_anchor(n_experts: int) -> None:
+    anchor_router_score(n_experts)
+
+
+@pytest.mark.parametrize("n_experts,topk", ROUTER_CASES)
+def test_router_qb_matches_an_independent_numpy_anchor(n_experts: int, topk: int) -> None:
+    anchor_router_qb(n_experts, topk)
