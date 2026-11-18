@@ -34,7 +34,36 @@ BPT = 4.718
 
 def test_known_token_rate_gives_the_expected_source_bytes() -> None:
     """1,000 tok/s at BPT 4.718 is exactly 4,718 B/s of source text."""
+    assert bench.SOURCE_BYTES_PER_TOKEN == BPT
     assert bench.bytes_per_s(1_000.0, BPT) == 4_718.0
+    assert bench.bytes_per_s(1_000.0) == 4_718.0  # the default really is the manifest BPT
+
+
+def test_a_failed_compile_is_never_printed_as_a_compiled_speed() -> None:
+    """The label, not the caller's intent, names the mode; a failed compile is eager."""
+    assert bench.speed_label(compiled_measured=True) == "compiled"
+    for reason in ("compile+graph buffers OOM at b24", "inductor timeout", "0 graphs"):
+        assert bench.speed_label(compiled_measured=False, compile_reason=reason) == "eager"
+        # Even a caller that wrongly claims a graph must not print a failed compile as
+        # compiled: the reason is authoritative.
+        assert bench.speed_label(compiled_measured=True, compile_reason=reason) == "eager"
+
+    measured = {
+        "median_ms": 12.5,
+        "measure_steps": 30,
+        "repetitions": 3,
+        "tokens_per_s": 100.0,
+        "bytes_per_s": 471.8,
+    }
+    assert bench.speed_line("eager", measured).startswith("eager median 12.5 ms/step")
+    assert "compiled" not in bench.speed_line("eager", measured)
+    assert bench.speed_line("compiled", measured).startswith("compiled median 12.5 ms/step")
+    assert bench.compile_refusal_line("out of memory").startswith("compiled not measured:")
+    assert bench.compile_refusal_line("no compile attempted", skipped=True).startswith(
+        "compiled skipped by --eager-only:"
+    )
+    with pytest.raises(LoudError, match="unknown speed label"):
+        bench.speed_line("maybe", measured)
 
 
 def test_old_engine_conversion_matches_its_published_byte_rate() -> None:
