@@ -71,11 +71,11 @@ def ternarize(model: nn.Module) -> int:
 class QuantBlock(nn.Module):
     """A block with the quantizations applied where they belong, and counted.
 
-    `matrices` is how many ternary matrices this block's forward reads (shared bank
-    matrices are read by every block, so each block reports its own read), and
-    `act_int4` quantizes the activations entering it. Both counters are the proof the
-    plan's bits are real: an enabled quantization that never ran raises
-    `MissingReport`, which is the defect this file exists to make impossible.
+    `act_int4` quantizes the activations entering it, and the ternary counter is
+    read from the LIVE module tree at forward time — not from the `matrices`
+    snapshot taken at build. An undone swap then reports zero and an enabled
+    quantization that never ran raises `MissingReport`, which is the defect this
+    file exists to make impossible.
     """
 
     def __init__(self, inner: nn.Module, *, matrices: int = 0, act_int4: bool = False) -> None:
@@ -91,6 +91,10 @@ class QuantBlock(nn.Module):
             x = int4(x)
             if counters is not None:
                 counters.count("act_int4", x.shape[0] * x.shape[1])
-        if counters is not None and self.matrices:
-            counters.count("weight_ternary", self.matrices)
+        if counters is not None:
+            #: Live use, not the build-time claim: a swap that never happened (or was
+            #: undone) must leave the counter at zero so `check()` can refuse it.
+            live = sum(type(m) is QuantLinear for m in self.inner.modules())
+            if live:
+                counters.count("weight_ternary", live)
         return cast(torch.Tensor, self.inner(x, counters))

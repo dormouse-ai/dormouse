@@ -358,6 +358,7 @@ class _Glu(nn.Module):
         y = self._rows(x)
         if counters is not None:
             self._count(x, counters)
+            self.watch_dictionary(counters)
         return y
 
     def _rows(self, x: torch.Tensor) -> torch.Tensor:
@@ -432,6 +433,34 @@ class _Glu(nn.Module):
         counters.count("ffn_fwd", rows)
         if self._factorised:
             counters.count("tsct_fwd", rows * self._factorised)
+
+    def watch_dictionary(self, counters: Counters) -> None:
+        """Declare the live-entry gate at backward, when gradients finally exist.
+
+        The stack's own `check()` runs inside forward, before any gradient, so a
+        gate that needs one cannot be enabled there. This mirrors the step's clip
+        counter: declared late, counted from the real thing, and a zero is a
+        MissingReport at the step's final `check()`. An entry whose coefficient
+        receives no gradient can never move; counting it as used is the silence
+        this gate exists to refuse.
+        """
+        coef = getattr(self, "coef", None)
+        if coef is None or not self.training or not torch.is_grad_enabled():
+            return
+        handle: torch.utils.hooks.RemovableHandle | None = None
+
+        def on_grad(grad: torch.Tensor) -> None:
+            assert handle is not None
+            handle.remove()
+            counters.enable(
+                "ffn_dictionary_live",
+                counter="ffn_dict_entries_live",
+                why="an enabled dictionary entry must receive gradient",
+            )
+            live = [k for k in _enabled(coef) if float(grad[k]) != 0.0]
+            counters.count("ffn_dict_entries_live", len(live))
+
+        handle = coef.register_hook(on_grad)
 
     @staticmethod
     def _read(matrix: nn.Linear | FactorLinear, x: torch.Tensor) -> torch.Tensor:
