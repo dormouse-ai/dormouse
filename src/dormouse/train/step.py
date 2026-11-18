@@ -42,7 +42,9 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Protocol, cast
 
 import torch
 from dormouse_core.counters import Counters
@@ -50,6 +52,8 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.nn import functional
 
+from .aux import LightMTP
+from .jepa import JepaAux, er_jepa_loss
 from .optim import MixOptimizer
 
 __all__ = [
@@ -104,6 +108,10 @@ class StepResult:
     skipped: bool
     loss_device: torch.Tensor | None = None
     norm_device: torch.Tensor | None = None
+    #: The auxiliary terms, reported separately from `loss`: two runs must not disagree
+    #: for a reason hidden inside the token loss.
+    aux_loss: float | None = None
+    jepa_loss: float = 0.0
 
 
 def chunked_cross_entropy(
@@ -146,6 +154,64 @@ def _skip(
     return StepResult(loss=loss, grad_norm=grad_norm, skipped=True)
 
 
+class _Encoder(Protocol):
+    """The encoder half the paired JEPA term reads; the stack provides it."""
+
+    def encode(
+        self, ids: torch.Tensor, counters: Counters | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def hidden(self, ids: torch.Tensor, counters: Counters | None = None) -> torch.Tensor: ...
+
+    def head(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor: ...
+
+
+def _replay(
+    model: nn.Module,
+    jepa: JepaAux,
+    step: int,
+    rows: int,
+    counters: Counters | None,
+) -> float:
+    """Return the replayed half of ER-JEPA's eq. (4), from one packed forward.
+
+    The store holds whole pairs, not micro-batches of the current batch, so the term is
+    added whole after the micro-batch loop. Only its value is returned; the backward
+    runs here, and a non-finite value leaves the caller to skip the step.
+    """
+    budget = jepa.replay_rows(rows)
+    if budget < 1:
+        return 0.0
+    view_a, view_b = jepa.memory.retrieve(budget, step=step)
+    x = view_b[:, :-1]
+    if counters is not None:
+        counters.enable("fwd", counter="fwd", why="a forward runs in the step")
+        counters.count("fwd", x.numel())
+        counters.enable("jepa_replay_rows", counter="jepa_replay_rows", why="rows were replayed")
+        counters.count("jepa_replay_rows", budget)
+    encoder = cast(_Encoder, model)
+    # The two views are encoded in separate passes: the live stack's KDA requires a
+    # sequence that tiles its 64-token chunk, and a packed view is an odd length.
+    h_a, _logits_a = encoder.encode(view_a[:, :-1], counters)
+    h_b, logits_b = encoder.encode(view_b[:, :-1], counters)
+    token = chunked_cross_entropy(logits_b, view_b[:, 1:])
+    replay = er_jepa_loss(
+        None,
+        (h_a, h_b),
+        jepa.head,
+        lam=jepa.lam,
+        beta=jepa.replay_weight,
+        token_replay=token,
+    )
+    if counters is not None:
+        counters.enable("bwd", counter="bwd", why="the backward runs in the step")
+        counters.count("bwd", x.numel())
+    value = float(replay.detach())
+    if math.isfinite(value):
+        replay.backward()  # type: ignore[no-untyped-call]
+    return value
+
+
 def commit_step(
     model: nn.Module,
     optimizer: MixOptimizer,
@@ -155,6 +221,7 @@ def commit_step(
     clip: float = CLIP,
     pre_step: PreStep | None = None,
     read: bool = True,
+    bounded: list[nn.Parameter] | None = None,
 ) -> StepResult:
     """Run the device firewall, the clip and the step for eager and replayed steps.
 
@@ -166,7 +233,9 @@ def commit_step(
     """
     if counters is not None:
         counters.enable("clip", counter="clip", why="the gradient norm is bounded")
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    norm = torch.nn.utils.clip_grad_norm_(
+        list(model.parameters()) if bounded is None else bounded, clip
+    )
     if counters is not None:
         counters.count("clip")
     finite = torch.isfinite(loss.detach()).all() & torch.isfinite(norm)
@@ -222,6 +291,10 @@ def train_step(
     counters: Counters | None = None,
     pre_step: PreStep | None = None,
     read: bool = True,
+    aux: LightMTP | None = None,
+    jepa: JepaAux | None = None,
+    pair: torch.Tensor | None = None,
+    step: int = 0,
 ) -> StepResult:
     """One optimizer step over `ids [accum·batch, seq+1]`, as the docstring orders it.
 
@@ -255,10 +328,52 @@ def train_step(
             f"clip={clip} scales every gradient to zero",
             "use the ceiling in loss units (1.0 for this recipe) or math.inf for none",
         )
+    if aux is not None and getattr(model, "aux", None) is not aux:
+        raise LoudError(
+            "the auxiliary head is not attached to this model, so no optimizer owns it",
+            "call aux.attach(model) before MixOptimizer(model): an unattached head is "
+            "routed to no parameter group and never trains",
+        )
+    if (jepa is None) != (pair is None):
+        raise LoudError(
+            "the JEPA term and its paired batch come together",
+            "pass jepa=JepaAux(...) with pair=view_b, or neither",
+        )
+    width = 0
+    if pair is not None:
+        width = pair.shape[1]
+        if pair.shape[0] != ids.shape[0] or ids.shape[1] != 2 * width:
+            raise LoudError(
+                f"ids {tuple(ids.shape)} is not [view A | view B] for view B {tuple(pair.shape)}",
+                "pack the pair as cat([view_a, view_b], dim=1): both rows the same width",
+            )
+        if width < 2:
+            raise LoudError(
+                f"a view of {width} token(s) leaves no view-B position after the shift",
+                "give the pair at least two tokens per view",
+            )
+    keep = jepa is not None and jepa.keep()
+    if jepa is not None and counters is not None:
+        counters.enable("jepa", counter="jepa_seen", why="the ER-JEPA term is on for this run")
+        counters.count("jepa_seen")
+        if keep:
+            counters.enable("jepa_fwd", counter="jepa_fwd", why="the term computed this step")
+            counters.count("jepa_fwd")
+        else:
+            counters.enable("jepa_skipped", counter="jepa_skipped", why="loss dropout fired")
+            counters.count("jepa_skipped")
+    if jepa is not None and pair is not None:
+        # Stored on skipped steps too: the store a later step replays must not depend
+        # on this step's dropout coin.
+        jepa.memory.insert(ids[:, :width], ids[:, width:])
+    if jepa is not None:
+        jepa.head.zero_grad(set_to_none=True)
     inputs, targets = ids[:, :-1], ids[:, 1:]
     rows = ids.shape[0] // accum
     optimizer.zero_grad(set_to_none=True)
     loss_total = torch.zeros((), dtype=torch.float32, device=ids.device)
+    aux_total = 0.0
+    jepa_total = 0.0
     for micro in range(accum):
         x = inputs[micro * rows : (micro + 1) * rows]
         y = targets[micro * rows : (micro + 1) * rows]
@@ -267,21 +382,90 @@ def train_step(
             # `forward`, so a counter this module owns must already be non-zero there.
             counters.enable("fwd", counter="fwd", why="a forward runs in the step")
             counters.count("fwd", x.numel())
-        logits = model(x, counters)
-        loss = chunked_cross_entropy(logits, y)
-        # The reported sum keeps the raw value (a NaN step reports NaN). The backward
-        # seed is masked: on a finite step `where(True, loss, 0)` is bit-identical to
-        # `loss`, on a bad one the seed is exactly zero and no gradient is injected.
+        seen: dict[int, torch.Tensor] = {}
+        h: torch.Tensor | None = None
+        # One context for both mechanisms: the hooks exist only while the aux head is
+        # on, and they are removed in `finally` whatever the encoder does.
+        captures = aux.capture(model) if aux is not None else nullcontext({})
+        with captures as captured:
+            if jepa is not None and pair is not None:
+                # Two passes over one encoder: view A is the source, view B the target.
+                # The stack's chunked attention cannot take the two views packed into
+                # one odd-length window; the objective, its stop-gradient and the replay
+                # are unchanged. The token loss still reads view B only.
+                view_a, view_b = ids[:, :width], ids[:, width:]
+                h_a, _ = cast(_Encoder, model).encode(view_a[:, :-1], counters)
+                h_b, logits = cast(_Encoder, model).encode(view_b[:, :-1], counters)
+                h = torch.cat([h_a, h_b], dim=0)
+            else:
+                logits = model(x, counters)
+            seen = captured
+        if jepa is not None and pair is not None:
+            # eq. (3)'s token term stays on view B; dropping the alignment never drops
+            # it, and a skipped step pays only this one forward's extra view.
+            loss = chunked_cross_entropy(logits, y[:, width:])
+        else:
+            loss = chunked_cross_entropy(logits, y)
+        total = loss
+        if aux is not None:
+            extra = aux.loss(seen)
+            if not torch.isfinite(extra).all():
+                optimizer.zero_grad(set_to_none=True)
+                return _skip(counters, float(extra.detach()), "the aux loss is not finite")
+            total = total + aux.weight * extra
+            aux_total += float(extra.detach()) / accum
+            if counters is not None:
+                # Enabled after the forward: the stack checks its own counters inside
+                # it, so a counter the step owns must not be declared before it returns.
+                counters.enable("aux_head", counter="aux_fwd", why="the head predicts a state")
+                counters.enable("aux", counter="aux_loss", why="the aux loss is added in")
+                counters.count("aux_fwd", x.shape[0] * (x.shape[1] - aux.k))
+                counters.count("aux_loss")
+            _LOG.info(
+                "aux lightmtp loss=%.6f weighted=%.6f k=%d layer=%d",
+                float(extra.detach()),
+                float(extra.detach()) * aux.weight,
+                aux.k,
+                aux.layer,
+            )
+        if keep and jepa is not None and h is not None:
+            term = er_jepa_loss(
+                (h[: h.shape[0] // 2], h[h.shape[0] // 2 :]),
+                None,
+                jepa.head,
+                lam=jepa.lam,
+            )
+            if not torch.isfinite(term).all():
+                optimizer.zero_grad(set_to_none=True)
+                return _skip(counters, float(term.detach()), "the JEPA term is not finite")
+            total = total + term
+            jepa_total += float(term.detach()) / accum
+        # The reported sum keeps the raw NTP value (a NaN step reports NaN). The
+        # backward seed is masked: on a finite step `where(True, total, 0)` is
+        # bit-identical to `total`; on a bad one no gradient is injected at all.
         loss_total = loss_total + loss.detach() / accum
-        finite = torch.isfinite(loss.detach()).all()
-        seed = torch.where(finite, loss, torch.zeros_like(loss))
+        finite = torch.isfinite(total.detach()).all()
+        seed = torch.where(finite, total, torch.zeros_like(total))
         if counters is not None:
             counters.enable("bwd", counter="bwd", why="the backward runs in the step")
         # torch's stub for `Tensor.backward` is unannotated, and this is the call.
         (seed / accum).backward()  # type: ignore[no-untyped-call]
         if counters is not None:
             counters.count("bwd", x.numel())
-    return commit_step(
+    if keep and jepa is not None:
+        replayed = _replay(model, jepa, step=step, rows=rows * accum, counters=counters)
+        if not math.isfinite(replayed):
+            optimizer.zero_grad(set_to_none=True)
+            return _skip(counters, replayed, "the replayed term is not finite")
+        jepa_total += replayed
+    if jepa is not None and counters is not None:
+        counters.enable("jepa_memory_size", counter="jepa_memory_size", why="the store has a size")
+        counters.count("jepa_memory_size", jepa.memory.size)
+    bounded = list(model.parameters())
+    if jepa is not None:
+        attached = {id(p) for p in bounded}
+        bounded.extend(p for p in jepa.head.parameters() if id(p) not in attached)
+    result = commit_step(
         model,
         optimizer,
         loss_total,
@@ -289,4 +473,16 @@ def train_step(
         clip=clip,
         pre_step=pre_step,
         read=read,
+        bounded=bounded,
+    )
+    if aux is None and jepa is None:
+        return result
+    return StepResult(
+        loss=result.loss,
+        grad_norm=result.grad_norm,
+        skipped=result.skipped,
+        loss_device=result.loss_device,
+        norm_device=result.norm_device,
+        aux_loss=aux_total if aux is not None else None,
+        jepa_loss=jepa_total,
     )
