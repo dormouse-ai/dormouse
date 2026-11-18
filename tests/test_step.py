@@ -40,15 +40,22 @@ def _build(vocab: int = 16) -> tuple[torch.nn.Module, MixOptimizer, torch.Tensor
 def test_twenty_steps_reduce_the_loss_monotonically_on_one_batch() -> None:
     """A step that is wired right overfits three sequences in twenty steps.
 
-    Measured curve (loss after each step): 29.42, 29.09, 28.70, 28.20, 27.53, 26.64,
-    25.45, 23.90, 21.90, 19.44, 16.66, 13.93, 11.30, 8.85, 6.58, 4.78, 3.54, 2.69,
-    2.16, 1.92. Strictly descending — from 29.42 to 1.92, a factor of 15 — which is
-    what a step whose sign, scale and routing are all right does to three sequences.
+    Measured curve (loss after each step): 4.85, 4.79, 4.73, 4.64, 4.53, 4.38, 4.19,
+    3.95, 3.65, 3.31, 2.95, 2.61, 2.32, 2.09, 1.92, 1.81, 1.73, 1.68, 1.63, 1.58.
+    Strictly descending — 4.85 to 1.58 — which is what a step whose sign, scale and
+    routing are all right does to three sequences.
+
+    Recalibrated 2026-11-16 after the tied-head 1/sqrt(d_model) scale (PR #74): the
+    old curve started at 29.42 (unscaled logits) and ended at 1.92, a factor of 15.
+    Scaling the head cuts the START to 4.85 while the overfit floor is unchanged (~1.6),
+    so the ratio is necessarily smaller (0.325, was 0.065) — the same descent, measured
+    from a correct init level. The 0.4 bar still fails a step that does not learn
+    (ratio ~1) or descends too slowly; it has ~23% headroom over the measured ratio.
     """
     model, optimizer, ids = _build()
     losses = [train_step(model, ids, optimizer=optimizer).loss for _ in range(20)]
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
-    assert losses[-1] < losses[0] / 5, losses
+    assert losses[-1] < losses[0] * 0.4, losses
 
 
 # --------------------------------------------------------------------- the gradient

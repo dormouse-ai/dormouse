@@ -9,6 +9,7 @@ a cadence. What a *run* needs beyond the stack is six things, and they live here
     eval = "path.bin"      the held-out stream BPB and the harness are measured on
     schedule = "cosine"    cosine | wsd | sf, routed by train/optim.py
     lr_muon, lr_adamw      the arms' peak rates, or the mode's own default
+    lr_router              optional router rate; default lr_muon / sqrt(d_model)
     warmup, eval_every, ckpt_every, eval_batches, harness, seed
 
 Steps are `tokens // (batch x seq_len)` — the number `dorm plan` already prints — rather
@@ -51,6 +52,7 @@ RUN_KEYS = frozenset(
         "schedule",
         "lr_muon",
         "lr_adamw",
+        "lr_router",
         "warmup",
         "eval_every",
         "ckpt_every",
@@ -106,6 +108,7 @@ class RunRecipe:
     schedule: str
     lr_muon: float | None
     lr_adamw: float | None
+    lr_router: float | None
     warmup: int | None
     eval_every: int
     ckpt_every: int
@@ -165,6 +168,7 @@ class RunRecipe:
             schedule=str(raw.get("schedule", "cosine")),
             lr_muon=_rate(raw, "lr_muon"),
             lr_adamw=_rate(raw, "lr_adamw"),
+            lr_router=_rate(raw, "lr_router"),
             warmup=_count(raw, "warmup"),
             eval_every=_count(raw, "eval_every", 0),
             ckpt_every=_count(raw, "ckpt_every", 0),
@@ -190,6 +194,7 @@ class RunRecipe:
             schedule=str(run["schedule"]),
             lr_muon=run["lr_muon"],
             lr_adamw=run["lr_adamw"],
+            lr_router=run.get("lr_router"),
             warmup=run["warmup"],
             eval_every=int(run["eval_every"]),
             ckpt_every=int(run["ckpt_every"]),
@@ -257,6 +262,7 @@ class RunRecipe:
                 "schedule": self.schedule,
                 "lr_muon": self.lr_muon,
                 "lr_adamw": self.lr_adamw,
+                "lr_router": self.lr_router,
                 "warmup": self.warmup,
                 "eval_every": self.eval_every,
                 "ckpt_every": self.ckpt_every,
