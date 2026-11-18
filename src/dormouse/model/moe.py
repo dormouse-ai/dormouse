@@ -84,9 +84,10 @@ COUNTERS (a zero must be a measurement, not a default):
 * `moe_static_passes` — slots the static grid executed: `MAX_DISPATCH_PASSES` on the
   fused path, or the forced `fixed_passes` on the anchor; zero on the data-dependent
   path, where this counter is not enabled;
-* `moe_dropped` - `routed - executed`, counted even when 0 so a run that never
-  drops proves it measured (the key is in `snapshot()`; `Counters.line()` prints
-  non-zero values only, so a zero is read from the snapshot, not from the log);
+* `moe_dropped` - `routed - executed` from the pass plan, zero when dropless;
+  `moe_drop_checks` is the proof the balance was MEASURED (a zero value is a
+  measurement, not silence — `Counters.line()` prints non-zero values only, so
+  read the zero from `snapshot()`);
 * `moe_capacity` — rows per expert slot this forward sized, from the formula above;
 * `moe_pad_rows` — the padded total `passes · E·capacity`, i.e. what the slabs executed
   against `moe_rows_run` (the ratio is itself the padding's report);
@@ -503,12 +504,23 @@ class MoEFFN(nn.Module):
             counters.count("moe_capacity", capacity)
             counters.count("moe_pad_rows", passes * pad)
             counters.count("moe_dispatch_passes", passes)
-            counters.count("moe_dropped", 0)
+            #: The slots the pass plan covers are the rows it can execute. A dropless
+            #: bank sizes them to cover every assignment, so the measured drop is zero —
+            #: computed, not written as a literal. `moe_drop_checks` is the proof the
+            #: measurement ran; a silent zero is a MissingReport at step end.
+            slots = passes * self.n_experts * capacity
+            counters.count("moe_dropped", routed - min(routed, slots))
+            counters.count("moe_drop_checks")
             if fused:
                 counters.count("bank_ops", fused_bank.bank_launches() - launches)
             #: The read belongs to the arm, so it reports the rows the DISPATCH read — the
             #: assignments, not their padding (that is `moe_pad_rows`).
             self._arms(0, 1)[0].count_read(routed, counters)
+            #: The batched read never calls an expert's own `forward`, so the dictionary
+            #: gate has to be declared on every expert here: one idle expert's zero
+            #: gradient must not stand in for the bank's live entries.
+            for arm in self._arms(0, self.n_experts):
+                arm.watch_dictionary(counters)
         return y
 
     def _fused_ready(self, x: torch.Tensor) -> bool:
@@ -623,6 +635,11 @@ class MoEFFN(nn.Module):
             "moe_dispatch",
             counter="moe_dispatch_passes",
             why="the dispatch counted its passes",
+        )
+        counters.enable(
+            "moe_dropped",
+            counter="moe_drop_checks",
+            why="the drop balance was measured, even when it is zero",
         )
         if self.fixed_passes is not None or self._fused_ready(x):
             #: The static grid is a mechanism the same way QB is: enabled here, counted in
