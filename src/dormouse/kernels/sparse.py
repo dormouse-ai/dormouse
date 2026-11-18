@@ -277,6 +277,55 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
     return _KERNELS
 
 
+def _sparse_compute(  # pragma: no cover - the launches are the card's
+    q: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    at: torch.Tensor,
+    visible: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, ...]:
+    """Launch the sparse forward, returning the write and the backward's saved tensors.
+
+    The eager autograd Function and the opaque custom op share this one copy of the launch.
+    """
+    built = _require()
+    batch, seq, heads, width = q.shape
+    keep = at.shape[-1]
+    bd = _pow2(width)
+    #: `[b·h, s, d]` planes: the transposes are 8.4 MiB each at the live shape, and the
+    #: kernel reads rows of `d` contiguous — the layout a gather wants.
+    qh = q.transpose(1, 2).contiguous()
+    kh = key.transpose(1, 2).contiguous()
+    vh = value.transpose(1, 2).contiguous()
+    flat = (qh, kh, vh)
+    # `.clone()` is not redundant: dynamo's higher-order-op capture rejects an
+    # intermediate that aliases the Function's input (`RuntimeError: idx ... aliases
+    # an input`), so the index buffer must own its storage.
+    idx = at.to(torch.int32).contiguous().clone()
+    vis = visible.to(torch.uint8).contiguous().clone()
+    out = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
+    ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
+    _count(1)
+    built["fwd"][(batch * heads * seq,)](
+        *flat,
+        idx,
+        vis,
+        out,
+        ml,
+        seq,
+        heads,
+        width,
+        keep,
+        min(BN, _pow2(keep)),
+        bd,
+        float(scale),
+        num_warps=WARPS,
+        num_stages=STAGES,
+    )
+    return out.to(q.dtype), qh, kh, vh, idx, vis, out, ml
+
+
 class _Sparse(torch.autograd.Function):
     """The layer's read, as one program per query, in and out of the index map."""
 
@@ -285,43 +334,10 @@ class _Sparse(torch.autograd.Function):
         ctx, q, key, value, at, visible, scale
     ):
         """Return `o [b, s, h, d]` and keep what the backward recomputes from."""
-        built = _require()
-        batch, seq, heads, width = q.shape
-        keep = at.shape[-1]
-        bd = _pow2(width)
-        #: `[b·h, s, d]` planes: the transposes are 8.4 MiB each at the live shape, and the
-        #: kernel reads rows of `d` contiguous — the layout a gather wants.
-        qh = q.transpose(1, 2).contiguous()
-        kh = key.transpose(1, 2).contiguous()
-        vh = value.transpose(1, 2).contiguous()
-        flat = (qh, kh, vh)
-        # `.clone()` is not redundant: dynamo's higher-order-op capture rejects an
-        # intermediate that aliases the Function's input (`RuntimeError: idx ... aliases
-        # an input`), so the index buffer must own its storage.
-        idx = at.to(torch.int32).contiguous().clone()
-        vis = visible.to(torch.uint8).contiguous().clone()
-        out = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
-        ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
-        _count(1)
-        built["fwd"][(batch * heads * seq,)](
-            *flat,
-            idx,
-            vis,
-            out,
-            ml,
-            seq,
-            heads,
-            width,
-            keep,
-            min(BN, _pow2(keep)),
-            bd,
-            float(scale),
-            num_warps=WARPS,
-            num_stages=STAGES,
-        )
-        ctx.save_for_backward(*flat, idx, vis, out, ml)
-        ctx.meta = (batch, seq, heads, width, keep, float(scale))
-        return out.to(q.dtype)
+        write, qh, kh, vh, idx, vis, out, ml = _sparse_compute(q, key, value, at, visible, scale)
+        ctx.save_for_backward(qh, kh, vh, idx, vis, out, ml)
+        ctx.meta = (q.shape[0], q.shape[1], q.shape[2], q.shape[3], at.shape[-1], float(scale))
+        return write
 
     @staticmethod
     def backward(ctx: Any, grad: torch.Tensor) -> tuple[Any, ...]:  # pragma: no cover
@@ -372,6 +388,70 @@ class _Sparse(torch.autograd.Function):
         return dq_out, dk_out, dv_out, None, None, None
 
 
+#: The opaque boundary dynamo sees: one node per sparse layer instead of a trace through
+#: the Triton launch. The seven saved tensors are extra outputs because a custom op's
+#: `setup_context` cannot read attributes its implementation set under FakeTensor.
+@torch.library.custom_op(
+    "dormouse::sparse_attention",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor key, Tensor value, Tensor at, Tensor visible, float scale) -> "
+        "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)"
+    ),
+)
+def _sparse_op(  # pragma: no cover - the kernels need a card
+    q: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    at: torch.Tensor,
+    visible: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, ...]:
+    """Run sparse attention, returning the write and the backward's saved tensors."""
+    return _sparse_compute(q, key, value, at, visible, scale)
+
+
+@_sparse_op.register_fake
+def _sparse_op_fake(  # pragma: no cover - only dynamo's fake path reaches it
+    q: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    at: torch.Tensor,
+    visible: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, ...]:
+    """Declare the write and the seven saved buffers without touching data."""
+    del scale
+    batch, seq, heads, width = q.shape
+    keep = at.shape[-1]
+    write = q.new_empty((batch, seq, heads, width))
+    plane = q.new_empty((batch, heads, seq, width))
+    idx = q.new_empty((batch, seq, keep), dtype=torch.int32)
+    vis = q.new_empty((batch, seq, keep), dtype=torch.uint8)
+    raw = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
+    ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
+    return write, plane, plane, plane, idx, vis, raw, ml
+
+
+def _sparse_setup(ctx: Any, inputs: tuple[Any, ...], output: tuple[torch.Tensor, ...]) -> None:
+    """Save the operands and the seven intermediates in `_Sparse.backward`'s order."""
+    q, key, value, at, visible, scale = inputs
+    ctx.save_for_backward(
+        output[1], output[2], output[3], output[4], output[5], output[6], output[7]
+    )
+    ctx.meta = (q.shape[0], q.shape[1], q.shape[2], q.shape[3], at.shape[-1], float(scale))
+    del key, value, visible
+
+
+def _sparse_backward(ctx: Any, *grads: torch.Tensor | None) -> tuple[Any, ...]:
+    """Reuse the eager backward; the scale argument has no gradient."""
+    grad = cast("torch.Tensor", grads[0])
+    return (*_Sparse.backward(ctx, grad), None)
+
+
+_sparse_op.register_autograd(_sparse_backward, setup_context=_sparse_setup)
+
+
 def _pow2(n: int) -> int:
     """Return `n` rounded up to a power of two, at least 16 (one warp's tile)."""
     return max(16, 1 << max(0, n - 1).bit_length())
@@ -416,6 +496,5 @@ def attention(
             "this is the kernel entry point; dsa.py picks the anchor instead",
         )
     #: The launch itself: no card, no line, and `dsa.py` chose the anchor above.
-    return cast(
-        "torch.Tensor", _Sparse.apply(q, key, value, at, visible, scale)
-    )  # pragma: no cover
+    out = _sparse_op(q, key, value, at, visible, scale)[0]
+    return cast("torch.Tensor", out)  # pragma: no cover
