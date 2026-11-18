@@ -27,12 +27,15 @@ defect class `dormouse_core.counters` exists for.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
 from ..model.moe import MAX_DISPATCH_PASSES, MoEFFN
+from . import compiled
 from .optim import MixOptimizer
 from .step import (
     CHUNK_TOKENS,
@@ -56,6 +59,25 @@ POOL_FRACTION = 0.08
 #: Warm-up iterations before a capture: every kernel compiled, every lazy buffer grown, so
 #: the graph's private pool is the step's steady state and not a first-call high-water mark.
 WARMUP = 3
+
+#: Break-reason substrings that mean an opaque kernel leaked back into the graph. Counter
+#: side effects and other Python-only seams end regions too, but they are not the kernels.
+_KERNEL_BREAKS = ("bank", "sparse", "attention", "triton", "custom_op")
+
+
+class _CallableGraph:
+    """The CPU stand-in for a CUDA graph: the compiled body, replayed by calling it.
+
+    The captured arithmetic is identical; only the host's way of re-issuing it differs.
+    """
+
+    def __init__(self, body: Any) -> None:
+        """Hold the callable body."""
+        self.body = body
+
+    def replay(self) -> None:
+        """Re-run the compiled body; `capture` binds its loss to the graph's output."""
+        self.body()
 
 
 class StepGraph:
@@ -102,10 +124,56 @@ class StepGraph:
         self._replays = 0
         #: The op a failed capture stopped at, or `None` — the name a report needs.
         self.failed_on: str | None = None
-        self._warm()
-        self._capture()
+        self.capture()
 
     # ------------------------------------------------------------------ capture
+    def capture(self) -> None:
+        """Compile the step into one dynamo graph, then record it (or bind it on CPU).
+
+        The bank and sparse-attention kernels are opaque custom ops, so dynamo sees one
+        node per kernel instead of breaking at every Triton launch site. A capture that
+        produced more than one graph, or a break naming a kernel, is refused: an eager
+        step under a graph's name is the defect this method exists to prevent.
+        """
+        if not compiled.enabled():
+            compiled.checked(self.model)
+        self._warm()
+        proof = compiled.proof()
+        graphs = proof["unique_graphs"]
+        if graphs != 1:
+            raise LoudError(
+                f"the step compiled into {graphs} dynamo graphs, not one",
+                f"breaks: {proof['graph_break']}; the bank and sparse attention are opaque "
+                "custom ops, so a second graph means a region still breaks around them",
+            )
+        kernel_breaks = {
+            name: count
+            for name, count in proof["graph_break"].items()
+            if any(part in name.lower() for part in _KERNEL_BREAKS)
+        }
+        if kernel_breaks:
+            raise LoudError(
+                f"a kernel leaked out of the opaque graph: {kernel_breaks}",
+                "the bank and sparse-attention launches must stay behind their custom ops",
+            )
+        if self.ids.is_cuda:
+            self._capture()
+        else:
+
+            def replay_body() -> None:
+                self._loss = self._body()
+
+            self._graph = _CallableGraph(replay_body)  # type: ignore[assignment]
+            replay_body()
+
+    def proof(self) -> dict[str, Any]:
+        """Return dynamo's own account of the capture: graphs, frames and breaks."""
+        return compiled.proof()
+
+    def graph_breaks(self) -> dict[str, int]:
+        """Return the break reasons recorded while capturing, by name."""
+        return compiled.breaks()
+
     def _body(self) -> torch.Tensor:
         """Run the captured arithmetic: no host reads, one device scalar out."""
         self.optimizer.zero_grad(set_to_none=False)
@@ -123,6 +191,10 @@ class StepGraph:
 
     def _warm(self) -> None:
         """Run the body off-graph: every kernel compiled, every buffer grown."""
+        if not self.ids.is_cuda:
+            for _ in range(WARMUP):
+                self._body()
+            return
         stream = torch.cuda.Stream()  # type: ignore[no-untyped-call]
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
