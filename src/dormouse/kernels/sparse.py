@@ -446,7 +446,9 @@ def _sparse_setup(ctx: Any, inputs: tuple[Any, ...], output: tuple[torch.Tensor,
 def _sparse_backward(ctx: Any, *grads: torch.Tensor | None) -> tuple[Any, ...]:
     """Reuse the eager backward; the scale argument has no gradient."""
     grad = cast("torch.Tensor", grads[0])
-    return (*_Sparse.backward(ctx, grad), None)
+    # _Sparse.backward already returns one gradient per schema input (dq, dk, dv,
+    # and None for at/visible/scale); appending another makes 7 grads for 6 inputs.
+    return _Sparse.backward(ctx, grad)
 
 
 _sparse_op.register_autograd(_sparse_backward, setup_context=_sparse_setup)

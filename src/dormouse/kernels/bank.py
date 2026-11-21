@@ -1109,7 +1109,11 @@ def _bank_setup(ctx: Any, inputs: tuple[Any, ...], output: tuple[torch.Tensor, .
 def _bank_backward(ctx: Any, *grads: torch.Tensor | None) -> tuple[Any, ...]:
     """Reuse the eager backward; the shape/flag arguments have no gradient."""
     d_out = cast("torch.Tensor", grads[0])
-    return (*_Bank.backward(ctx, d_out), None, None, None, None)  # type: ignore[no-untyped-call]
+    # Eager backward returns 13 slots: one grad per tensor input (12) + meta None.
+    # The custom op splits meta into cap/kinds/sides/bf16, so drop the meta slot and
+    # append one None per scalar input: 12 + 4 = 16, matching the schema's 16 inputs.
+    grads = _Bank.backward(ctx, d_out)  # type: ignore[no-untyped-call]
+    return (*grads[:12], None, None, None, None)
 
 
 _bank_op.register_autograd(_bank_backward, setup_context=_bank_setup)
