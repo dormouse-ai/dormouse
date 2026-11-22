@@ -13,11 +13,11 @@ and inventing a reference there clips against a number nobody measured. The refe
 updated with the *clipped* norm, so one huge gradient cannot become the next step's
 ceiling.
 
-`is_spike` — a loss above `median + k·MAD` of the last `window` steps. The band is built
-from observed losses only, so a skipped step cannot widen the band that would have
-skipped it. `floor` is the least scale the band may have, as a fraction of the median: a
-converged run's MAD is the batch's own noise, and a band built from it alone calls a
-2% fluctuation a spike.
+`is_spike` — a non-finite loss, or one above `median + k·MAD` of the last `window`
+steps. The band is built from observed losses only, so a skipped step cannot widen the
+band that would have skipped it. `floor` is the least scale the band may have, as a
+fraction of the median: a converged run's MAD is the batch's own noise, and a band built
+from it alone calls a 2% fluctuation a spike.
 
 `throughput_drop` — the message for a step 20% below the median of the opening window,
 naming the cause. The old project lost hours to a stalled stream nobody noticed, so the
@@ -53,7 +53,9 @@ def adaptive_clip(model: nn.Module, running: dict[str, float], z: float) -> tupl
         examined += 1
         norm = float(param.grad.detach().norm())
         previous = running.get(name)
-        if previous is None:
+        # A zero, inf or NaN reference would either clip every later gradient to zero
+        # or never clip again; reseed from this observation instead.
+        if previous is None or not math.isfinite(previous) or previous <= 0.0:
             running[name] = norm
             continue
         ceiling = z * previous
@@ -66,7 +68,13 @@ def adaptive_clip(model: nn.Module, running: dict[str, float], z: float) -> tupl
 
 
 def is_spike(loss: float, window: Sequence[float], *, k: float, size: int) -> bool:
-    """Return whether `loss` is above `median + k·MAD` of a full window of past losses."""
+    """Return whether `loss` is non-finite or above `median + k·MAD` of a full window."""
+    if not math.isfinite(loss):
+        return True
+    # A non-finite window makes median/MAD non-finite, so the band is inf or NaN and
+    # every finite comparison is False: the gate would be silently off.
+    if not all(math.isfinite(value) for value in window):
+        return True
     if len(window) < size:
         return False
     median = statistics.median(window)

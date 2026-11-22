@@ -22,7 +22,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
