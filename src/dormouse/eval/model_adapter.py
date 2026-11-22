@@ -10,13 +10,20 @@ from __future__ import annotations
 
 import random
 import string
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from .iq import Task
 
-__concepts__ = ("CheckpointAdapter", "EchoAdapter", "KnownAdapter", "ModelAdapter", "RandomAdapter")
+__concepts__ = (
+    "CheckpointAdapter",
+    "EchoAdapter",
+    "FunctionAdapter",
+    "KnownAdapter",
+    "ModelAdapter",
+    "RandomAdapter",
+)
 
 
 @runtime_checkable

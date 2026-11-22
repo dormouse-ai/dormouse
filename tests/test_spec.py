@@ -174,6 +174,9 @@ def test_the_other_config_files_are_gone() -> None:
     assert sorted(p.name for p in CONFIGS.glob("*.toml")) == [
         "dormouse_1b.toml",
         "dormouse_1b_top1_r192.toml",
+        # The two-hour chat recipe is the same stack at b2 s1024, not a second
+        # architecture; tests/test_fastchat_config.py prices it.
+        "fastchat_400m.toml",
         "smoke.toml",
     ]
 
