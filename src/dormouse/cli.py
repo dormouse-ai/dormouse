@@ -259,11 +259,6 @@ def _status(pattern: str) -> int:
     return 0
 
 
-def _now() -> float:
-    """Return the clock `status` measures age against; a function so a test can freeze it."""
-    return time.time()
-
-
 def journal_row(path: Path, now: float) -> dict[str, Any]:
     """One `status` row, read from the journal and nothing else."""
     journal = Journal.open(path)
