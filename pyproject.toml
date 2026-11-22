@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
   "dormouse-core @ git+https://github.com/dormouse-ai/dormouse-core@master",
   "numpy>=1.26",
-  "tokenizers>=0.23",
+  "tokenizers>=0.23.3",
   "torch>=2.5",
 ]
 
