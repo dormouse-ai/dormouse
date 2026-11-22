@@ -1,0 +1,39 @@
+# 200-step convergence check on the validated DCLM stream, at the regression stack's
+# widths (d=64, 4 layers, lr 3e-3). Two steps cannot move CE from random init into the
+# 2-4 BPB band; 200 steps can, and this is the honest check that the stream is learnable.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+sources = "corpus"
+
+d_model = 64
+n_layers = 4
+n_heads = 4
+n_kv_heads = 2
+head_dim = 16
+c_lat = 32
+d_ffn = 128
+n_experts = 4
+topk = 1
+expert_tsct_rank = 32
+attn_k = 64
+attn_window = 32
+seq_len = 128
+batch = 8
+
+tokens = 204_800
+throughput_tflops = 1.0
+schedule = "cosine"
+seed = 1234
+lr_muon = 0.003
+harness = false
+eval_every = 50
+ckpt_every = 0
+eval_batches = 1
+eval = "heldout.bin"
+
+[[source]]
+path = "train.bin"
+weight = 1.0

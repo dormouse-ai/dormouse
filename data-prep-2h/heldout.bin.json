@@ -1,0 +1,9 @@
+{
+ "bytes_per_token": 4.165858,
+ "doc_hashes_sha": "8e0fc12b01b68d66d18adf82fe29c798f62828e5d1a65fa777c4714db5228640",
+ "documents": 1145,
+ "dtype": "uint16",
+ "source": "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-datasets/dclm/global-shard_01_of_10/local-shard_0_of_10/shard_00000090_processed.jsonl.zst",
+ "tokenizer_sha": "50235922e0bacb3a",
+ "tokens": 1503331
+}

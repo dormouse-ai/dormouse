@@ -1,0 +1,38 @@
+# Fast CPU smoke over the validated DCLM stream: 2 steps on a tiny bpe stack.
+# unit=bpe keeps the real 32768-id tokenizer and the measured bytes_per_token,
+# so the BPB this prints is the number the 2h run would compute.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "dsa"
+optimizer = "muon"
+objective = "ntp"
+sources = "corpus"
+
+d_model = 32
+n_layers = 2
+n_heads = 2
+n_kv_heads = 1
+head_dim = 16
+c_lat = 8
+d_ffn = 64
+n_experts = 2
+topk = 1
+expert_tsct_rank = 8
+attn_k = 64
+attn_window = 32
+seq_len = 128
+batch = 8
+
+tokens = 2048
+throughput_tflops = 1.0
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 0
+eval_batches = 1
+eval = "heldout.bin"
+
+[[source]]
+path = "train.bin"
+weight = 1.0
