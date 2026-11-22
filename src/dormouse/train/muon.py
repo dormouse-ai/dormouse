@@ -91,7 +91,9 @@ __all__ = [
     "COLROW_EPS",
     "MUON_LR",
     "NS_COEFFS",
+    "NS_DTYPES",
     "NS_EPS",
+    "NS_FP16_COUNTER",
     "NS_GROUPED_COUNTER",
     "NS_POWER_ITERS",
     "NS_STEPS",
@@ -130,6 +132,13 @@ MUON_LR = 0.02
 #: absent mechanism fails `Counters.check()` instead of reporting eager timings.
 NS_GROUPED_COUNTER = "ns_grouped"
 
+#: Chain dtype literal. `fp32` is the shipped default; `fp16` is the opt-in tensor-core
+#: rung (fp32 spectral prescale, fp16 quintic, fp32 output).
+NS_DTYPES: tuple[str, ...] = ("fp32", "fp16")
+
+#: Counter proving the opt-in fp16 rung actually ran (declared-but-absent fails loudly).
+NS_FP16_COUNTER = "ns_fp16"
+
 
 def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """`mm` for one matrix, `bmm` for a `[N, m, n]` batch — the same kernel each."""
@@ -162,15 +171,18 @@ def spectral_bound(x: torch.Tensor, iters: int = NS_POWER_ITERS) -> torch.Tensor
     return bound
 
 
-def _prescale(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
-    """Cast to fp32, bound the spectrum, and put a tall matrix on its short side."""
+def _prescale(
+    x: torch.Tensor, *, work_dtype: torch.dtype = torch.float32
+) -> tuple[torch.Tensor, bool]:
+    """Cast to fp32, bound the spectrum on the fp32 master, THEN select the chain dtype."""
     work = x.to(torch.float32)
     work = work / spectral_bound(work).clamp_min(NS_EPS)
     transposed = work.shape[-2] > work.shape[-1]
-    return (work.transpose(-2, -1) if transposed else work), transposed
+    short = work.transpose(-2, -1) if transposed else work
+    return short.to(work_dtype), transposed
 
 
-def _require_foreach(batch: list[torch.Tensor]) -> None:
+def _require_foreach(batch: list[torch.Tensor], *, work_dtype: torch.dtype = torch.float32) -> None:
     """Refuse loudly when the fused chain cannot run — never fall back per group."""
     if not callable(getattr(torch, "_foreach_mul", None)) or not callable(
         getattr(torch, "_foreach_add", None)
@@ -182,10 +194,11 @@ def _require_foreach(batch: list[torch.Tensor]) -> None:
     if not batch:
         raise LoudError("the fused polar chain was given no matrices", "pass at least one group")
     for tensor in batch:
-        if tensor.dtype != torch.float32:
+        if tensor.dtype != work_dtype:
+            name = "fp32" if work_dtype == torch.float32 else "fp16"
             raise LoudError(
-                f"fused polar requires fp32 work tensors, got {tensor.dtype}",
-                "_prescale casts every input to fp32 before the chain",
+                f"fused polar requires {name} work tensors, got {tensor.dtype}",
+                f"_prescale casts every input to {name} before the chain",
             )
         if tensor.ndim not in (2, 3):
             raise LoudError(
@@ -199,18 +212,27 @@ def _require_foreach(batch: list[torch.Tensor]) -> None:
             )
 
 
-def _polar_many(batch: list[torch.Tensor], steps: int = NS_STEPS) -> list[torch.Tensor]:
+def _polar_many(
+    batch: list[torch.Tensor], steps: int = NS_STEPS, *, ns_dtype: str = "fp32"
+) -> list[torch.Tensor]:
     """Newton–Schulz for every matrix in `batch`, one lockstep chain (§6).
 
-    The GEMMs stay one `bmm`/`mm` per matrix. The five fp32 elementwise ops per
+    The GEMMs stay one `bmm`/`mm` per matrix. The five elementwise ops per
     iteration — `b·gram`, `c·(gram@gram)`, their add, `a·x`, the final add — run as
     `_foreach_mul`/`_foreach_add` over all matrices at once, so launches no longer
-    scale with the number of shape groups. Same dtype, coefficients and arithmetic
-    order as `polar` on each matrix; `tests/test_muon_foreach.py` pins the parity.
+    scale with the number of shape groups. `fp32` is the shipped path (parity pinned
+    in `tests/test_muon_foreach.py`); `fp16` runs the same coefficients and iteration
+    count on tensor cores, with the spectral prescale and the output in fp32.
     """
+    if ns_dtype not in NS_DTYPES:
+        raise LoudError(
+            f"ns_dtype={ns_dtype!r} is not a chain dtype",
+            f"use one of: {', '.join(NS_DTYPES)}",
+        )
+    work_dtype = torch.float16 if ns_dtype == "fp16" else torch.float32
     a, b, c = NS_COEFFS
-    _require_foreach(batch)
-    prepared = [_prescale(x) for x in batch]
+    _require_foreach(batch)  # momentum is fp32 on both rungs, before the prescale
+    prepared = [_prescale(x, work_dtype=work_dtype) for x in batch]
     works = [work for work, _ in prepared]
     transposed = [flag for _, flag in prepared]
     for _ in range(steps):
@@ -223,12 +245,12 @@ def _polar_many(batch: list[torch.Tensor], steps: int = NS_STEPS) -> list[torch.
         scaled: list[torch.Tensor] = list(torch._foreach_mul(works, a))
         works = list(torch._foreach_add(scaled, projected))
     return [
-        work.transpose(-2, -1).contiguous() if flag else work.contiguous()
+        (work.transpose(-2, -1).contiguous() if flag else work.contiguous()).to(torch.float32)
         for work, flag in zip(works, transposed, strict=True)
     ]
 
 
-def polar(x: torch.Tensor, steps: int = NS_STEPS) -> torch.Tensor:
+def polar(x: torch.Tensor, steps: int = NS_STEPS, *, ns_dtype: str = "fp32") -> torch.Tensor:
     """Return the orthogonal factor of `x` for `[m, n]` or a batch `[N, m, n]`.
 
     Runs on the **short side**: a tall matrix is transposed first, so the Gram is
@@ -236,7 +258,7 @@ def polar(x: torch.Tensor, steps: int = NS_STEPS) -> torch.Tensor:
     orthogonality holds to the conditioning of `x` — §3 states the ceiling. The single
     matrix is the public form of the fused chain `_polar_many` runs in the optimizer.
     """
-    return _polar_many([x], steps=steps)[0]
+    return _polar_many([x], steps=steps, ns_dtype=ns_dtype)[0]
 
 
 def colrow(x: torch.Tensor, eps: float = COLROW_EPS) -> torch.Tensor:
@@ -281,6 +303,7 @@ def orthogonalise(
     *,
     head_split: tuple[int, int] | None = None,
     steps: int = NS_STEPS,
+    ns_dtype: str = "fp32",
 ) -> torch.Tensor:
     """`polar(momentum)` per head when the parameter is a packed qkv weight (§5).
 
@@ -288,7 +311,9 @@ def orthogonalise(
     moment divides each row by its own scale and ColRow's unit row norm would leave
     nothing to divide.
     """
-    return _assemble([polar(part, steps) for part in _regions(momentum, head_split)])
+    return _assemble(
+        [polar(part, steps, ns_dtype=ns_dtype) for part in _regions(momentum, head_split)]
+    )
 
 
 def muon_direction(
@@ -296,6 +321,7 @@ def muon_direction(
     *,
     head_split: tuple[int, int] | None = None,
     steps: int = NS_STEPS,
+    ns_dtype: str = "fp32",
 ) -> torch.Tensor:
     """`ColRow(polar(momentum))`, per head when the parameter is a packed qkv weight.
 
@@ -303,7 +329,9 @@ def muon_direction(
     per-head slices and the rest is one matrix: Q and K of a packed `[3d, d]`
     projection, with V as the remainder (§5).
     """
-    return _assemble([colrow(polar(part, steps)) for part in _regions(momentum, head_split)])
+    return _assemble(
+        [colrow(polar(part, steps, ns_dtype=ns_dtype)) for part in _regions(momentum, head_split)]
+    )
 
 
 class Muon(Optimizer):
@@ -318,11 +346,14 @@ class Muon(Optimizer):
         steps: int = NS_STEPS,
         weight_decay: float = 0.0,
         grouped: bool = True,
+        ns_dtype: str = "fp32",
     ) -> None:
         """Bind the four numbers every group inherits unless it overrides them.
 
         `grouped` schedules equal-shaped regions as one `bmm` chain (§6). It is a
         schedule switch, not a second algorithm: `grouped=False` is the parity control.
+        `ns_dtype` selects the chain's arithmetic: `fp32` is bitwise-shipped, `fp16`
+        is the opt-in tensor-core rung.
         """
         if not 0.0 <= momentum < 1.0:
             raise LoudError(
@@ -334,7 +365,13 @@ class Muon(Optimizer):
                 f"muon ns steps={steps} runs no iteration",
                 "5 is the recipe's, and §3 of the module docstring prices fewer",
             )
+        if ns_dtype not in NS_DTYPES:
+            raise LoudError(
+                f"ns_dtype={ns_dtype!r} is not a chain dtype",
+                f"use one of: {', '.join(NS_DTYPES)}",
+            )
         self.grouped = grouped
+        self.ns_dtype = ns_dtype
         super().__init__(
             params,
             {"lr": lr, "momentum": momentum, "steps": steps, "weight_decay": weight_decay},
@@ -347,7 +384,8 @@ class Muon(Optimizer):
         Polar runs once per (shape, steps, role) bucket rather than once per matrix. The
         bucket key carries the role so a per-head Q/K slice never joins a whole-matrix
         bucket; AdamW parameters are never in this optimizer's param groups at all.
-        Passing `counters` enables and proves the batched path (§6).
+        Passing `counters` enables and proves the batched path (§6) and the opt-in
+        fp16 rung.
         """
         loss = None
         if closure is not None:
@@ -358,6 +396,12 @@ class Muon(Optimizer):
                 "ns_grouped",
                 counter=NS_GROUPED_COUNTER,
                 why="shape-grouped polar runs as batched bmm",
+            )
+        if counters is not None and self.ns_dtype == "fp16":
+            counters.enable(
+                NS_FP16_COUNTER,
+                counter=NS_FP16_COUNTER,
+                why="fp16 tensor-core NS chain runs the declared rung",
             )
         jobs: dict[
             tuple[torch.Size, int, tuple[int, int] | None],
@@ -406,8 +450,10 @@ class Muon(Optimizer):
                     owners_by_steps[steps].append(([entry], False))
         results: dict[tuple[Any, int, int], torch.Tensor] = {}
         for steps, inputs in inputs_by_steps.items():
-            outputs = _polar_many(inputs, steps=steps)
+            outputs = _polar_many(inputs, steps=steps, ns_dtype=self.ns_dtype)
             for out, (entries, is_batch) in zip(outputs, owners_by_steps[steps], strict=True):
+                if counters is not None and self.ns_dtype == "fp16":
+                    counters.count(NS_FP16_COUNTER, len(entries))
                 direction = colrow(out)
                 for index, (param, region_index, matrix_index, _) in enumerate(entries):
                     value = direction[index] if is_batch else direction
@@ -417,6 +463,13 @@ class Muon(Optimizer):
         grouped_proof = counters.counts[NS_GROUPED_COUNTER] if counters is not None else 1
         if self.grouped and jobs and not grouped_proof:
             raise MissingReport([NS_GROUPED_COUNTER])
+        fp16_proof = (
+            counters.counts.get(NS_FP16_COUNTER, 0)
+            if counters is not None and self.ns_dtype == "fp16"
+            else 1
+        )
+        if self.ns_dtype == "fp16" and jobs and not fp16_proof:
+            raise MissingReport([NS_FP16_COUNTER])
         for param, (lr, decay, scale, plan) in plans.items():
             parts: list[torch.Tensor] = []
             for region_index, (batched, shape) in enumerate(plan):

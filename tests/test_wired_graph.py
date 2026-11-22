@@ -66,6 +66,7 @@ GOLDEN_COUNTS = {
     "clip_events": 7,
     "opt_muon": 5,
     "opt_adamw": 4,
+    "ns_grouped": 9,
     "opt_steps": 1,
     "ema": 1,
 }

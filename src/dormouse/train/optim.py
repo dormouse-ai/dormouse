@@ -45,6 +45,7 @@ from .muon import (
     COLROW_EPS,
     MUON_LR,
     NS_COEFFS,
+    NS_DTYPES,
     NS_EPS,
     NS_POWER_ITERS,
     NS_STEPS,
@@ -60,6 +61,7 @@ __all__ = [
     "COLROW_EPS",
     "MUON_LR",
     "NS_COEFFS",
+    "NS_DTYPES",
     "NS_EPS",
     "NS_POWER_ITERS",
     "NS_STEPS",
@@ -99,18 +101,31 @@ class MixOptimizer:
         sf_weight_decay: float = SF_WEIGHT_DECAY,
         sf_final_decay_frac: float = 0.05,
         muon_grouped: bool = True,
+        muon_ns_dtype: str = "fp32",
     ) -> None:
         """Route `model`'s parameters, then build the arm pair `schedule` names.
 
         Under `cosine`/`wsd` a rate of `None` keeps the recipe's `muon_lr=0.02` and
         `lr_adamw=0.003`; under `sf` it keeps the paper's single `η = 0.01` for both,
         because a schedule-free run at the scheduled rate is 6× the tuned one and
-        reports the divergence as a property of the method.
+        reports the divergence as a property of the method. `muon_ns_dtype` selects
+        the Muon chain's arithmetic; `fp16` is an opt-in tensor-core rung, refused
+        under `sf`, whose arm has no dtype rung.
         """
         if schedule not in SCHEDULES:
             raise LoudError(
                 f"schedule={schedule!r} is not a mode this stack has",
                 f"use one of: {', '.join(SCHEDULES)}",
+            )
+        if muon_ns_dtype not in NS_DTYPES:
+            raise LoudError(
+                f"muon_ns_dtype={muon_ns_dtype!r} is not a chain dtype",
+                f"use one of: {', '.join(NS_DTYPES)}",
+            )
+        if schedule == "sf" and muon_ns_dtype != "fp32":
+            raise LoudError(
+                f"muon_ns_dtype={muon_ns_dtype!r} under a schedule-free optimizer",
+                "the sf arm is SFNorMuon and has no NS dtype rung; use cosine or wsd",
             )
         self.schedule = schedule
         self.model = model
@@ -170,6 +185,7 @@ class MixOptimizer:
             steps=steps,
             weight_decay=muon_weight_decay,
             grouped=muon_grouped,
+            ns_dtype=muon_ns_dtype,
         )
         self.adamw = AdamW(
             [p for _, p in vectors], lr=lr_adamw, betas=betas, eps=eps, weight_decay=weight_decay

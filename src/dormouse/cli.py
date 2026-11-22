@@ -96,6 +96,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="replay a captured whole step after warm-up (default off until parity passes)",
     )
+    run.add_argument(
+        "--muon-ns-dtype",
+        choices=("fp32", "fp16"),
+        default=None,
+        help="Muon Newton-Schulz chain dtype (default: the config's muon_ns_dtype)",
+    )
 
     score = sub.add_parser("eval", help="score a checkpoint: the harness table and its BPB")
     score.add_argument("checkpoint", help="runs/<id>/final.pt, or the run directory")
@@ -196,6 +202,7 @@ def _train(args: argparse.Namespace) -> int:
         until=args.steps,
         approve=args.yes,
         graph=args.graph,
+        muon_ns_dtype=args.muon_ns_dtype,
         echo=print,
     )
     print(
