@@ -130,7 +130,7 @@ def solve(
             # on the build, so take the last non-empty, non-header line.
             for line in reversed(proc.stdout.splitlines()):
                 stripped = line.strip()
-                if not stripped or stripped.startswith(">") and "·" in stripped:
+                if not stripped or (stripped.startswith(">") and "·" in stripped):
                     continue
                 text = stripped
                 break

@@ -1,0 +1,55 @@
+# fastchat_400m: the smallest chat stack that fits a two-hour envelope on 1x5070 Ti.
+#
+# This is the shipped 401M stack at batch 2 x seq 1024 -- the shape the engine's MFU
+# was measured on (39.92% of 92 TFLOP/s, commit 6e210b6). It is NOT a second
+# architecture: every width below is a value the one spec prices and builds.
+#
+# width arithmetic (from `dorm plan` on the meta device, not from a guess):
+#   stored   400,985,812  = embedding 27,262,976 + attention 25,081,608
+#                           + moe bank 348,620,428 + norms 20,800
+#   active    68,506,348  = embedding + attention + (topk 2 + shared 1) experts
+#   engine bill 407 MFLOP/token = 6 x active (tools/decisive_bench.py)
+#
+# budget at D = 108,000,000 tokens (90M SYNTH-enriched pretrain + 18M SFT):
+#   headline 6 x P_stored x D = 2.598e17 FLOP -> 1.965 h at 39.92% MFU of 92 TFLOP/s
+#   engine   6 x P_active  x D = 4.437e16 FLOP -> 0.336 h
+# The headline is deliberately the conservative one: it charges every stored bank
+# parameter, so a 2-hour gate passes even if the routed bank stops saving FLOPs.
+#
+# SPEC VERSION. This worktree's StackSpec (6abf49b) predates the v2 fields. The run
+# identity is config_version=1 (the 401M topology); precision is bf16 autocast, with
+# fp16 Newton-Schulz in Muon and the fused epilogue -- all engine settings at this HEAD,
+# not keys this config can spell. RunRecipe.read refuses unknown keys, so do NOT add
+# `config_version`, `amp`, `fp16_ns`, `graph` or `epilogue` here until spec.py carries
+# them. See docs/fastchat-recipe.md for the exact run flags.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+# Captured whole step; pair with `dorm train --graph` (off until parity is re-proven).
+torch_compile = true
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 108_000_000
+# 92 TFLOP/s peak x 39.92% measured whole-step MFU: what `dorm plan` prices seconds at.
+throughput_tflops = 36.7264

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import random
 import string
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from .iq import Task
