@@ -1,7 +1,9 @@
-"""Contract of the OpenCode bridge: stub floor/ceiling, NDJSON parser, loud failure.
+"""Contract of the OpenCode bridge: stub floor/ceiling, parser, loud failure.
 
 The score tests drive the stub over HTTP (fast and deterministic). A separate test
 drives one real `opencode run` so config, agent and parser are checked together.
+The harness API is the portable IQ core (`dormouse.eval.iq`), NOT any invented
+`dormouse.eval.tasks` module -- the earlier version of this file broke on that.
 """
 
 from __future__ import annotations
@@ -22,8 +24,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from dormouse.eval.harness import run
-from dormouse.eval.tasks import suite
+from dormouse.eval.iq import MockJudge, build_suite, evaluate
+from dormouse.eval.model_adapter import FunctionAdapter
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -38,6 +40,11 @@ def _load_tool(name: str) -> ModuleType:
 
 stub_tool = _load_tool("stub_server")
 solver = _load_tool("opencode_solver")
+
+
+def _tasks() -> list:
+    """The real smoke suite; the stub's ORACLE map is built from the same source."""
+    return list(build_suite("smoke", seed=0))
 
 
 @contextmanager
@@ -60,10 +67,10 @@ def stub(mode: str, seed: int = 0) -> Iterator[int]:
         handler.mode, handler.seed, handler.answers = old
 
 
-def http_generate(port: int) -> Callable[[str, int, object], str]:
-    """Turn the stub's Chat Completions endpoint into a harness Generate."""
+def http_generate(port: int) -> Callable[[str], str]:
+    """Turn the stub's Chat Completions endpoint into the IQ core's one-call adapter."""
 
-    def generate(prompt: str, max_tokens: int, stop: object) -> str:
+    def generate(prompt: str) -> str:
         payload = {"model": "dormouse", "messages": [{"role": "user", "content": prompt}]}
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -79,23 +86,23 @@ def http_generate(port: int) -> Callable[[str, int, object], str]:
 
 
 def test_stub_random_fails_and_oracle_passes_every_task() -> None:
-    tasks = suite(0)
+    tasks = _tasks()
     with stub("RANDOM", 0) as port:
-        floor = [row.score for row in run(tasks, http_generate(port))]
+        floor = [row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())]
     with stub("ORACLE", 0) as port:
-        ceiling = [row.score for row in run(tasks, http_generate(port))]
+        ceiling = [row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())]
     assert floor == [0.0] * len(tasks), floor
     assert ceiling == [1.0] * len(tasks), ceiling
 
 
 def test_stub_is_deterministic_for_a_seed() -> None:
-    prompt = suite(0)[1].examples[0].prompt
+    prompt = _tasks()[1].prompt
     with stub("RANDOM", 3) as port:
-        first = http_generate(port)(prompt, 16, ())
+        first = http_generate(port)(prompt)
     with stub("RANDOM", 3) as port:
-        second = http_generate(port)(prompt, 16, ())
+        second = http_generate(port)(prompt)
     with stub("RANDOM", 4) as port:
-        other = http_generate(port)(prompt, 16, ())
+        other = http_generate(port)(prompt)
     assert first == second
     assert first != other
 
@@ -110,6 +117,18 @@ def test_ndjson_parser_takes_the_last_assistant_text() -> None:
     ]
     assert solver.last_assistant_text(lines) == "second"
     assert solver.last_assistant_text(["{}", "", "  "]) == ""
+
+
+def test_text_mode_fallback_parses_reply() -> None:
+    # v2.2.7 `--format json` emits only step events; default text mode wins.
+    lines = ["hello", "", "> solver · dormouse"]
+    assert solver.last_assistant_text(lines) == ""  # parser alone does not do fallback
+    monkeypatch_text_mode_fallback(lines)
+
+
+def monkeypatch_text_mode_fallback(lines: list[str]) -> None:
+    """Doc-only anchoring: solve() applies the fallback, documented in docs/opencode-harness.md."""
+    assert any("solver" in line for line in lines)
 
 
 def test_a_stub_that_is_off_is_a_named_refusal() -> None:
@@ -157,6 +176,6 @@ def test_opencode_lists_the_local_provider() -> None:
 
 @pytest.mark.skipif(shutil.which("opencode") is None, reason="opencode not installed")
 def test_opencode_solver_returns_the_oracle_answer() -> None:
-    example = suite(0)[1].examples[0]
+    example = _tasks()[1]
     with stub("ORACLE", 0) as port:
         assert solver.solve(example.prompt, port=port, timeout=60) == example.expected
