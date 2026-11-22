@@ -177,6 +177,9 @@ def test_the_other_config_files_are_gone() -> None:
         # The two-hour chat recipe is the same stack at b2 s1024, not a second
         # architecture; tests/test_fastchat_config.py prices it.
         "fastchat_400m.toml",
+        # The fp32-state FLA precision A/B is the same stack at b2, priced in
+        # tests/test_kda_precision.py.
+        "kda_precision.toml",
         # The smart-fast recipe is the same 401M stack with the surviving lever
         # manifest; tests/test_smart_fast.py prices it.
         "smart_fast.toml",

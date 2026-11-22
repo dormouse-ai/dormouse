@@ -61,6 +61,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ...kernels.kda_fla import chunk_kda_fla, fla_requested
 from ..blocks import PROJ_STD
 from .projections import LatentProjections
 
@@ -272,7 +273,12 @@ class KDA(LatentProjections):
             self.a_up(self.activation(self.a_down(x))).view(batch, seq, self.n_heads, self.head_dim)
             + self.a_bias
         )
-        alpha = torch.exp(-nn.functional.softplus(decay))
+        #: The log-decay must be fp32 in both backends: autocast would otherwise
+        #: take softplus/exp in bf16 and quantize a value the recurrence exponentiates.
+        #: A fp64 anchor must stay fp64, hence the dtype guard rather than a bare cast.
+        with torch.autocast("cuda", enabled=False):
+            work = decay.float() if decay.dtype in (torch.bfloat16, torch.float16) else decay
+            alpha = torch.exp(-nn.functional.softplus(work))
         return q, k, v, alpha, torch.sigmoid(self.beta(x))
 
     def _write(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -301,6 +307,16 @@ class KDA(LatentProjections):
         the same term is `(a ⊙ k) @ (k / a)ᵀ`: one matmul per chunk, and no
         `[·, chunk, chunk, head_dim]` tensor exists at any size.
         """
+        #: The Triton backend keeps the state and the log-decay in fp32. CPU (the fp64
+        #: anchor) and fp64 stay on the eager path; on CUDA a missing FLA is a LoudError,
+        #: never a silent timing of the eager path.
+        if (
+            fla_requested()
+            and q.is_cuda
+            and q.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and self.chunk in (32, 64)
+        ):
+            return chunk_kda_fla(q, k, v, alpha, beta, chunk=self.chunk)
         batch, heads, _, _ = q.shape
         chunk = self.chunk
         count = q.shape[2] // chunk
@@ -319,12 +335,17 @@ class KDA(LatentProjections):
         #: live shape) instead of the 5-D tensor (8.7 GiB over the nine layers).
         written: torch.Tensor
         state: torch.Tensor
-        if keep:
-            written, state = checkpoint(
-                self._chunks, *core, use_reentrant=False, preserve_rng_state=False
-            )
-        else:
-            written, state = self._chunks(*core)
+        #: FLA's WY solve runs in fp32. Under autocast the eager matmuls would
+        #: silently drop to bf16, so their gradients diverge by 3-24% and the A/B
+        #: would be a dtype comparison, not a kernel comparison. Kimi §3.2 asks for
+        #: fp32 here; keep the eager core in the same arithmetic as the Triton one.
+        with torch.autocast("cuda", enabled=False):
+            if keep:
+                written, state = checkpoint(
+                    self._chunks, *core, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                written, state = self._chunks(*core)
         return written.reshape(batch, heads, -1, written.shape[-1]), state
 
     def _chunks(
