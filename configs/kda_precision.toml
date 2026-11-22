@@ -1,0 +1,36 @@
+# kda_precision: a MEASUREMENT shape, not a second architecture.
+#
+# Identical to dormouse_1b.toml except batch=2 and seq_len=768 (12 KDA chunks).
+# The full s1024 shape cannot coexist with the card's resident foreign tenants
+# (~2.3 GiB) in the Muon Gram step; s768 keeps the whole 832-wide stack and all
+# nine KDA layers. tests/test_kda_precision.py runs 200 steps per arm with only
+# DORMOUSE_KDA_FLA changing.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 768
+batch = 2
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0
