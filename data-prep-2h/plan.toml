@@ -1,0 +1,30 @@
+# Plan-only recipe for the validated DCLM stream. Same 401M topology as
+# configs/fastchat_400m.toml; the [[source]] block makes it a valid RunRecipe too.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = true
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 108_000_000
+throughput_tflops = 36.7264
