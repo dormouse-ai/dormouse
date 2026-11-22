@@ -50,6 +50,8 @@ OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
 WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
+#: Where the run's tensors live; `auto` falls back to CPU when no card is present.
+DEVICES: tuple[str, ...] = ("auto", "cpu", "cuda")
 
 #: The vocab each unit prices the token table at. `bpe` is the tokenizer's own default:
 #: the number exists in `data/tokenizer.py` and nowhere else, so a head priced here and a
@@ -103,6 +105,7 @@ class StackSpec(Config):
     # ------------------------------------------------------------------ wiring
     torch_compile: bool = False
     sources: str = "corpus"
+    device: str = "auto"
 
     # ------------------------------------------------------------------ widths
     #: The token table's row count. 0 means "the unit's own": `bpe` takes
@@ -157,6 +160,7 @@ class StackSpec(Config):
         _literal("objective", self.objective, OBJECTIVES)
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
+        _literal("device", self.device, DEVICES)
         if self.vocab != VOCAB[self.unit]:
             raise LoudError(
                 f"vocab={self.vocab} is not the {self.unit} vocabulary ({VOCAB[self.unit]})",

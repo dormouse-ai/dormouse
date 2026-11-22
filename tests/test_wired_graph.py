@@ -50,6 +50,7 @@ GOLDEN = [
     (15, 4.2043023109436035, 4.413464069366455, 7, False, "0b47a29316a0049b", 1.5163815235990865),
 ]
 GOLDEN_COUNTS = {
+    "step_heartbeat": 1,
     "fwd": 32,
     "embed_fwd": 32,
     "norm_fwd": 96,

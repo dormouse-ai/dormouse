@@ -70,12 +70,14 @@ class Trainer:
         journal: Journal,
         eval_stream: BatchStream | None = None,
         use_graph: bool = False,
+        heartbeat: Callable[[str], None] | None = None,
     ) -> None:
         """Wire the run and refuse a schedule whose last step is not the anneal's."""
         self.model, self.stream, self.optim = model, stream, optim
         self.schedule, self.cfg, self.journal = schedule, cfg, journal
         self.eval_stream = eval_stream
         self.use_graph = use_graph
+        self.heartbeat = heartbeat
         self.graph: StepGraph | None = None
         self.log_every = 1
         self._last_loss = 0.0
@@ -196,6 +198,16 @@ class Trainer:
             self.stage = stage.name
         counters = Counters()
         self.counters = counters
+        # A step announces itself before the forward: an expensive step then leaves a
+        # heartbeat on stdout instead of a journal that stops mid-step with no explanation.
+        counters.enable(
+            "heartbeat",
+            counter="step_heartbeat",
+            why="a step reports that it started before the forward runs",
+        )
+        counters.count("step_heartbeat")
+        if self.heartbeat is not None:
+            self.heartbeat(f"step {step}/{total}: computing ({stage.name})")
         started = time.perf_counter()
         batch = self.stream.batch(step, cfg.tokens_per_step)
         fetched = time.perf_counter()
@@ -423,6 +435,7 @@ class Trainer:
         journal: Journal,
         eval_stream: BatchStream | None = None,
         use_graph: bool = False,
+        heartbeat: Callable[[str], None] | None = None,
     ) -> Trainer:
         """Restore a run from `run_dir` so that the next batch is the one that would have come.
 
@@ -443,6 +456,7 @@ class Trainer:
             journal,
             eval_stream,
             use_graph=use_graph,
+            heartbeat=heartbeat,
         )
         checkpoint.restore(trainer, snapshot)
         trainer.stage = trainer._stage(min(snapshot.step, trainer.cfg.steps - 1)).name

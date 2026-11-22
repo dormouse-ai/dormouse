@@ -78,6 +78,27 @@ BUDGET_SECONDS = 3600.0
 STEP_COUNTERS = frozenset({"embed_fwd", "block_fwd", "norm_fwd", "head_fwd", "tied_head"})
 
 
+def _resolve_device(choice: str) -> torch.device:
+    """Resolve the spec's device: `auto` picks CUDA when present, else CPU.
+
+    An explicit `cuda` on a card-less host refuses out loud — a step that silently
+    trained on CPU would report card speed for arithmetic that never ran on a card.
+    """
+    if choice == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice == "cuda":
+        if not torch.cuda.is_available():
+            raise LoudError(
+                "device=cuda, but torch.cuda.is_available() is False",
+                "set device=auto (or cpu) in the config; a cuda request that quietly "
+                "trained on cpu would report card speed from a cpu run",
+            )
+        return torch.device("cuda")
+    raise LoudError(f"unknown device {choice!r}", "use auto, cpu or cuda")
+
+
 class _NoSwap:
     """`eval_weights()` that does nothing, for a model that is already the eval weights.
 
@@ -146,8 +167,8 @@ def _assert_plan(where: str, priced: int, measured: int) -> None:
         )
 
 
-def _mixture(recipe: RunRecipe) -> Mixture:
-    """Open the mixture and the byte ratio the loop's accounting divides by."""
+def _mixture(recipe: RunRecipe, device: torch.device) -> Mixture:
+    """Open the mixture on the run's device and the ratio the accounting divides by."""
     expected = ""
     if recipe.spec.tokenizer:
         from ..data.tokenizer import sha_file
@@ -161,6 +182,7 @@ def _mixture(recipe: RunRecipe) -> Mixture:
         bytes_per_token(recipe),
         batch=recipe.spec.batch,
         seq_len=recipe.spec.seq_len,
+        device=device,
     )
 
 
@@ -204,7 +226,7 @@ def _counts(trainer: Trainer, assembled: Assembled) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _heldout(recipe: RunRecipe, steps: int) -> HeldOut:
+def _heldout(recipe: RunRecipe, steps: int, device: torch.device) -> HeldOut:
     """Return the held-out window, refusing one the training arithmetic would reach into."""
     if recipe.eval_path is None:
         raise LoudError(
@@ -219,6 +241,7 @@ def _heldout(recipe: RunRecipe, steps: int) -> HeldOut:
         batch=recipe.spec.batch,
         seq_len=recipe.spec.seq_len,
         probes=probes,
+        device=device,
     )
     read = steps * recipe.spec.batch * (recipe.spec.seq_len + 1)
     for source in recipe.sources:
@@ -249,6 +272,7 @@ def train(
     parity gate passes; a capture that refuses is LOUD, never an eager fallback.
     """
     recipe = RunRecipe.read(config)
+    target = _resolve_device(recipe.spec.device)
     budget = SMOKE_STEPS if smoke else recipe.steps
     steps = budget if until is None else min(until, budget)
     if until is not None and until > budget:
@@ -279,12 +303,12 @@ def train(
         # and its timing says something about the code rather than the core count.
         torch.set_num_threads(1)
     torch.manual_seed(recipe.seed)
-    assembled = assemble(recipe.spec, smoke=smoke)
+    assembled = assemble(recipe.spec, device=target, smoke=smoke)
     per_step = 6 * assembled.report()["active"] * cfg.tokens_per_step
     _assert_plan("start", priced, per_step)
 
-    stream = _mixture(recipe)
-    window = _heldout(recipe, budget)
+    stream = _mixture(recipe, target)
+    window = _heldout(recipe, budget, target)
     journal = Journal.open(directory / "run.jsonl")
     optim, schedule = _optimizer(assembled.model, recipe, cfg)
     if resume:
@@ -297,10 +321,19 @@ def train(
             journal=journal,
             eval_stream=window,
             use_graph=graph,
+            heartbeat=echo,
         )
     else:
         trainer = Trainer(
-            assembled.model, stream, optim, schedule, cfg, journal, window, use_graph=graph
+            assembled.model,
+            stream,
+            optim,
+            schedule,
+            cfg,
+            journal,
+            window,
+            use_graph=graph,
+            heartbeat=echo,
         )
         stream.mix.record(journal, 0)
     if journal.last("start") is None:
@@ -319,6 +352,7 @@ def train(
             plan_source=plan_source,
             step_flops=per_step,
             graph=graph,
+            device=str(target),
         )
     resumed_from = trainer.step
     echo(f"run {directory}: {steps} steps from {resumed_from}, {recipe.schedule} schedule")
@@ -431,9 +465,13 @@ def _export(
     return path, blob
 
 
-def load_artifact(path: str | Path) -> tuple[StackSpec, nn.Module]:
-    """Read an exported artifact back: the spec it was built at and the weights it holds."""
-    return _build(_read(path))
+def load_artifact(path: str | Path, *, device: str = "cpu") -> tuple[StackSpec, nn.Module]:
+    """Read an exported artifact back: the spec it was built at and the weights it holds.
+
+    Artifacts are portable and load on CPU by default; pass `device="cuda"` to place
+    one on a card. The train path picks its own device from the spec.
+    """
+    return _build(_read(path), _resolve_device(device))
 
 
 def _read(path: str | Path) -> dict[str, Any]:
@@ -448,10 +486,10 @@ def _read(path: str | Path) -> dict[str, Any]:
     return raw
 
 
-def _build(raw: dict[str, Any]) -> tuple[StackSpec, nn.Module]:
-    """Build the stack an artifact names and load its weights into it."""
+def _build(raw: dict[str, Any], device: torch.device) -> tuple[StackSpec, nn.Module]:
+    """Build the stack an artifact names on `device` and load its weights into it."""
     spec = cast(StackSpec, StackSpec.from_mapping(raw["spec"]))
-    model = assemble(spec, smoke=bool(raw["smoke"])).model
+    model = assemble(spec, device=device, smoke=bool(raw["smoke"])).model
     model.load_state_dict(raw["state"])
     model.eval()
     return spec, model
@@ -463,7 +501,7 @@ def evaluate(checkpoint_path: str | Path, *, echo: Callable[[str], None] = print
     raw = _read(path)
     if bool(raw.get("smoke", False)):
         torch.set_num_threads(1)
-    spec, model = _build(raw)
+    spec, model = _build(raw, torch.device("cpu"))
     directory = path.parent
     stored = directory / "config.json"
     if not stored.exists():
@@ -488,6 +526,7 @@ def evaluate(checkpoint_path: str | Path, *, echo: Callable[[str], None] = print
         batch=spec.batch,
         seq_len=spec.seq_len,
         probes=probes,
+        device=torch.device("cpu"),
     )
     bpb = report.evaluate(
         model,
