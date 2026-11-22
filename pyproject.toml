@@ -50,6 +50,9 @@ ignore = ["D203", "D213", "N818"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D", "RUF002", "RUF003"]
+# The IQ suite deliberately generates Russian prompts; Cyrillic here is data,
+# not a typo, and RUF001's Latin lookalike suggestion would corrupt the tasks.
+"src/dormouse/eval/iq.py" = ["RUF001", "RUF002", "RUF003"]
 # The train package's docstrings are derivations. `σ`, `×` and `–` there are notation,
 # not typos: rewriting them as ASCII turns the formulas into something read as code.
 "src/dormouse/train/*" = ["RUF002", "RUF003"]
