@@ -1,0 +1,61 @@
+# smart_fast: one "smart + fast" run, assembled ONLY from the levers that survived
+# research/night/.bulba/research/iq-04-synthesis.md. No new mechanism is invented here.
+#
+# This is the same 401M topology as fastchat_400m.toml -- 400,985,812 stored /
+# 68,506,348 active -- priced with the conservative 6*P_stored*D bill. The honest
+# active size is 68.5M, NOT the chat-MT-Bench 400M-active / 3.8B-stored shape, which
+# does not fit. Every width below is a value the one spec prices and builds.
+#
+# Budget at D = 108,000,000 tokens (90M SYNTH-enriched pretrain + 30k-example SFT stage):
+#   6 * P_stored * D = 2.598e17 FLOP -> 1.965 h at 39.92% MFU of 92 TFLOP/s (2h gate)
+#   6 * P_active  * D = 4.437e16 FLOP -> 0.336 h (routed engine bill, always smaller)
+#
+# LEVER MANIFEST (lever|status|enabled|gate -- full table in docs/smart-fast.md):
+#   synth_static_25  | survived | on  | 25% static corpus, 0 FLOP, never x10; delta-test
+#   fp16_ns          | survived | on  | optimizer-only, cos>=0.9999 (engine commit 97630f4)
+#   graph_epilogue   | survived | on  | torch_compile + --graph, MFU 39.92% (commit c553a57)
+#   lns_replace_init | survived | on  | REPLACE write_std=0.02/sqrt(2L), 2.714696 +/- 0.10
+#   sft_pika_30k     | survived | on  | assistant-only loss, re-init chat embeddings
+#   verifier_1rollout| survived | on  | 1 rollout/prompt, verifier on held-out
+#   grpo_outcome_only| survived | on  | outcome-only; dense-MC and sc_k5 are RED
+#   iq_smoke         | survived | on  | random=0/oracle=1; the sole quality gate
+#   tst_r_0.3        | gated    | OFF | conflicts with mix_plan (COMPATIBILITY.md:38)
+#   xmod/fff/loop_l  | REFUTED  | OFF | never enabled -- see docs/smart-fast.md
+#   engram/mtp/jepa  | REFUTED  | OFF | never enabled -- see docs/smart-fast.md
+#   fsz/sc_k5        | REFUTED  | OFF | never enabled -- see docs/smart-fast.md
+#
+# PARSE CONTRACT: RunRecipe.read and StackSpec.from_toml refuse unknown keys, so the
+# levers above are NOT config flags at this HEAD. Engine settings (fp16 NS, graph
+# epilogue, LNS) are properties of the binary at the cited commits; data levers are
+# [[source]]/[[stage]] run-recipe entries; the run flags are `dorm train --graph`.
+# See docs/smart-fast.md for the exact wiring. Do NOT add `tst_r`, `lns`, `synth_share`
+# or `[flags]` here until spec.py carries them -- they would be silent no-ops.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"       # fp16 Newton-Schulz is the engine default (97630f4)
+objective = "ntp"        # TST is a separate objective, never in this mixed-source run
+weight_qat = "none"
+act_quant = "none"       # int4 x static compile is a documented conflict
+torch_compile = true     # whole-step CUDA graph + epilogue; pair with `dorm train --graph`
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 108_000_000
+throughput_tflops = 36.7264

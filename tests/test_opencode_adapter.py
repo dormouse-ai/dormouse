@@ -88,9 +88,13 @@ def http_generate(port: int) -> Callable[[str], str]:
 def test_stub_random_fails_and_oracle_passes_every_task() -> None:
     tasks = _tasks()
     with stub("RANDOM", 0) as port:
-        floor = [row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())]
+        floor = [
+            row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())
+        ]
     with stub("ORACLE", 0) as port:
-        ceiling = [row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())]
+        ceiling = [
+            row.score for row in evaluate(tasks, FunctionAdapter(http_generate(port)), MockJudge())
+        ]
     assert floor == [0.0] * len(tasks), floor
     assert ceiling == [1.0] * len(tasks), ceiling
 
