@@ -87,6 +87,9 @@ def solve(
         preflight_stub(port)
     env = os.environ.copy()
     env["DORMOUSE_STUB_PORT"] = str(port)
+    # OpenCode v2.2.7 `--format json` emits only step_start/step_finish events,
+    # NOT the assistant text (verified on-card 22.11). Default text mode prints
+    # a ``> solver · dormouse`` header then the reply, so parse that instead.
     cmd = [
         "opencode",
         "run",
@@ -94,9 +97,6 @@ def solve(
         "local/dormouse",
         "--agent",
         "solver",
-        "--format",
-        "json",
-        "--archived",
         "--standalone",
         prompt,
     ]
@@ -124,6 +124,16 @@ def solve(
         if proc.returncode != 0:
             raise SolverError(f"opencode exit {proc.returncode}: {proc.stderr[-400:]}")
         text = last_assistant_text(proc.stdout.splitlines())
+        if not text.strip():
+            # Fallback: default text mode prints '> solver · dormouse' plus the
+            # reply. The reply may appear before OR after the header depending
+            # on the build, so take the last non-empty, non-header line.
+            for line in reversed(proc.stdout.splitlines()):
+                stripped = line.strip()
+                if not stripped or stripped.startswith(">") and "·" in stripped:
+                    continue
+                text = stripped
+                break
         if not text.strip():
             raise ProtocolError(f"opencode returned no assistant text: {output[-400:]}")
         return text

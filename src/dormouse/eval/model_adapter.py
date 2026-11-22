@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 import string
 from pathlib import Path
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from .iq import Task
@@ -25,6 +26,20 @@ class ModelAdapter(Protocol):
     def generate(self, prompt: str) -> str:
         """Return one answer for one prompt."""
         ...
+
+
+class FunctionAdapter:
+    """Wrap a plain ``str -> str`` callable as a ModelAdapter.
+
+    The OpenCode solver exposes a one-argument ``solve(prompt)``; the IQ core
+    expects the ``ModelAdapter`` protocol. This is the bridge between them.
+    """
+
+    def __init__(self, fn: Callable[[str], str]) -> None:
+        self._fn = fn
+
+    def generate(self, prompt: str) -> str:
+        return self._fn(prompt)
 
 
 class KnownAdapter:

@@ -27,9 +27,12 @@ CHAT_PATH = "/v1/chat/completions"
 
 def oracle_answers(seed: int) -> dict[str, str]:
     """Return the exact prompt-to-answer map the harness scores against."""
-    from dormouse.eval.tasks import suite
+    from dormouse.eval.iq import build_suite
 
-    return {example.prompt: example.expected for task in suite(seed) for example in task.examples}
+    # IQ core exposes build_suite(seed) -> TaskSuite of Task(prompt, expected).
+    # The stub must answer exactly the prompts the scorer will ask, or ORACLE
+    # silently scores zero. Keep this import against the real module (grill/70).
+    return {task.prompt: task.expected for task in build_suite("smoke", seed=seed)}
 
 
 def _last_user_text(messages: object) -> str:
