@@ -39,6 +39,7 @@ import re
 import shutil
 from collections.abc import Callable
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -195,6 +196,7 @@ def _optimizer(
         schedule=recipe.schedule,
         lr_muon=recipe.lr_muon,
         lr_adamw=recipe.lr_adamw,
+        muon_ns_dtype=recipe.muon_ns_dtype,
         sf_warmup=cfg.warmup_steps,
     )
     if recipe.schedule != "cosine":
@@ -264,6 +266,7 @@ def train(
     until: int | None = None,
     approve: bool = False,
     graph: bool = False,
+    muon_ns_dtype: str | None = None,
     echo: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     """Run one config end to end and return its receipt: journal, numbers, artifact.
@@ -272,6 +275,8 @@ def train(
     parity gate passes; a capture that refuses is LOUD, never an eager fallback.
     """
     recipe = RunRecipe.read(config)
+    if muon_ns_dtype is not None:
+        recipe = replace(recipe, muon_ns_dtype=muon_ns_dtype)
     target = _resolve_device(recipe.spec.device)
     budget = SMOKE_STEPS if smoke else recipe.steps
     steps = budget if until is None else min(until, budget)

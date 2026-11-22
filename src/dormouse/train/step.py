@@ -198,7 +198,7 @@ def commit_step(
             counters.enable("opt_muon", counter="opt_muon", why="matrices step under Muon")
         if sizes["adamw"]:
             counters.enable("opt_adamw", counter="opt_adamw", why="vectors step under AdamW")
-    optimizer.step()
+    optimizer.step(counters=counters)
     if counters is not None:
         counters.count("opt_muon", sizes["muon"])
         counters.count("opt_adamw", sizes["adamw"])

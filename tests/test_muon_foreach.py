@@ -52,7 +52,9 @@ def _scalar_polar(batch: list[torch.Tensor], steps: int = NS_STEPS) -> list[torc
     return out
 
 
-def _scalar_many(batch: list[torch.Tensor], steps: int = NS_STEPS) -> list[torch.Tensor]:
+def _scalar_many(
+    batch: list[torch.Tensor], steps: int = NS_STEPS, *, ns_dtype: str = "fp32"
+) -> list[torch.Tensor]:
     return _scalar_polar(batch, steps)
 
 

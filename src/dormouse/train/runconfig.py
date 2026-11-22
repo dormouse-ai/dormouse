@@ -49,6 +49,7 @@ RUN_KEYS = frozenset(
         "stage",
         "eval",
         "schedule",
+        "muon_ns_dtype",
         "lr_muon",
         "lr_adamw",
         "warmup",
@@ -104,6 +105,7 @@ class RunRecipe:
     stages: tuple[MixStage, ...]
     eval_path: Path | None
     schedule: str
+    muon_ns_dtype: str
     lr_muon: float | None
     lr_adamw: float | None
     warmup: int | None
@@ -163,6 +165,7 @@ class RunRecipe:
             stages=stages,
             eval_path=None if held is None else (source.parent / str(held)).resolve(),
             schedule=str(raw.get("schedule", "cosine")),
+            muon_ns_dtype=str(raw.get("muon_ns_dtype", "fp32")),
             lr_muon=_rate(raw, "lr_muon"),
             lr_adamw=_rate(raw, "lr_adamw"),
             warmup=_count(raw, "warmup"),
@@ -188,6 +191,7 @@ class RunRecipe:
             stages=tuple(MixStage(str(item["name"]), item["until"]) for item in run["stages"]),
             eval_path=None if run["eval"] is None else Path(str(run["eval"])),
             schedule=str(run["schedule"]),
+            muon_ns_dtype=str(run.get("muon_ns_dtype", "fp32")),
             lr_muon=run["lr_muon"],
             lr_adamw=run["lr_adamw"],
             warmup=run["warmup"],
@@ -255,6 +259,7 @@ class RunRecipe:
                 "stages": [{"name": stage.name, "until": stage.until} for stage in self.stages],
                 "eval": None if self.eval_path is None else str(self.eval_path),
                 "schedule": self.schedule,
+                "muon_ns_dtype": self.muon_ns_dtype,
                 "lr_muon": self.lr_muon,
                 "lr_adamw": self.lr_adamw,
                 "warmup": self.warmup,

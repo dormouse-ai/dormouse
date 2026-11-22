@@ -127,9 +127,11 @@ def test_a_per_head_matrix_never_joins_a_whole_bucket_of_the_same_shape() -> Non
     calls: list[tuple[torch.Size, ...]] = []
     real_many = _polar_many
 
-    def recording_many(batch: list[torch.Tensor], steps: int = 5) -> list[torch.Tensor]:
+    def recording_many(
+        batch: list[torch.Tensor], steps: int = 5, *, ns_dtype: str = "fp32"
+    ) -> list[torch.Tensor]:
         calls.append(tuple(x.shape for x in batch))
-        return real_many(batch, steps=steps)
+        return real_many(batch, steps=steps, ns_dtype=ns_dtype)
 
     with patch("dormouse.train.muon._polar_many", recording_many):
         Muon(
