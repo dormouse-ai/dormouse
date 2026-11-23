@@ -168,7 +168,15 @@ def spectral_bound(x: torch.Tensor, iters: int = NS_POWER_ITERS) -> torch.Tensor
         v = _matmul(x.transpose(-2, -1), _matmul(x, v))
         v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
     bound: torch.Tensor = _matmul(x, v).norm(dim=(-2, -1), keepdim=True)
-    return bound
+    # A max-norm row can still be nearly orthogonal to the top right-singular
+    # vector; three iterations then under-estimate by >1.5x and the quintic
+    # leaves its basin. Refine only when the estimate is still moving fast, so
+    # a well-converged matrix keeps the shipped bound bit-for-bit.
+    for _ in range(iters):
+        v = _matmul(x.transpose(-2, -1), _matmul(x, v))
+        v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
+    refined: torch.Tensor = _matmul(x, v).norm(dim=(-2, -1), keepdim=True)
+    return torch.where(refined > bound * 1.05, refined, bound)
 
 
 def _prescale(
