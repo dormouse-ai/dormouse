@@ -55,6 +55,8 @@ import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
+from . import mfu40 as mfu40_kernels
+
 #: Absolute parity gate for the fp32 path; the derivation is in the module docstring.
 FP32_PARITY = 2e-6
 
@@ -184,6 +186,25 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
         u = tl.load(U + off, mask=mask, other=0.0).to(tl.float32)
         out = g * tl.sigmoid(g) * u
         tl.store(OUT + off, out.to(OUT.dtype.element_ty), mask=mask)
+
+    @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
+    def glu_bwd_kernel(G, U, DO, DG, DU, n, BLOCK: tl.constexpr, FP64: tl.constexpr):  # type: ignore[no-untyped-def]
+        """KO5: both GLU adjoints in one pass, no full-size temporaries."""
+        off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = off < n
+        if FP64:
+            g = tl.load(G + off, mask=mask, other=0.0)
+            u = tl.load(U + off, mask=mask, other=0.0)
+            d = tl.load(DO + off, mask=mask, other=0.0)
+        else:
+            g = tl.load(G + off, mask=mask, other=0.0).to(tl.float32)
+            u = tl.load(U + off, mask=mask, other=0.0).to(tl.float32)
+            d = tl.load(DO + off, mask=mask, other=0.0).to(tl.float32)
+        sig = tl.sigmoid(g)
+        tl.store(
+            DG + off, (d * u * sig * (1.0 + g * (1.0 - sig))).to(DG.dtype.element_ty), mask=mask
+        )
+        tl.store(DU + off, (d * g * sig).to(DU.dtype.element_ty), mask=mask)
 
     @triton.jit  # type: ignore[untyped-decorator]  # pragma: no cover - compiled on device
     def _activate(x, kind: tl.constexpr):  # type: ignore[no-untyped-def]
@@ -356,6 +377,7 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
             "grad": _grad,
             "residual_norm": residual_norm_kernel,
             "glu": glu_kernel,
+            "glu_bwd": glu_bwd_kernel,
             "mix": mix_kernel,
         }
     )
@@ -476,6 +498,18 @@ class _Glu(torch.autograd.Function):
         if d_out is None:
             return None, None
         gate, up = ctx.saved_tensors
+        if mfu40_kernels.enabled("KO5") and gate.is_cuda:
+            built = _require("glu_bwd")
+            width = gate.shape[-1]
+            gf, uf, df = _flat(gate, width), _flat(up, width), _flat(d_out, width)
+            dg, du = torch.empty_like(gf), torch.empty_like(uf)
+            n = gf.numel()
+            block = 1024
+            built["glu_bwd"][((n + block - 1) // block,)](
+                gf, uf, df, dg, du, n, block, gate.dtype == torch.float64
+            )
+            mfu40_kernels.count("ko5_glu_bwd_fused")
+            return dg.view(gate.shape), du.view(up.shape)
         d = d_out.detach().float().reshape(-1)
         g = gate.detach().float().reshape(-1)
         u = up.detach().float().reshape(-1)

@@ -45,6 +45,8 @@ from typing import Any, cast
 import torch
 from dormouse_core.errors import LoudError
 
+from . import mfu40 as mfu40_kernels
+
 #: One program owns one query, and reads its `BN` keys at a time. 64 is two sectors per
 #: row at `d = 64` and keeps a `[BN, d]` fp32 tile at 16 KiB, which is what lets the
 #: forward run at 4 warps without spilling (`tools/bench_sparse.py` prints `n_regs`).
@@ -53,7 +55,7 @@ BN = 128
 #: The backward holds `k`, `v`, `p` and the two atomic tiles at once, so it reads 64 keys
 #: at a time; measured, 128 there is 167 registers (two thirds of the file) and 41 ms
 #: against this one's 23.
-BN_BWD = 64
+BN_BWD = 32 if mfu40_kernels.enabled("KO3") else 64
 
 #: Warps per program. One query is a 64-wide row, so 4 warps already cover it and the
 #: extra warps only buy latency hiding on the scattered loads.
@@ -68,7 +70,7 @@ STAGES = 2
 #: so many queries vote for the same key row, and one fp32 buffer serialises those
 #: atomics. Measured on the layer's own map: 50.6 ms per backward at one copy, 25 ms at
 #: eight (16.8 MiB each, summed once: 134 MiB of read per tensor per layer).
-SHARDS = 8
+SHARDS = 4 if mfu40_kernels.enabled("KO3") else 8
 
 _KERNELS: dict[str, Any] = {}
 _LAUNCHES = 0
@@ -196,6 +198,67 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
         tl.store(ML + 2 * pid + 1, norm)
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def fwd_single_kernel(  # type: ignore[no-untyped-def]
+        Q,
+        K,
+        V,
+        AT,
+        VIS,
+        OUT,
+        ML,
+        S,
+        H,
+        D: tl.constexpr,
+        KEEP: tl.constexpr,
+        BN: tl.constexpr,
+        BD: tl.constexpr,
+        SCALE: tl.constexpr,
+    ):
+        """KO3: one online-softmax pass; each key row and index slot is fetched once."""
+        pid = tl.program_id(0)
+        qpos = pid % S
+        bh = pid // S
+        batch = bh // H
+        head = bh % H
+        off = bh * S * D
+        cols = tl.arange(0, BD)
+        dcol = cols < D
+        q = tl.load(Q + off + qpos * D + cols, mask=dcol, other=0.0).to(tl.float32)
+        at_row = AT + (batch * S + qpos) * KEEP
+        vis_row = VIS + (batch * S + qpos) * KEEP
+        mx = float("-inf")
+        norm = 0.0
+        acc = tl.zeros([BD], tl.float32)
+        for n0 in range(0, KEEP, BN):
+            n = n0 + tl.arange(0, BN)
+            nmask = n < KEEP
+            idx = tl.load(at_row + n, mask=nmask, other=0)
+            vis = tl.load(vis_row + n, mask=nmask, other=0)
+            k = tl.load(
+                K + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            s = tl.sum(k * q[None, :], 1) * SCALE
+            s = tl.where((vis != 0) & nmask, s, float("-inf"))
+            new_m = tl.maximum(mx, tl.max(s, 0))
+            safe = tl.where(new_m == float("-inf"), 0.0, new_m)
+            alpha = tl.exp(mx - safe)
+            p = tl.where(s == float("-inf"), 0.0, tl.exp(s - safe))
+            v = tl.load(
+                V + off + idx[:, None] * D + cols[None, :],
+                mask=nmask[:, None] & dcol[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            acc = acc * alpha + tl.sum(p[:, None] * v, 0)
+            norm = norm * alpha + tl.sum(p, 0)
+            mx = new_m
+        o = acc / tl.maximum(norm, 1e-30)
+        tl.store(OUT + (batch * S + qpos) * H * D + head * D + cols, o, mask=dcol)
+        tl.store(ML + 2 * pid, mx)
+        tl.store(ML + 2 * pid + 1, norm)
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def bwd_kernel(  # type: ignore[no-untyped-def]
         Q,
         K,
@@ -273,7 +336,12 @@ def _build() -> dict[str, Any] | None:  # pragma: no cover - requires triton + a
             )
         tl.store(DQ + off + qpos * D + cols, dq, mask=dcol)
 
-    _KERNELS.update({"fwd": fwd_kernel, "bwd": bwd_kernel})
+    _KERNELS.update(
+        {
+            "fwd": fwd_single_kernel if mfu40_kernels.enabled("KO3") else fwd_kernel,
+            "bwd": bwd_kernel,
+        }
+    )
     return _KERNELS
 
 
@@ -307,6 +375,8 @@ def _sparse_compute(  # pragma: no cover - the launches are the card's
     out = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
     ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
     _count(1)
+    if mfu40_kernels.enabled("KO3"):
+        mfu40_kernels.count("ko3_sparse_single_pass")
     built["fwd"][(batch * heads * seq,)](
         *flat,
         idx,
@@ -359,6 +429,8 @@ class _Sparse(torch.autograd.Function):
         )
         dv = torch.zeros_like(dk)
         _count(1)
+        if mfu40_kernels.enabled("KO3"):
+            mfu40_kernels.count("ko3_sparse_single_pass")
         built["bwd"][(batch * heads * seq,)](
             qh,
             kh,

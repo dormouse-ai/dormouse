@@ -61,6 +61,7 @@ from dormouse_core.errors import LoudError
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ...kernels import mfu40 as mfu40_kernels
 from ...kernels.kda_fla import chunk_kda_fla, fla_requested
 from ..blocks import PROJ_STD
 from .projections import LatentProjections
@@ -372,6 +373,8 @@ class KDA(LatentProjections):
         the logged form carried, so a fully decayed channel still gives a finite ratio
         and an exact `a_t/a_i = 1` pair instead of `-inf - (-inf)`.
         """
+        if mfu40_kernels.enabled("KO1"):
+            return self._chunks_batched_solves(q, k, v, alpha, beta)
         chunk = q.shape[-2]
         incl = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
         strict = torch.tril(incl, -1)
@@ -404,6 +407,48 @@ class KDA(LatentProjections):
                 unitriangular=True,
             ).to(q.dtype)
             out.append(qi @ state + qk[..., index, :, :] @ pseudo)
+            state = last[..., index, :].unsqueeze(-1) * state + torch.einsum(
+                "bhtd,bhtv->bhdv", carried[..., index, :, :], pseudo
+            )
+        return torch.stack(out, dim=-3), state
+
+    def _chunks_batched_solves(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """KO1: two batched solves; ``A⁻¹(β(v-keyed·S)) = A⁻¹(βv) − (A⁻¹β·keyed)·S``."""
+        mfu40_kernels.count("ko1_attn_batched_solves")
+        chunk = q.shape[-2]
+        incl = torch.tril(torch.ones(chunk, chunk, dtype=torch.bool, device=q.device))
+        strict = torch.tril(incl, -1)
+        a = torch.cumprod(alpha, dim=-2)
+        divided = k * a.clamp_min(1e-12).reciprocal()
+        keyed = a * k
+        as_query = a * q
+        divided_t = divided.transpose(-1, -2)
+        gram = (keyed @ divided_t).masked_fill(~strict, 0.0)
+        qk = (as_query @ divided_t).masked_fill(~incl, 0.0)
+        carried = a[..., -1, :].unsqueeze(-2) * divided
+        last = a[..., -1, :]
+        width = q.shape[-1]
+        work = torch.promote_types(q.dtype, torch.float32)
+        step = beta.unsqueeze(-1)
+        system = (step * gram).to(work)
+        part_v = torch.linalg.solve_triangular(
+            system, (step * v).to(work), upper=False, unitriangular=True
+        ).to(q.dtype)
+        part_k = torch.linalg.solve_triangular(
+            system, (step * keyed).to(work), upper=False, unitriangular=True
+        ).to(q.dtype)
+        state = q.new_zeros(*q.shape[:2], width, width)
+        out: list[torch.Tensor] = []
+        for index in range(q.shape[-3]):
+            pseudo = part_v[..., index, :, :] - part_k[..., index, :, :] @ state
+            out.append(as_query[..., index, :, :] @ state + qk[..., index, :, :] @ pseudo)
             state = last[..., index, :].unsqueeze(-1) * state + torch.einsum(
                 "bhtd,bhtv->bhdv", carried[..., index, :, :], pseudo
             )
