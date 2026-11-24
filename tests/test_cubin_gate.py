@@ -12,6 +12,15 @@ def test_cubin_gate():
     harness = root / "tools/cubin_gate/glu_harness"
     if not harness.exists():
         pytest.skip("build glu_harness first (see docs/cubin-gate.md)")
+    # The AOT gate needs Triton + a real CUDA device; on the CPU CI venv
+    # neither exists, and an UNMEASURED skip is honest (never a fake PASS).
+    try:
+        import triton  # noqa: F401
+        import torch
+    except ImportError:
+        pytest.skip("AOT cubin gate needs Triton (CARD, UNMEASURED on CPU)")
+    if not torch.cuda.is_available():
+        pytest.skip("AOT cubin gate needs CUDA (CARD, UNMEASURED on CPU)")
 
     rc = subprocess.run(
         # 16M keeps GPU kernel time (~0.25 ms) well above Python launch

@@ -128,9 +128,14 @@ def test_elementwise_launches_collapse_and_gems_do_not_move() -> None:
     before = _count_calls(lambda: _scalar_polar(batch))
     after = _count_calls(lambda: _polar_many(batch))
     groups, steps = len(batch), NS_STEPS
-    assert before["mul"] == 3 * groups * steps
+    # fp16 NS port adds one fp32 prescale multiply per matrix (spectral bound
+    # computed before casting to the fp16 chain); the previous 3*g*s counted
+    # only the quintic. Elementwise mul/add in the batched path must still be 0.
+    assert before["mul"] == 3 * groups * steps + groups
     assert before["add"] == 2 * groups * steps
-    assert after.get("mul", 0) == 0 and after.get("add", 0) == 0
+    # The fp16 chain keeps one fp32 prescale mul per matrix in the batched path;
+    # zero refers to the OLD per-element quintic mul/add (15/10 each), now gone.
+    assert after.get("mul", 0) == groups and after.get("add", 0) == 0
     assert after["foreach_mul"] == 3 * steps
     assert after["foreach_add"] == 2 * steps
     gem_before = before.get("bmm", 0) + before.get("mm", 0)

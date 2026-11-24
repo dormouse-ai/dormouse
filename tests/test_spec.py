@@ -184,6 +184,9 @@ def test_the_other_config_files_are_gone() -> None:
         # manifest; tests/test_smart_fast.py prices it.
         "smart_fast.toml",
         "smoke.toml",
+        # The 500M-active / 20B-total training target is the same stack at wider
+        # widths; tests/test_cfg500.py prices it and pins the digest.
+        "train_500m_20b.toml",
     ]
 
 
