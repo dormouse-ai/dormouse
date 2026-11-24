@@ -499,12 +499,18 @@ def _sparse_op_fake(  # pragma: no cover - only dynamo's fake path reaches it
     batch, seq, heads, width = q.shape
     keep = at.shape[-1]
     write = q.new_empty((batch, seq, heads, width))
-    plane = q.new_empty((batch, heads, seq, width))
+    # N3 P0: fake must allocate SEPARATE tensors for qh/kh/vh. Aliasing one
+    # `plane` made autograd's compiled path see a shared destination and
+    # silently produce wrong dq/dk/dv (maxdiff 0.6-0.9) with correct forward.
+    qh = q.new_empty((batch, heads, seq, width))
+    kh = q.new_empty((batch, heads, seq, width))
+    vh = q.new_empty((batch, heads, seq, width))
     idx = q.new_empty((batch, seq, keep), dtype=torch.int32)
     vis = q.new_empty((batch, seq, keep), dtype=torch.uint8)
     raw = torch.empty((batch, seq, heads, width), dtype=torch.float32, device=q.device)
+    # N3 P1 was about the LIBRARY fake; this app op really returns (b*h*s, 2).
     ml = torch.empty((batch * heads * seq, 2), dtype=torch.float32, device=q.device)
-    return write, plane, plane, plane, idx, vis, raw, ml
+    return write, qh, kh, vh, idx, vis, raw, ml
 
 
 def _sparse_setup(ctx: Any, inputs: tuple[Any, ...], output: tuple[torch.Tensor, ...]) -> None:
