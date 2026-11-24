@@ -12,6 +12,7 @@ it measures. See ``docs/iq-harness.md`` for the ceiling.
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 import re
 import unicodedata
@@ -26,6 +27,11 @@ from dormouse_core.errors import LoudError
 __concepts__ = ("BlindJudge", "MockJudge", "Row", "Score", "Task", "TaskSuite")
 
 SCHEMA_VERSION = 1
+
+#: No number from this harness may be reported as IQ without a named human anchor.
+IQ_REFUTED = "IQ_REFUTED"
+#: The pre-registered minimum for a quality claim; smoke (n=10) is a signal only.
+MIN_QUALITY_N = 50
 
 #: The three ways an answer can be checked, all without a network judge.
 type TaskKind = Literal["exact", "code", "choice"]
@@ -63,7 +69,12 @@ class Score:
     reason: str
 
     def __post_init__(self) -> None:
-        """Refuse the verdict that says nothing about why it failed."""
+        """Refuse a non-rate verdict and the failure that says why it failed."""
+        if not math.isfinite(self.value) or not 0.0 <= self.value <= 1.0:
+            raise LoudError(
+                f"score {self.value!r} is not a finite rate in [0, 1]",
+                "a judge reports passes / n, a finite number between zero and one",
+            )
         if self.value == 0.0 and not self.reason.strip():
             raise LoudError(
                 "score 0 without reason",
@@ -166,6 +177,31 @@ def evaluate(
     if counters is not None:
         counters.check()
     return rows
+
+
+def wilson_95(successes: int, n: int) -> tuple[float, float]:
+    """Wilson 95% interval for a pass rate, declared before the run."""
+    if n <= 0 or not 0 <= successes <= n:
+        raise LoudError(
+            f"Wilson interval needs 0 <= k <= n, got k={successes}, n={n}",
+            "count passes out of a positive number of examples",
+        )
+    z = 1.959963984540054
+    rate = successes / n
+    denom = 1 + z * z / n
+    centre = (rate + z * z / (2 * n)) / denom
+    half = z * math.sqrt(rate * (1 - rate) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def iq_verdict(*, blind_kappa: float | None = None, anchor: str = "") -> str:
+    """Refuse every IQ claim until blind kappa against a named human anchor exists."""
+    if blind_kappa is None or not anchor or not math.isfinite(blind_kappa):
+        return IQ_REFUTED
+    return (
+        f"blind-kappa={blind_kappa:.3f} vs {anchor} measured; "
+        "IQ is not an instrument here, no number claimed"
+    )
 
 
 def arithmetic(seed: int = 0, n: int = 4) -> tuple[Task, ...]:
@@ -301,6 +337,8 @@ class TaskSuite:
 
 __all__ = [
     "DEFAULT_FIXTURE",
+    "IQ_REFUTED",
+    "MIN_QUALITY_N",
     "SCHEMA_VERSION",
     "BlindJudge",
     "MockJudge",
@@ -316,6 +354,8 @@ __all__ = [
     "factual",
     "filling",
     "from_fixture",
+    "iq_verdict",
     "normalize",
     "score",
+    "wilson_95",
 ]

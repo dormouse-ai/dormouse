@@ -10,17 +10,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import time
+import urllib.request
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
+
+from dormouse_core.errors import LoudError
 
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT = 60.0
 MAX_RETRIES = 3
 REPO_ROOT = Path(__file__).resolve().parent.parent
 Generate = Callable[[str, int, Sequence[str]], str]
+
+_RATE_PHRASE = re.compile(r"rate\s*limit|too\s+many\s+requests", re.IGNORECASE)
+_HTTP_429 = re.compile(r"(?:http|status|error|code)\s*[:=]?\s*429\b", re.IGNORECASE)
+_STATUS_KEYS = ("code", "status", "status_code")
+_ANSWER_LABELS = ("the answer is", "answer:")
+_FOOTER_PREFIXES = ("[tokens:", "[cost:", "[time:", "[duration:", "[steps:")
 
 
 class SolverError(RuntimeError):
@@ -67,10 +77,80 @@ def preflight_stub(port: int, *, host: str = "127.0.0.1", timeout: float = 2.0) 
         raise StubUnavailable(f"stub not reachable at {host}:{port}: {exc}") from exc
 
 
+def _error_status_429(event: object) -> bool:
+    """Read an explicit 429 from a provider error object, never from answer text."""
+    if not isinstance(event, dict):
+        return False
+    for key in ("detail", "error"):
+        if _error_status_429(event.get(key)):
+            return True
+    for key in _STATUS_KEYS:
+        value = event.get(key)
+        if (isinstance(value, int) and value == 429) or (
+            isinstance(value, str) and value.strip() == "429"
+        ):
+            return True
+    return False
+
+
 def _is_rate_limit(output: str) -> bool:
-    """Detect the common rate-limit phrasings in provider output."""
-    lowered = output.lower()
-    return any(mark in lowered for mark in ("rate limit", "too many requests", "429"))
+    """Detect a rate limit without treating an answer containing 429 as one."""
+    if _RATE_PHRASE.search(output) or _HTTP_429.search(output):
+        return True
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if _error_status_429(event):
+            return True
+    return False
+
+
+def _is_json_object(line: str) -> bool:
+    """Parse a line only when it is a JSON object, skipping plain text."""
+    try:
+        return isinstance(json.loads(line), dict)
+    except json.JSONDecodeError:
+        return False
+
+
+def text_mode_answer(stdout: str) -> str:
+    """Return the assistant text of a text-mode reply, not its header or footer."""
+    kept: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(">"):
+            continue
+        if stripped.startswith(_FOOTER_PREFIXES):
+            continue
+        if stripped.lower().rstrip(":") in _ANSWER_LABELS:
+            continue
+        if _is_json_object(stripped):
+            continue  # NDJSON tail carries step events, not the answer
+        kept.append(stripped)
+    return "\n".join(kept)
+
+
+def check_stub_binding(port: int, *, seed: int | None = None, suite: str | None = None) -> None:
+    """Refuse a stub whose reported seed/suite differs from the harness's."""
+    if seed is None and suite is None:
+        return
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/config", timeout=5) as resp:
+            config = json.load(resp)
+    except (OSError, ValueError) as exc:
+        raise StubUnavailable(f"stub {port} cannot report its suite/seed: {exc}") from exc
+    if seed is not None and config.get("seed") != seed:
+        raise LoudError(
+            f"stub seed {config.get('seed')} != harness seed {seed}",
+            "start the stub with --seed equal to the harness seed",
+        )
+    if suite is not None and config.get("suite") != suite:
+        raise LoudError(
+            f"stub suite {config.get('suite')} != harness suite {suite}",
+            "start the stub with --suite equal to the harness suite",
+        )
 
 
 def solve(
@@ -80,11 +160,14 @@ def solve(
     timeout: float = DEFAULT_TIMEOUT,
     max_retries: int = MAX_RETRIES,
     preflight: bool = True,
+    seed: int | None = None,
+    suite: str | None = None,
 ) -> str:
     """Run one isolated OpenCode session and return its final assistant text."""
     port = port if port is not None else int(os.environ.get("DORMOUSE_STUB_PORT", DEFAULT_PORT))
     if preflight:
         preflight_stub(port)
+    check_stub_binding(port, seed=seed, suite=suite)
     env = os.environ.copy()
     env["DORMOUSE_STUB_PORT"] = str(port)
     # OpenCode v2.2.7 `--format json` emits only step_start/step_finish events,
@@ -125,15 +208,7 @@ def solve(
             raise SolverError(f"opencode exit {proc.returncode}: {proc.stderr[-400:]}")
         text = last_assistant_text(proc.stdout.splitlines())
         if not text.strip():
-            # Fallback: default text mode prints '> solver · dormouse' plus the
-            # reply. The reply may appear before OR after the header depending
-            # on the build, so take the last non-empty, non-header line.
-            for line in reversed(proc.stdout.splitlines()):
-                stripped = line.strip()
-                if not stripped or (stripped.startswith(">") and "·" in stripped):
-                    continue
-                text = stripped
-                break
+            text = text_mode_answer(proc.stdout)
         if not text.strip():
             raise ProtocolError(f"opencode returned no assistant text: {output[-400:]}")
         return text

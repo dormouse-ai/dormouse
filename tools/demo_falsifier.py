@@ -40,10 +40,10 @@ def wait_port(port: int, timeout: float = 10.0) -> None:
     raise RuntimeError(f"stub did not listen on {port}")
 
 
-def score_via_opencode(port: int, seed: int) -> float:
-    """Score the smoke suite through provider local/dormouse, not a mock adapter."""
-    suite = build_suite("smoke", seed=seed)
-    generate = opencode_solver.make_generate(port=port)
+def score_via_opencode(port: int, seed: int, suite_name: str) -> float:
+    """Score one suite through provider local/dormouse, bound to the stub's config."""
+    suite = build_suite(suite_name, seed=seed)
+    generate = opencode_solver.make_generate(port=port, seed=seed, suite=suite_name)
     adapter = FunctionAdapter(lambda prompt: generate(prompt, 96, ()))
     rows = evaluate(suite.tasks, adapter, MockJudge())
     for row in rows:
@@ -52,9 +52,9 @@ def score_via_opencode(port: int, seed: int) -> float:
     return sum(row.score for row in rows) / len(rows)
 
 
-def score_inprocess(model: str, seed: int) -> float:
+def score_inprocess(model: str, seed: int, suite_name: str) -> float:
     """Report the iq_eval.py floor/ceiling for a same-run comparison."""
-    suite = build_suite("smoke", seed=seed)
+    suite = build_suite(suite_name, seed=seed)
     if model == "mock":
         from dormouse.eval.model_adapter import RandomAdapter
 
@@ -72,14 +72,15 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--port", type=int, default=18765)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--suite", choices=("smoke", "full"), default="smoke")
     p.add_argument("--floor-only", action="store_true", help="in-process scores, no OpenCode")
     args = p.parse_args()
 
-    suite = build_suite("smoke", seed=args.seed)
-    print(f"smoke tasks={len(suite)} seed={args.seed}")
+    suite = build_suite(args.suite, seed=args.seed)
+    print(f"{args.suite} tasks={len(suite)} seed={args.seed}")
     print(
-        f"iq_eval in-process: mock={score_inprocess('mock', args.seed):.3f} "
-        f"known={score_inprocess('known', args.seed):.3f}"
+        f"iq_eval in-process: mock={score_inprocess('mock', args.seed, args.suite):.3f} "
+        f"known={score_inprocess('known', args.seed, args.suite):.3f}"
     )
     if args.floor_only:
         return 0
@@ -91,6 +92,7 @@ def main() -> int:
         env["DORMOUSE_STUB_PORT"] = str(args.port)
         env["STUB_MODE"] = mode
         env["STUB_SEED"] = str(args.seed)
+        env["STUB_SUITE"] = args.suite
         server = subprocess.Popen(
             [
                 sys.executable,
@@ -101,6 +103,8 @@ def main() -> int:
                 mode,
                 "--seed",
                 str(args.seed),
+                "--suite",
+                args.suite,
             ],
             cwd=ROOT,
             env=env,
@@ -109,7 +113,7 @@ def main() -> int:
         )
         try:
             wait_port(args.port)
-            scores[mode] = score_via_opencode(args.port, args.seed)
+            scores[mode] = score_via_opencode(args.port, args.seed, args.suite)
         finally:
             server.terminate()
             try:

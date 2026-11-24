@@ -23,14 +23,16 @@ From the repository root (OpenCode discovers `opencode.jsonc` and `.opencode/` t
 export DORMOUSE_STUB_PORT=8765
 PYTHONPATH=src python tools/stub_server.py --mode ORACLE --seed 0 &
 opencode models | grep local/dormouse
-python tools/opencode_solver.py "What is 964 + 494?
-Answer:"                       # 1458
+python tools/opencode_solver.py "What is 51 + 55?
+Answer:"                         # 106
 python -m pytest tests/test_opencode_adapter.py -q
 ```
 
-`STUB_MODE` and `STUB_SEED` environment variables work in place of `--mode` and
-`--seed`. `RANDOM` emits seeded noise, `ORACLE` answers from `suite(seed)` itself,
-`ECHO` returns the prompt (wiring probe). Stop the server after the run.
+`STUB_MODE`, `STUB_SEED` and `STUB_SUITE` work in place of `--mode`, `--seed` and
+`--suite`. `RANDOM` emits seeded noise, `ORACLE` answers from the same suite/seed
+the scorer uses, `ECHO` returns the prompt (wiring probe). The stub reports its
+config at `/v1/config`; a mismatched suite or seed is a refusal, never a low score.
+Stop the server after the run.
 
 To score a suite through the real bridge:
 

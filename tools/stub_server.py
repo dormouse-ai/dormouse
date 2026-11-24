@@ -22,17 +22,18 @@ from typing import ClassVar
 
 DEFAULT_PORT = 8765
 MODES = ("RANDOM", "ORACLE", "ECHO")
+SUITES = ("smoke", "full")
 CHAT_PATH = "/v1/chat/completions"
+CONFIG_PATH = "/v1/config"
 
 
-def oracle_answers(seed: int) -> dict[str, str]:
-    """Return the exact prompt-to-answer map the harness scores against."""
+def oracle_answers(seed: int, suite: str = "smoke") -> dict[str, str]:
+    """Return the reference map for the same suite and seed the harness scores."""
     from dormouse.eval.iq import build_suite
 
-    # IQ core exposes build_suite(seed) -> TaskSuite of Task(prompt, expected).
     # The stub must answer exactly the prompts the scorer will ask, or ORACLE
     # silently scores zero. Keep this import against the real module (grill/70).
-    return {task.prompt: task.expected for task in build_suite("smoke", seed=seed)}
+    return {task.prompt: task.expected for task in build_suite(suite, seed=seed)}
 
 
 def _last_user_text(messages: object) -> str:
@@ -77,7 +78,15 @@ class StubHandler(BaseHTTPRequestHandler):
 
     mode: str = "RANDOM"
     seed: int = 0
+    suite: str = "smoke"
     answers: ClassVar[dict[str, str]] = {}
+
+    def do_GET(self) -> None:
+        """Report the suite/seed the harness must bind to, or 404."""
+        if self.path.split("?", 1)[0].rstrip("/") != CONFIG_PATH:
+            self.send_error(404)
+            return
+        self._send_json({"mode": self.mode, "seed": self.seed, "suite": self.suite})
 
     def do_POST(self) -> None:
         """Answer a Chat Completions request."""
@@ -154,12 +163,19 @@ def main() -> None:
     )
     parser.add_argument("--mode", choices=MODES, default=os.environ.get("STUB_MODE", "RANDOM"))
     parser.add_argument("--seed", type=int, default=int(os.environ.get("STUB_SEED", "0")))
+    parser.add_argument("--suite", choices=SUITES, default=os.environ.get("STUB_SUITE", "smoke"))
     args = parser.parse_args()
     StubHandler.mode = args.mode
     StubHandler.seed = args.seed
-    StubHandler.answers = oracle_answers(args.seed) if args.mode == "ORACLE" else {}
+    StubHandler.suite = args.suite
+    StubHandler.answers = (
+        oracle_answers(args.seed, suite=args.suite) if args.mode == "ORACLE" else {}
+    )
     server = ThreadingHTTPServer(("127.0.0.1", args.port), StubHandler)
-    print(f"stub {args.mode} seed={args.seed} on http://127.0.0.1:{args.port}/v1", flush=True)
+    print(
+        f"stub {args.mode} suite={args.suite} seed={args.seed} on http://127.0.0.1:{args.port}/v1",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

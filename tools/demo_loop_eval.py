@@ -1,11 +1,11 @@
-"""F2/F3/F4: paired IQ-smoke A/B of the S6 loop graft on a real checkpoint.
+"""F2/F3/F4: paired smoke-signal A/B of the S6 loop graft on a real checkpoint.
 
     PYTHONPATH=src taskset -c 4 python tools/demo_loop_eval.py \
       --checkpoint runs/demo_200m/export/model.pt
 
-Scores IQ_smoke_base and IQ_smoke_loop on 3 seeds, counts per-task wins/regressions,
-measures CUDA-event min-of-7 decode latency, and refuses to call a non-green result a
-quality win. The wrapper adds zero training FLOP and leaves state_dict bitwise identical.
+Scores smoke_base and smoke_loop on 3 seeds, counts per-task wins/regressions,
+measures min-of-7 decode latency, and emits smoke-signal (not IQ, not a quality win)
+until n>=50 with pre-registered Wilson-95 bounds. The wrapper adds zero training FLOP.
 """
 
 from __future__ import annotations
@@ -21,9 +21,32 @@ sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
 
-from dormouse.eval.iq import MockJudge, build_suite, evaluate  # noqa: E402
+from dormouse.eval.iq import (  # noqa: E402
+    MIN_QUALITY_N,
+    MockJudge,
+    build_suite,
+    evaluate,
+    iq_verdict,
+    wilson_95,
+)
 from dormouse.eval.model_adapter import CheckpointAdapter  # noqa: E402
 from tools.demo_loops import graft, polynomial_weights  # noqa: E402
+
+
+def loop_gate(*, n: int, wins: int, regressions: int, latency_ratio: float) -> dict[str, object]:
+    """Pre-register n>=50 and Wilson-95 before any quality claim; smoke stays a signal."""
+    lower, upper = wilson_95(wins, n)
+    verdict = "smoke-signal"
+    if n >= MIN_QUALITY_N:
+        verdict = (
+            "PASS" if lower >= 0.60 and regressions == 0 and latency_ratio <= 2.0 else "REFUTE"
+        )
+    return {
+        "n": n,
+        "wilson_95": (lower, upper),
+        "verdict": verdict,
+        "iq_verdict": iq_verdict(),
+    }
 
 
 def score(adapter: object, seed: int) -> dict[str, float | int]:
@@ -97,8 +120,8 @@ def main() -> int:
         wins = sum(1 for k in a if b[k] > a[k])
         regressions = sum(1 for k in a if b[k] < a[k])
         per_seed[str(seed)] = {
-            "IQ_smoke_base": sum(a.values()) / len(a),
-            "IQ_smoke_loop": sum(b.values()) / len(b),
+            "smoke_base": sum(a.values()) / len(a),
+            "smoke_loop": sum(b.values()) / len(b),
             "wins": wins,
             "regressions": regressions,
             "per_task_base": a,
@@ -128,21 +151,18 @@ def main() -> int:
 
     total_wins = sum(v["wins"] for v in per_seed.values())
     total_reg = sum(v["regressions"] for v in per_seed.values())
+    n = sum(len(v["per_task_base"]) for v in per_seed.values())
     ratio = results["latency_ms"]["ratio"]
-    green = total_wins >= 3 and total_reg == 0 and ratio <= 2.0
-    results["gate"] = {
-        "wins_ge_3": total_wins >= 3,
-        "zero_regressions": total_reg == 0,
-        "latency_le_2x": ratio <= 2.0,
-        "verdict": "GREEN" if green else "REFUTE",
-    }
-    # F3/F4 are conditional on F2 green; an honest kill is recorded otherwise.
+    gate = loop_gate(n=n, wins=total_wins, regressions=total_reg, latency_ratio=ratio)
+    results["gate"] = gate
+    # F3/F4 are conditional on a pre-registered PASS; a smoke-signal cannot unlock them.
+    quality = gate["verdict"] == "PASS"
     results["F3_anchor"] = {
-        "status": "not_run" if not green else "pending",
+        "status": "not_run" if not quality else "pending",
         "rule": "h'=x1+omega(x1-x~); omega sweep, kill at delta<=0",
     }
     results["F4_polynomial"] = {
-        "status": "not_run" if not green else "pending",
+        "status": "not_run" if not quality else "pending",
         "weights_K3": polynomial_weights(3),
     }
 
@@ -150,13 +170,13 @@ def main() -> int:
     args.out.write_text(json.dumps(results, indent=1, default=str) + "\n")
     print("baseline|looped|Δtasks|regressions|latency ratio|state bitwise|verdict")
     print(
-        f"{sum(v['IQ_smoke_base'] for v in per_seed.values()) / len(per_seed):.3f}|"
-        f"{sum(v['IQ_smoke_loop'] for v in per_seed.values()) / len(per_seed):.3f}|"
+        f"{sum(v['smoke_base'] for v in per_seed.values()) / len(per_seed):.3f}|"
+        f"{sum(v['smoke_loop'] for v in per_seed.values()) / len(per_seed):.3f}|"
         f"{total_wins}|{total_reg}|{ratio:.3f}|{results['state_dict_bitwise']}|"
-        f"{results['gate']['verdict']}"
+        f"{gate['verdict']}|{gate['iq_verdict']}"
     )
     print(f"results: {args.out}")
-    return 0 if green else 1
+    return 0 if quality else 1
 
 
 if __name__ == "__main__":
