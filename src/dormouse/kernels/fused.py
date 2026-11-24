@@ -134,6 +134,11 @@ def set_fused(on: bool) -> None:
     _FUSED = bool(on)
 
 
+def flag_on() -> bool:
+    """Return the requested regime, independent of whether this machine can run it."""
+    return _FUSED
+
+
 def fused() -> bool:
     """Return whether the fused path is on.
 

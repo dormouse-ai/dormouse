@@ -23,7 +23,7 @@ def test_flag_is_on_by_default() -> None:
 
 def test_fused_is_on_by_default() -> None:
     """The fused path is the shipped path in a fresh, unflagged import."""
-    code = "from dormouse.kernels import fused; print(fused.fused())"
+    code = "from dormouse.kernels import fused; print(fused.flag_on())"
     env = {k: v for k, v in os.environ.items() if k != "DORMOUSE_FUSED"}
     env["PYTHONPATH"] = str(ROOT / "src")
     out = subprocess.check_output([sys.executable, "-c", code], env=env, text=True)

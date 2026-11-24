@@ -67,8 +67,13 @@ def test_log_decay_keeps_an_external_fp64_anchor() -> None:
     assert np.allclose(alpha.detach().numpy(), want, atol=1e-12, rtol=0)
 
 
-def test_qb_bias_is_absent_from_the_bank_checkpoint() -> None:
-    """moe.py owns a Router: neither the router nor the bank may persist its QB bias."""
+def test_qb_bias_is_checkpointed_but_finite_and_centered() -> None:
+    """B1: QB bias MUST be in the checkpoint for bit-exact resume/eval.
+
+    N2's fix is the fp32 softplus+clamp that keeps it finite; removing the bias
+    from state_dict broke resume (8/20 losses off by 7.5e-4). The guard here is
+    that the persisted load controller is finite and zero-mean, not absent.
+    """
     bank = MoEFFN(
         d_model=16,
         d_ffn=12,
@@ -79,14 +84,18 @@ def test_qb_bias_is_absent_from_the_bank_checkpoint() -> None:
         min_expert_params=0,
     )
     assert isinstance(bank.router, Router)
-    assert "bias" not in bank.router.state_dict()
-    assert not any(key.startswith("router.bias") for key in bank.state_dict())
+    assert "bias" in bank.router.state_dict()
+    assert any(key.startswith("router.bias") for key in bank.state_dict())
+    bias = bank.router.state_dict()["bias"]
+    assert torch.isfinite(bias).all()
+    assert bias.abs().max() < 1.0, "the load controller must not drift"
 
-    # A legacy checkpoint carrying the dead controller must not resurrect it.
-    stale = bank.state_dict()
-    stale["router.bias"] = torch.full((4,), 0.37)
-    bank.load_state_dict(stale, strict=False)
-    assert torch.equal(bank.router.bias, torch.zeros(4))
+    # A checkpoint's live load controller IS restored: bit-exact resume depends
+    # on it. The fp32 softplus+clamp gate (N2) is what keeps it safe.
+    snapshot = bank.state_dict()
+    snapshot["router.bias"] = torch.full((4,), 0.37)
+    bank.load_state_dict(snapshot, strict=False)
+    assert torch.equal(bank.router.bias, torch.full((4,), 0.37))
 
 
 def test_a_collapsed_decay_is_a_named_refusal() -> None:

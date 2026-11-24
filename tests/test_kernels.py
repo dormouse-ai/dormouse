@@ -239,7 +239,10 @@ def test_the_module_reports_its_state_without_a_device() -> None:
     was = k.fused()
     try:
         k.set_fused(True)
-        assert k.fused() is True
+        assert k.flag_on() is True
+        # fused() also requires a CUDA/Triton kernel: on CPU the default stays
+        # on but the executed path is the eager fallback.
+        assert k.fused() is k.available()
         assert k.fused_ops() == 0, "the flag alone must not claim a launch"
     finally:
         k.set_fused(was)

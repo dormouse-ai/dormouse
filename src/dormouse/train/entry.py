@@ -60,7 +60,7 @@ from .optim import MixOptimizer
 from .recipe import LoopConfig, annealed_schedule
 from .runconfig import RunRecipe, fresh, refuse_drift
 from .schedule import warmup_cosine
-from .streams import HeldOut, Mixture, bytes_per_token
+from .streams import HeldOut, Mixture, bytes_per_token, heldout_bytes_per_token
 from .talker import Talker, vocabulary
 
 __all__ = ["SMOKE_STEPS", "evaluate", "load_artifact", "train"]
@@ -239,7 +239,7 @@ def _heldout(recipe: RunRecipe, steps: int, device: torch.device) -> HeldOut:
     probes, _ = recipe.probes(steps)
     window = HeldOut(
         recipe.eval_path,
-        bytes_per_token(recipe),
+        heldout_bytes_per_token(recipe),
         batch=recipe.spec.batch,
         seq_len=recipe.spec.seq_len,
         probes=probes,
@@ -529,7 +529,7 @@ def evaluate(checkpoint_path: str | Path, *, echo: Callable[[str], None] = print
     probes, first = recipe.probes(recipe.steps)
     window = HeldOut(
         recipe.eval_path,
-        bytes_per_token(recipe),
+        heldout_bytes_per_token(recipe),
         batch=spec.batch,
         seq_len=spec.seq_len,
         probes=probes,
