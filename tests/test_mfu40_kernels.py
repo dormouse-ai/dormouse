@@ -15,10 +15,19 @@ from dormouse.model.attn_variants.kda import KDA
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_flag_is_off_by_default() -> None:
-    """An unflagged process must run the shipped engine."""
-    assert mfu40.ON is (os.environ.get(mfu40.FLAG, "0") == "1")
+def test_flag_is_on_by_default() -> None:
+    """An unflagged process runs the four kernels; `=0` is the A/B arm."""
+    assert mfu40.ON is (os.environ.get(mfu40.FLAG, "1") != "0")
     assert "ko1_attn_batched_solves" in mfu40.snapshot()
+
+
+def test_fused_is_on_by_default() -> None:
+    """The fused path is the shipped path in a fresh, unflagged import."""
+    code = "from dormouse.kernels import fused; print(fused.fused())"
+    env = {k: v for k, v in os.environ.items() if k != "DORMOUSE_FUSED"}
+    env["PYTHONPATH"] = str(ROOT / "src")
+    out = subprocess.check_output([sys.executable, "-c", code], env=env, text=True)
+    assert out.strip() == "True"
 
 
 def test_ko1_batched_solves_match_shipped_chunks() -> None:

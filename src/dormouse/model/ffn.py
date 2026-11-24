@@ -239,7 +239,7 @@ def _accumulate(
     `w` carries the trailing `K`, so `w[..., k:k+1]` is per token, not per channel —
     which is why a chunk of rows is a chunk of both.
     """
-    if fused.fused():
+    if fused.fused() and fused.available():
         if kinds is None:
             raise LoudError(
                 f"a {len(fns)}-entry dictionary is not one the fused mixture computes",

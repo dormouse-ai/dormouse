@@ -2,8 +2,8 @@
 
 One env var, read at import, so a CUDA-graph capture sees one stable regime:
 
-    DORMOUSE_MFU40_KERNELS=0   the shipped engine (baseline arm)
-    DORMOUSE_MFU40_KERNELS=1   all four kernels (enabled arm)
+    DORMOUSE_MFU40_KERNELS=0   the baseline arm (opt-out, for A/B only)
+    DORMOUSE_MFU40_KERNELS=1   all four kernels (the default)
 
 Kernel-level receipts live here, not in ``Counters``: the locked harness snapshots
 them into ``mfu40_counters`` so a flag that did not fire can never be reported as
@@ -19,7 +19,7 @@ import torch
 FLAG = "DORMOUSE_MFU40_KERNELS"
 
 #: Import-time regime: graph capture and Triton constexprs must not see a mid-step flip.
-ON = os.environ.get(FLAG, "0") == "1"
+ON = os.environ.get(FLAG, "1") != "0"
 
 #: Per-kernel sub-switches, only meaningful when the main flag is on. They exist so
 #: an A/B that loses time can attribute the loss without another code edit.

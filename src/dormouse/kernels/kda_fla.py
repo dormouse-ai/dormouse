@@ -19,9 +19,10 @@ Translation from our kernel layout to FLA's:
   chunk form uses;
 * ``scale=1.0`` (our eq. 1 has no ``1/sqrt(d)``) and ``chunk_size=64``.
 
-``DORMOUSE_KDA_FLA`` selects the backend (default off until the full-width paired
-gate passes). On CPU the eager path always runs; on CUDA a missing FLA is a
-LoudError, never a silent fall back to the eager timing.
+``DORMOUSE_KDA_FLA`` selects the backend, default OFF: the full-width paired gate
+REFUTED it (paired dBPB +0.0986 at b2 x s1024, 200 steps; ~10x the 0.01 bar).
+On CPU the eager path always runs; on CUDA a missing FLA is a LoudError, never a
+silent fall back to the eager timing.
 """
 
 from __future__ import annotations
@@ -37,8 +38,8 @@ ChunkKDA = Callable[..., tuple[torch.Tensor, torch.Tensor]]
 
 _DORMOUSE_KDA_FLA = "DORMOUSE_KDA_FLA"
 
-#: The default is deliberately OFF. `tests/test_kda_precision.py` proves the
-#: full-width paired gate before this literal is flipped to "1".
+#: Deliberately OFF: the full-width paired gate REFUTED this backend (dBPB +0.0986
+#: at b2 x s1024, 200 steps, seed 4). Flipping this ships a quality regression.
 _DEFAULT = "0"
 
 _ESCAPE = (

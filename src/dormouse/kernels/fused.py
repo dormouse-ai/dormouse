@@ -96,8 +96,8 @@ MIX_BLOCK = 1024
 #: tree and cannot import it, so the constant is stated against its owner.
 SITU_BETA = 4.0
 
-#: The flag. Off by default: a fused path nobody measured is not a default.
-_FUSED = os.environ.get("DORMOUSE_FUSED", "") not in ("", "0")
+#: The fused path is the shipped path; `DORMOUSE_FUSED=0` is the A/B arm.
+_FUSED = os.environ.get("DORMOUSE_FUSED", "1") not in ("0", "off", "false")
 
 #: Fused launches since the last `reset_fused_ops()`. Zero while the flag is off, and
 #: zero while the flag is on is a defect, not a state.
