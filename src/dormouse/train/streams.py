@@ -20,6 +20,7 @@ probe index. They overlap only if the run is longer than the corpus minus the wi
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +32,7 @@ from ..data.mix import MixtureStream
 from .recipe import Batch
 from .runconfig import RunRecipe
 
-__all__ = ["HeldOut", "Mixture", "bytes_per_token"]
+__all__ = ["HeldOut", "Mixture", "bytes_per_token", "heldout_bytes_per_token"]
 
 __concepts__ = ("HeldOut", "Mixture")
 
@@ -126,33 +127,26 @@ class HeldOut:
         )
 
 
-def bytes_per_token(recipe: RunRecipe) -> float:
-    """Return how many bytes sit behind each token: exact for bytes, measured for a tokenizer."""
-    if recipe.spec.unit == "byte":
-        return 1.0
-    measured = set()
-    for source in recipe.sources:
-        path = Path(source.path)
-        meta = path.with_suffix(path.suffix + ".json")
-        raw = json.loads(meta.read_text(encoding="utf-8"))
-        value = raw.get("bytes_per_token")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            raise LoudError(
-                f"{meta}: the manifest does not carry the bytes per token it measured",
-                "a token model's BPB divides by the bytes behind its tokens; measure them "
-                "on the slice you tokenized (len(text.encode()) / len(ids)) and add "
-                "'bytes_per_token' to the manifest — an assumed 4.4 is how the previous "
-                "project's BPB became incomparable",
-            )
-        measured.add(round(float(value), 6))
-    if len(measured) > 1:
+def _manifest_bytes_per_token(path: Path, *, unit: str) -> float:
+    """Read one shard's measured bytes/token, refusing a missing or implausible value."""
+    meta = path.with_suffix(path.suffix + ".json")
+    raw = json.loads(meta.read_text(encoding="utf-8"))
+    value = raw.get("bytes_per_token")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
         raise LoudError(
-            f"the sources disagree on bytes per token: {sorted(measured)}",
-            "one number is the run's; retokenize the outliers, or give them a run of their "
-            "own — a per-source ratio makes one BPB an average of two",
+            f"{meta}: the manifest does not carry the bytes per token it measured ({value!r})",
+            "a token model's BPB divides by the bytes behind its tokens; measure them "
+            "on the slice you tokenized (len(text.encode()) / len(ids)) and add "
+            "'bytes_per_token' to the manifest — an assumed 4.4 is how the previous "
+            "project's BPB became incomparable",
         )
-    ratio = measured.pop()
-    if recipe.spec.unit == "bpe" and ratio <= 1.01:
+    ratio = round(float(value), 6)
+    if unit == "bpe" and ratio <= 1.01:
         raise LoudError(
             f"unit=bpe with bytes_per_token={ratio}: BPB would be the loss divided by ln 2",
             "a ratio of 1 says the manifest was written for a byte stream: retokenize the "
@@ -160,3 +154,37 @@ def bytes_per_token(recipe: RunRecipe) -> float:
             "with vocab=256. A BPB that is a rescaled loss is not a measurement",
         )
     return ratio
+
+
+def bytes_per_token(recipe: RunRecipe) -> float:
+    """Return how many bytes sit behind each training token: exact for bytes, measured otherwise."""
+    if recipe.spec.unit == "byte":
+        return 1.0
+    measured = {
+        _manifest_bytes_per_token(Path(source.path), unit=recipe.spec.unit)
+        for source in recipe.sources
+    }
+    if len(measured) > 1:
+        raise LoudError(
+            f"the sources disagree on bytes per token: {sorted(measured)}",
+            "one number is the run's; retokenize the outliers, or give them a run of their "
+            "own — a per-source ratio makes one BPB an average of two",
+        )
+    return measured.pop()
+
+
+def heldout_bytes_per_token(recipe: RunRecipe) -> float:
+    """Return the eval shard's own ratio; the training ratio prices the wrong text.
+
+    A held-out shard is tokenized separately and has its own bytes/token. Dividing its
+    loss by the training ratio reports a BPB that is off by their ratio (4.097 vs 4.207
+    in the demo run) while the byte counter still looks consistent with the train stream.
+    """
+    if recipe.eval_path is None:
+        raise LoudError(
+            "no eval stream to measure bytes per token for",
+            'add eval = "heldout.bin" to the config: BPB without its own window is not a number',
+        )
+    if recipe.spec.unit == "byte":
+        return 1.0
+    return _manifest_bytes_per_token(recipe.eval_path, unit=recipe.spec.unit)
