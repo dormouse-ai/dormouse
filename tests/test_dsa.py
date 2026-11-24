@@ -21,6 +21,7 @@ import torch
 from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
+from dormouse.model.attn_variants import dsa as dsa_module
 from dormouse.model.attn_variants.dsa import DSA
 
 D_MODEL = 16
@@ -209,6 +210,67 @@ def test_the_coeffects_declare_the_sparse_state() -> None:
 def test_the_repr_names_the_sparsity_and_the_indexer() -> None:
     text = repr(_dsa())
     assert "k=8" in text and "window=4" in text and "d_idx=16" in text
+
+
+def test_reuse_index_reuses_the_same_x_without_scanning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GLM's second loop: pass 2 reads pass 1's `[b, t, k]` map, bit for bit.
+
+    The chosen map is a function of this exact `x`, so reuse is not an approximation:
+    the second write must equal the unflagged one exactly, with no indexer MACs.
+    """
+    torch.manual_seed(40)
+    layer = _dsa()
+    x = torch.randn(2, SEQ, D_MODEL)
+    monkeypatch.setattr(dsa_module, "_REUSE_INDEX", False)
+    baseline = layer(x)
+    monkeypatch.setattr(dsa_module, "_REUSE_INDEX", True)
+    first, second = Counters(), Counters()
+    assert torch.equal(layer(x, first), baseline)
+    assert torch.equal(layer(x, second), baseline)
+    assert first.counts["dsa_index_macs"] == 2 * SEQ * 16
+    assert first.counts["reuse_tokens"] == 0
+    assert second.counts["dsa_index_macs"] == 0
+    assert second.counts["reuse_tokens"] == 2 * SEQ
+    assert second.counts["dsa_mli_reuse"] == 2 * SEQ
+    assert "index_reuse" in second.enabled
+    second.check()
+
+
+def test_reuse_index_is_one_shot_and_identity_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A third pass and a different `x` scan again: no stale map can leak."""
+    monkeypatch.setattr(dsa_module, "_REUSE_INDEX", True)
+    torch.manual_seed(41)
+    layer = _dsa()
+    x, other = torch.randn(1, SEQ, D_MODEL), torch.randn(1, SEQ, D_MODEL)
+    layer(x)
+    second = Counters()
+    layer(x, second)
+    assert second.counts["dsa_index_macs"] == 0
+    assert second.counts["reuse_tokens"] == SEQ
+    third = Counters()
+    layer(x, third)
+    assert third.counts["dsa_index_macs"] == SEQ * 16, "the map was consumed by pass 2"
+    new_input = Counters()
+    layer(other, new_input)
+    assert new_input.counts["dsa_index_macs"] == SEQ * 16
+    assert new_input.counts["reuse_tokens"] == 0
+
+
+def test_reuse_index_off_never_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flag is opt-in: two passes on the same `x` both pay for the scan."""
+    monkeypatch.setattr(dsa_module, "_REUSE_INDEX", False)
+    torch.manual_seed(42)
+    layer = _dsa()
+    x = torch.randn(1, SEQ, D_MODEL)
+    layer(x)
+    counters = Counters()
+    layer(x, counters)
+    assert counters.counts["dsa_index_macs"] == SEQ * 16
+    assert counters.counts["reuse_tokens"] == 0
 
 
 def test_the_gathered_slab_is_a_slice_of_queries_not_the_sequence(

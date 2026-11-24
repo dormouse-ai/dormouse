@@ -46,6 +46,8 @@ no arithmetic of its own — only an index list.
 
 from __future__ import annotations
 
+import os
+import weakref
 from typing import Any, cast
 
 import torch
@@ -67,6 +69,22 @@ WINDOW = 128
 #: Selected tokens per query. V3.2's 2048 is a serving budget; 512 is the one this
 #: stack's 4k/32k pricing is written at.
 K = 512
+
+#: Opt-in sparse index reuse: a second attention pass over the same `x` tensor reads
+#: pass 1's selection instead of running the indexer again (GLM-5.4's second loop).
+_REUSE_INDEX = os.environ.get("DORMOUSE_DSA_REUSE_INDEX", "0") == "1"
+
+
+def reuse_index_enabled() -> bool:
+    """Return whether a repeated forward over the same `x` reuses its index map."""
+    return _REUSE_INDEX
+
+
+def set_reuse_index(on: bool) -> None:
+    """Set the flag for this process; the environment variable sets its initial value."""
+    global _REUSE_INDEX
+    _REUSE_INDEX = bool(on)
+
 
 #: Elements in one gathered key/value slab. The gather is `[batch, heads, queries,
 #: k+window, head_dim]` and only one slab has to exist at a time: 2**25 is 64 MiB in bf16,
@@ -197,6 +215,10 @@ class DSA(LatentProjections):
         self.window = window
         self.mli = mli
         self.scale = head_dim**-0.5
+        #: One-shot, identity-scoped cache for the opt-in second pass. The weakref keeps
+        #: no activation alive; only the long index map is retained between the passes.
+        self._reuse_x: weakref.ReferenceType[torch.Tensor] | None = None
+        self._reuse_chosen: torch.Tensor | None = None
         #: `d_kv x d_model`: the heads need not tile the stream (KDA does the same).
         self.proj = nn.Linear(self.d_kv, d_model, bias=False, device=device)
         self.indexer = LightningIndexer(d_model, d_idx, chunk=chunk, device=device)
@@ -250,6 +272,7 @@ class DSA(LatentProjections):
             counters.count("dsa_selected", batch * seq * self.k)
             if reused:
                 counters.count("dsa_mli_reuse", reused)
+                counters.count("reuse_tokens", reused)
             if y.requires_grad:
                 y.register_hook(  # type: ignore[no-untyped-call]
                     lambda _: counters.count("dsa_bwd", batch * seq)
@@ -270,11 +293,33 @@ class DSA(LatentProjections):
         window alone already covers the sequence are questions about these two
         tensors, and no end-to-end loss answers them.
         """
-        tail = (
-            self.indexer.select(x, self.k, counters)
-            if prev is None
-            else self.indexer.reuse(prev, k=self.k)
+        cached = (
+            self._reuse_chosen
+            if _REUSE_INDEX and self._reuse_x is not None and self._reuse_x() is x
+            else None
         )
+        if prev is not None:
+            tail = self.indexer.reuse(prev, k=self.k)
+        elif cached is not None:
+            tail = cached
+            #: One-shot: pass 2 consumes the map and pass 3 scans again. Identity, not a
+            #: data_ptr, is the key: a different tensor can never inherit a stale map
+            #: after the allocator reuses an address.
+            self._reuse_x, self._reuse_chosen = None, None
+            if counters is not None:
+                tokens = x.shape[0] * x.shape[1]
+                counters.count("reuse_tokens", tokens)
+                counters.count("dsa_mli_reuse", tokens)
+                counters.enable(
+                    "index_reuse",
+                    counter="reuse_tokens",
+                    why="pass 2 reads pass 1's selection",
+                )
+        else:
+            tail = self.indexer.select(x, self.k, counters)
+            if _REUSE_INDEX:
+                self._reuse_x = weakref.ref(x)
+                self._reuse_chosen = tail.detach()
         return self._layout(tail, x.shape[1])
 
     def dense(self, x: torch.Tensor) -> torch.Tensor:

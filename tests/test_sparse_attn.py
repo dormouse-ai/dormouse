@@ -19,11 +19,14 @@ tolerance would pass it.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
+from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 
 from dormouse.kernels import sparse
+from dormouse.model.attn_variants import dsa as dsa_module
 from dormouse.model.attn_variants.dsa import DSA, _Pick
 
 #: The card's own skip, in the wording the bank's gate uses.
@@ -190,6 +193,57 @@ def test_the_sparse_path_is_deterministic_and_equals_its_dense_control() -> None
     sparse.set_sparse(True)
     assert torch.equal(layer(x), layer.dense(x))
     assert torch.equal(layer(x), layer(x))
+
+
+@ON_CARD
+def test_index_reuse_on_the_kernel_matches_an_external_fp64_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optimized path's second pass: no indexer pass, kernel launched, fp64 anchor.
+
+    The anchor is numpy's softmax over the SAME `[b, s, k+window]` map, written from
+    the formula in fp64 — not the eager gather arm, which is internal to this repo.
+    """
+    monkeypatch.setattr(dsa_module, "_REUSE_INDEX", True)
+    torch.manual_seed(43)
+    layer = _layer()
+    x = torch.randn(2, 64, layer.d_model, device="cuda")
+    sparse.set_sparse(True)
+    sparse.reset_sparse_launches()
+    first = layer(x)
+    reused_counters = Counters()
+    second = layer(x, reused_counters)
+    assert torch.equal(first, second), "the reused map must give the identical write"
+    assert sparse.sparse_launches() >= 2, "the optimized path must actually have run"
+    assert reused_counters.counts["dsa_index_macs"] == 0
+    assert reused_counters.counts["reuse_tokens"] == 2 * 64
+    reused_counters.check()
+
+    q, key, value = layer._project(x)
+    tail = layer.indexer.select(x, layer.k)
+    at, visible = layer._layout(tail, x.shape[1])
+    q64 = q.detach().double().cpu().numpy()
+    k64 = key.detach().double().cpu().numpy()
+    v64 = value.detach().double().cpu().numpy()
+    at64 = at.detach().cpu().numpy()
+    vis = visible.detach().cpu().numpy().astype(bool)
+    width = layer.head_dim
+    out = np.empty_like(q64)
+    for b in range(q64.shape[0]):
+        for h in range(q64.shape[2]):
+            for t in range(q64.shape[1]):
+                idx, live = at64[b, t], vis[b, t]
+                logits = k64[b, idx, h, :] @ q64[b, t, h, :] / np.sqrt(width)
+                logits = np.where(live, logits, -np.inf)
+                p = np.exp(logits - logits.max())
+                p /= p.sum()
+                out[b, t, h, :] = p @ v64[b, idx, h, :]
+    proj = layer.proj.weight.detach().double().cpu().numpy()
+    want = out.reshape(q64.shape[0], q64.shape[1], layer.d_kv) @ proj.T
+    got = second.detach().double().cpu().numpy()
+    worst = float(np.abs(got - want).max() / np.abs(want).max())
+    print(f"\nreuse + kernel against external fp64 anchor: {worst:.1e}")
+    assert worst < 2e-5
 
 
 def test_the_kernel_refuses_rather_than_pretending() -> None:
