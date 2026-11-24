@@ -40,7 +40,7 @@ table and exits 1 if the headline bill exceeds the envelope.
 | `mtp` | REFUTEd | no | +26% FLOP for +0.05pp at 1.2B; worse at our scale |
 | `jepa` | REFUTEd | no | +28% step; EBR 345x FLOP |
 | `fsz` | REFUTEd | no | no surviving evidence in iq-04 synthesis |
-| `sc_k5` | REFUTEd | no | +400% FLOP, n_eff about 2.1; 1 rollout optimal |
+| `sc_k5` | REFUTEd | no | +400% FLOP [N8: paper says correctness result, NOT efficiency], n_eff about 2.1; 1 rollout optimal |
 
 ## What is a config flag here, and what is not
 
