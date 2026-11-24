@@ -34,6 +34,7 @@ from dormouse_core.counters import Counters
 from dormouse_core.errors import LoudError
 from torch import nn
 
+from ..model.attn_variants.kda import KDA
 from ..model.moe import MAX_DISPATCH_PASSES, MoEFFN
 from . import compiled
 from .optim import MixOptimizer
@@ -278,6 +279,9 @@ class StepGraph:
                     "device; this is the same refusal the eager path makes on counts.max(), "
                     "checked here because the host read sits outside the capture",
                 )
+        for module in self.model.modules():
+            if isinstance(module, KDA):
+                module.check_alpha_floor()
         return commit_step(
             self.model,
             self.optimizer,

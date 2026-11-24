@@ -72,6 +72,12 @@ from .projections import LatentProjections
 #: that grows with the window (the bounded-state gate measures exactly this).
 A_BIAS_INIT = -4.0
 
+#: Per-channel decay floor. Below this the chunk's Gamma division reaches
+#: `1/alpha >= 1e6` and the triangular solve is ill-conditioned (N2/N6 measured
+#: `alpha_min -> 0`, i.e. `1e12`, after ~300 steps at high lr). A collapse is a
+#: defect in the decay projection/lr, not a precision edge case to clamp away.
+ALPHA_FLOOR = 1e-6
+
 #: Recompute the batched core in the backward instead of retaining it. OFF by default, and
 #: that is a change of regime rather than of taste: the graph the per-chunk form could not
 #: retain was `[batch, heads, chunk, chunk, head_dim]` PER CHUNK — measured 987 MiB per
@@ -85,6 +91,9 @@ CHECKPOINT_CHUNKS = False
 
 class KDA(LatentProjections):
     """Chunkwise KDA: `W_proj(gate · RMSNorm(chunk_delta_rule(q, k, v, alpha, β))))`."""
+
+    #: Declared for the type checker: `register_buffer` returns nothing.
+    _alpha_floor_hit: torch.Tensor
 
     #: What this mechanism needs and provides (Kimi §6.1: no RoPE inside it).
     COEFFECTS = Coeffects(
@@ -163,6 +172,14 @@ class KDA(LatentProjections):
         self.a_down = nn.Linear(d_model, head_dim, bias=False, device=device)
         self.a_up = nn.Linear(head_dim, self.d_kv, bias=False, device=device)
         self.a_bias = nn.Parameter(torch.full((n_heads, head_dim), A_BIAS_INIT, device=device))
+        #: Sticky device-side record of a collapsed decay, set without a host read so a
+        #: captured step stays capturable. The eager half reads it and refuses; a graph
+        #: reads it after replay (train/graph.py), the same seam `_overflow` uses.
+        self.register_buffer(
+            "_alpha_floor_hit",
+            torch.zeros((), dtype=torch.bool, device=device),
+            persistent=False,
+        )
         self.beta = nn.Linear(d_model, n_heads, bias=True, device=device)
         #: Kimi's output gate: `sigmoid(W_g x)` before the write projection.
         self.gate = nn.Linear(d_model, self.d_kv, bias=False, device=device)
@@ -206,6 +223,11 @@ class KDA(LatentProjections):
                 "chunk that divides it",
             )
         q, k, v, alpha, beta = self._project(x)
+        #: Eager forwards refuse a collapsed decay before feeding 1/alpha into the
+        #: solve. A capture records the flag instead: no device read may sit inside
+        #: it, so graph.py reads the same flag after replay.
+        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            self.check_alpha_floor()
         #: GQA: the kernel keeps one state per QUERY head, so a shared key/value head
         #: is broadcast to the heads that read it. `n_kv_heads == n_heads` skips this
         #: entirely, which is what makes the uncompressed layer bit-identical.
@@ -270,17 +292,38 @@ class KDA(LatentProjections):
         q, k, v = self.split(packed)
         q = nn.functional.normalize(q, dim=-1, eps=1e-6)
         k = nn.functional.normalize(k, dim=-1, eps=1e-6)
-        decay = (
-            self.a_up(self.activation(self.a_down(x))).view(batch, seq, self.n_heads, self.head_dim)
-            + self.a_bias
-        )
-        #: The log-decay must be fp32 in both backends: autocast would otherwise
-        #: take softplus/exp in bf16 and quantize a value the recurrence exponentiates.
-        #: A fp64 anchor must stay fp64, hence the dtype guard rather than a bare cast.
-        with torch.autocast("cuda", enabled=False):
-            work = decay.float() if decay.dtype in (torch.bfloat16, torch.float16) else decay
+        #: The log-decay is exponentiated by the recurrence, so it must be fp32
+        #: BEFORE anything rounds it (D01 B4). `decay.float()` after an autocast
+        #: `a_up` only upcasts a bf16 value; run the projection itself with autocast
+        #: off and promote a low-precision INPUT. A fp64 anchor then stays fp64
+        #: end to end rather than being cast down to fp32.
+        with torch.autocast("cuda", enabled=False), torch.autocast("cpu", enabled=False):
+            work_x = x.float() if x.dtype in (torch.bfloat16, torch.float16) else x
+            work = (
+                self.a_up(self.activation(self.a_down(work_x))).view(
+                    batch, seq, self.n_heads, self.head_dim
+                )
+                + self.a_bias
+            )
             alpha = torch.exp(-nn.functional.softplus(work))
+        #: No host read here: capture records the flag, the eager half refuses.
+        self._alpha_floor_hit |= (alpha < ALPHA_FLOOR).any()
         return q, k, v, alpha, torch.sigmoid(self.beta(x))
+
+    def check_alpha_floor(self) -> None:
+        """Named refusal for a decay that collapsed past `ALPHA_FLOOR`.
+
+        Reads the device flag on the eager side only; the captured forward must
+        never cross that seam (graph.py checks it after replay instead).
+        """
+        if bool(self._alpha_floor_hit):
+            raise LoudError(
+                f"KDA alpha fell below the {ALPHA_FLOOR:g} floor: the Gamma division "
+                "reaches 1e6+ and the triangular solve is ill-conditioned",
+                "the decay projection is growing without bound at this lr; lower the "
+                "lr, freeze a_bias, or bound a_up(a_down(x)) — raising the 1e-12 clamp "
+                "in _chunks would only hide the collapse",
+            )
 
     def _write(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Head-wise RMSNorm, the output gate, then the residual-writing projection."""
