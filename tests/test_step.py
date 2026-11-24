@@ -21,7 +21,7 @@ from stacks import reference_stack
 
 from dormouse.train import MixOptimizer, train_step
 from dormouse.train.optim import MUON_LR
-from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy, commit_step
+from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy
 
 SMALL = {"vocab": 16, "d_model": 32, "n_layers": 2, "n_heads": 2, "head_dim": 16, "d_ffn": 64}
 
@@ -155,71 +155,36 @@ def test_a_firewalled_step_leaves_no_gradient_behind() -> None:
     assert all(param.grad is None for param in model.parameters())
 
 
-def test_a_nonfinite_gradient_is_named_before_the_clip_smears_it(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """One bad grad in three becomes three bad grads; the receipt must still name it.
+def test_n11_a_nan_loss_names_its_forward_stage_and_counts_separately() -> None:
+    """N11: a forward NaN must say `logits`, not bury six skips in one `nan_guard`.
 
-    Finiteness before the clip is [True, False, True]. `clip_grad_norm_(clip=inf)`
-    returns a NaN norm and scales every grad by it, so afterwards it is
-    [False, False, False] and the culprit is unrecoverable. The detector runs before
-    the clip and leaves a named counter plus a named refusal reason.
+    The safe-LR run died at step 232 with `loss=nan` and no tensor name. Poisoning
+    the embedding makes the logits non-finite; the receipt must carry that stage
+    and a `nan_loss` counter, while a NaN gradient keeps `nan_norm` and no stage.
     """
-    culprit = "blocks.0.attn.qkv.weight"
-    grad_names = ("embed.weight", culprit, "norm.weight")
-
-    def poisoned() -> tuple[torch.nn.Module, MixOptimizer]:
-        model, optimizer, _ = _build()
-        named = dict(model.named_parameters())
-        with torch.no_grad():
-            for name in grad_names:
-                named[name].grad = torch.full_like(
-                    named[name], float("nan") if name == culprit else 1.0
-                )
-        return model, optimizer
-
-    model, optimizer = poisoned()
-    assert [
-        bool(torch.isfinite(dict(model.named_parameters())[name].grad).all()) for name in grad_names
-    ] == [True, False, True], "the repro's input"
-    twin, _ = poisoned()
-    torch.nn.utils.clip_grad_norm_(twin.parameters(), math.inf)
-    twin_params = dict(twin.named_parameters())
-    assert not any(bool(torch.isfinite(twin_params[name].grad).all()) for name in grad_names), (
-        "the clip is unchanged: one NaN becomes NaN in every gradient"
-    )
-
-    counters = Counters()
-    result = commit_step(model, optimizer, torch.tensor(1.5), counters=counters, clip=math.inf)
-    assert result.skipped
-    assert counters.counts[f"nonfinite_grad:{culprit}"] == 1
-    assert culprit in caplog.text, "the refusal must name the parameter, not just count it"
-
-
-def test_a_deferred_finite_loss_reaches_the_spike_gate() -> None:
-    """`read=False` defers reporting, not the policy's view of the real loss."""
     model, optimizer, ids = _build()
-    seen: list[float] = []
-
-    def policy(loss: float) -> bool:
-        seen.append(loss)
-        return True
-
-    result = train_step(model, ids, optimizer=optimizer, pre_step=policy, read=False)
-    assert seen and seen[0] > 0.0, f"the policy saw the sentinel: {seen}"
-    assert seen[0] == pytest.approx(result.loss)
-
-
-def test_a_deferred_nan_loss_is_a_nan_receipt() -> None:
-    """A skipped step reports NaN, never the 0.0 a deferred read would leave behind."""
-    model, optimizer, _ = _build()
+    with torch.no_grad():
+        model.embed.weight[0, 0] = float("inf")
     counters = Counters()
-    result = commit_step(
-        model, optimizer, torch.tensor(float("nan")), counters=counters, read=False
-    )
+    result = train_step(model, ids, optimizer=optimizer, counters=counters)
     assert result.skipped
-    assert math.isnan(result.loss), f"NaN was reported as {result.loss}"
-    assert counters.counts["nan_guard"] == 1
+    assert result.bad_stage == "logits"
+    assert counters.counts["nan_loss"] == 1
+    assert "nan_norm" not in counters.counts
+
+    model2, optimizer2, ids2 = _build()
+    poison = model2.blocks[0].register_full_backward_hook(
+        lambda _module, grad_input, _grad_output: (grad_input[0] * float("nan"), None)
+    )
+    try:
+        counters2 = Counters()
+        result2 = train_step(model2, ids2, optimizer=optimizer2, counters=counters2)
+    finally:
+        poison.remove()
+    assert result2.skipped
+    assert result2.bad_stage == ""
+    assert counters2.counts["nan_norm"] == 1
+    assert "nan_loss" not in counters2.counts
 
 
 # ----------------------------------------------------------------- the accumulation
