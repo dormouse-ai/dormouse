@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from .model.spec import StackSpec
 
-from dormouse_core.errors import LoudError
+from dormouse_core.errors import LoudError, MissingReport
 from dormouse_core.journal import Journal
 
 #: Commands that exist and do something. Everything else refuses.
@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch(args)
     except LoudError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except MissingReport as exc:
+        # A required named counter never incremented is a contract failure,
+        # not a crash: same exit-2 + Escape: contract as any other refusal.
+        print(f"MissingReport: {exc}", file=sys.stderr)
+        print("Escape: a named mechanism counter never incremented; check the flag and its wiring", file=sys.stderr)
         return 2
 
 
