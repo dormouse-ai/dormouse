@@ -1,0 +1,52 @@
+# demo_200m: Friday chat demo — 200M ACTIVE params on one 5070 Ti.
+#
+# The one architecture, at 2816 wide / 12 layers / rank-256 MoA with 8 experts.
+# Meta-device price: stored 269.8M / active 200.1M (top-2 + one shared expert).
+# Fewer experts than the 401M recipe is what keeps 200M active inside 16 GB:
+# active is dominated by the embedding + attention, not by the stored bank.
+#
+# device=auto picks the card; muon_ns_dtype=fp16 keeps Newton-Schulz in fp16
+# (engine commit 85a6811). bf16 autocast is the engine default at this HEAD.
+# SYNTH is 25% of the pretrain stage; the chat stage reuses the same tokenizer.
+
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"   # the NEW 14-special tokenizer
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+device = "auto"
+muon_ns_dtype = "fp16"
+
+d_model = 2816
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 12288
+n_experts = 8
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 6_144_000
+throughput_tflops = 36.7264
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 150
+ckpt_every = 150
+eval_batches = 4
+eval = "../data-prep-2h/demo_heldout.bin"
+
+[[source]]
+path = "../data-prep-2h/demo_pretrain.bin"
+weight = 1.0
