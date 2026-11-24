@@ -253,6 +253,11 @@ class Trainer:
         if result.skipped:
             self.skips += 1
             self.consecutive += 1
+            # V4/N4: the batch's bytes were already added to the ledger; its
+            # nats must be too, or BPB is computed over fewer nats than bytes
+            # (measured -0.0443). NaN loss stays non-finite on purpose: the
+            # receipt then refuses BPB instead of printing a flattering value.
+            self.nats += loss * batch.tokens
             counters.count("skipped")
         else:
             self.consecutive = 0
