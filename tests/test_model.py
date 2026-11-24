@@ -16,6 +16,8 @@ is covered where the assembler is (`tests/test_assemble.py`).
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from dormouse_core.counters import Counters
@@ -132,10 +134,11 @@ def test_the_same_seed_builds_the_same_model() -> None:
     assert torch.equal(a(ids), b(ids))
 
 
-def test_the_embedding_starts_at_unit_rms_and_projections_at_their_std() -> None:
+def test_the_embedding_starts_at_scaled_rms_and_projections_at_their_std() -> None:
     """The init contract the variance argument is written against."""
     model = reference_stack()
-    assert model.embed.weight.std().item() == pytest.approx(1.0, rel=0.2)
+    expected = 1.0 / math.sqrt(model.d_model)
+    assert model.embed.weight.std().item() == pytest.approx(expected, rel=0.2)
     qkv = model.blocks[0].attn.qkv.weight
     assert qkv.std().item() == pytest.approx(0.02, rel=0.2)
 

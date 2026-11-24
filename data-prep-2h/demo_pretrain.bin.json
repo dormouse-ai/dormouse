@@ -1,0 +1,11 @@
+{
+ "bytes_per_token": 4.097287,
+ "dclm_tokens": 46976161,
+ "doc_hashes_sha": "6cef1235d9a6c7a5456b6d4a9b187b20e2c10fa40aeea0bd0a00a004e3a4f5b7",
+ "documents": 72974,
+ "dtype": "uint16",
+ "source": "dclm+synth (25% SYNTH by physical tokens)",
+ "synth_tokens": 14383470,
+ "tokenizer_sha": "50235922e0bacb3a",
+ "tokens": 61359631
+}

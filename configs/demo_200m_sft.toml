@@ -1,0 +1,53 @@
+# demo_200m_sft: stage 2 chat continuation of demo_200m.
+# Same stack and tokenizer; the only change is the SFT stream and a short cosine decay.
+# Chat turns are rendered by data.tokenizer.format_turn (assistant-only masking is NOT
+# implemented in this engine: the loss covers every token in the chat stream).
+
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "chat"
+device = "auto"
+muon_ns_dtype = "fp16"
+
+d_model = 2816
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 12288
+n_experts = 8
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+# 750 total steps: the checkpoint resumes at step 600, so this adds 150 SFT steps.
+tokens = 1_536_000
+throughput_tflops = 36.7264
+schedule = "cosine"
+lr_muon = 0.001
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 0
+eval_batches = 4
+eval = "../data-prep-2h/demo_heldout.bin"
+
+[[stage]]
+name = "chat"
+until = 750
+
+[[source]]
+path = "../data-prep-2h/demo_sft.bin"
+weight = 1.0
+stage = "chat"

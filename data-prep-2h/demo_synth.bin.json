@@ -1,0 +1,9 @@
+{
+ "bytes_per_token": 4.369688,
+ "doc_hashes_sha": "5847df72bc829a93da194d6a82b597cd117227f45104b27226f926f4e4953706",
+ "documents": 37140,
+ "dtype": "uint16",
+ "source": "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-datasets/synth",
+ "tokenizer_sha": "50235922e0bacb3a",
+ "tokens": 14383470
+}

@@ -98,7 +98,7 @@ BK = 64
 
 #: `f`-columns one backward program owns: three `[r, BN]`-shaped accumulators held to the
 #: last row, so this is the number the register file sizes.
-BNC = 32
+BNC = 16
 
 #: Rows the column-major backward walks per iteration.
 BMC = 16

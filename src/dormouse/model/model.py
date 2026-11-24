@@ -28,9 +28,11 @@ projections that write the residual (`attn.proj`, `ffn.down`), which draw
 width `d` has variance `d·0.02² ≈ 0.33` at d=832 — a third of the unit-RMS stream it
 is added to, so the residual starts as the signal and the deltas start loud enough to
 learn; and the `1/√(2L)` on the writes keeps the stream's variance `≈ 1.5x` its init
-at any depth instead of growing with L. Token rows are `N(0, 1)` because RMSNorm is
-defined against a unit-RMS input: the first block's pre-norm is near-identity at step
-0, which is the state every anchor below is written against.
+at any depth instead of growing with L. Token rows are `N(0, 1/sqrt(d_model))`:
+the head is TIED to this table, so unit-variance rows would make the logits'
+standard deviation `sqrt(d_model)` and the init CE ~900 at d=2816 instead of
+`ln(vocab) ~ 10.4`. RMSNorm is scale-free, so shrinking the rows does not change
+what the blocks see.
 
 NO ROTARY TABLE. Neither attention mechanism uses one (KDA's decay and DSA's
 selection are their own positional signal), so the stack has no `rope` switch and no
@@ -39,6 +41,7 @@ position table to disagree with a checkpoint.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -89,7 +92,7 @@ class Transformer(nn.Module):
         self.d_ffn = d_ffn
         self.max_seq_len = max_seq_len
         self.embed = nn.Embedding(vocab, d_model, device=device)
-        nn.init.normal_(self.embed.weight, std=1.0)
+        nn.init.normal_(self.embed.weight, std=1.0 / math.sqrt(d_model))
         #: `declarations` is the list of mechanisms whose counters prove this stack
         #: ran; the constructor cannot infer it from the modules, and a mechanism the
         #: forward cannot count is a mechanism nobody can see was skipped.
