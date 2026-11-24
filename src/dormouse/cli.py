@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .model.spec import StackSpec
@@ -246,10 +246,14 @@ def _elasticity(journal: str | None) -> tuple[float, str]:
 
 
 def _spec(config: str) -> StackSpec:
-    """Read a stack config, annotated as what it is: `from_toml` returns the base."""
-    from .model.spec import StackSpec
+    """Read the stack with `dorm train`'s parser, without opening any data.
 
-    return cast(StackSpec, StackSpec.from_toml(config))
+    `plan` prices a config and `train` runs it, so both must refuse the same
+    unknown keys and read the same widths: one dialect, two lenses.
+    """
+    from .train.runconfig import RunRecipe
+
+    return RunRecipe.read_spec(config)
 
 
 def _status(pattern: str) -> int:

@@ -119,8 +119,12 @@ class RunRecipe:
 
     # ------------------------------------------------------------------ reading
     @classmethod
-    def read(cls, path: str | Path) -> RunRecipe:
-        """Parse and validate one run config, refusing an unknown key by name."""
+    def _load(cls, path: str | Path) -> tuple[Path, str, dict[str, Any], StackSpec]:
+        """Read one config's text and stack, refusing an unknown key by name.
+
+        `dorm plan` and `dorm train` both come through here: a file cannot be one
+        dialect to the first and another to the second.
+        """
         source = Path(path).resolve()
         try:
             text = source.read_text(encoding="utf-8")
@@ -145,6 +149,21 @@ class RunRecipe:
                 source=str(source),
             ),
         )
+        return source, text, raw, spec
+
+    @classmethod
+    def read_spec(cls, path: str | Path) -> StackSpec:
+        """Read the stack from a config without opening any data (the price lens).
+
+        A `dorm plan` config may be stack-only (no `[[source]]`), but it is parsed
+        by the same rules as a run: the same keys, types and spec validation.
+        """
+        return cls._load(path)[3]
+
+    @classmethod
+    def read(cls, path: str | Path) -> RunRecipe:
+        """Parse and validate one run config, refusing an unknown key by name."""
+        source, text, raw, spec = cls._load(path)
         stages = cls._stages(raw.get("stage", ()), source)
         sources = cls._sources(raw.get("source", ()), source)
         check_tokenizer(spec, sources, source)

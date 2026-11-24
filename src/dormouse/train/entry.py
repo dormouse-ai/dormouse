@@ -60,7 +60,7 @@ from .optim import MixOptimizer
 from .recipe import LoopConfig, annealed_schedule
 from .runconfig import RunRecipe, fresh, refuse_drift
 from .schedule import warmup_cosine
-from .streams import HeldOut, Mixture, heldout_bytes_per_token
+from .streams import HeldOut, Mixture, bytes_per_token
 from .talker import Talker, vocabulary
 
 __all__ = ["SMOKE_STEPS", "evaluate", "load_artifact", "train"]
@@ -180,7 +180,7 @@ def _mixture(recipe: RunRecipe, device: torch.device) -> Mixture:
     )
     return Mixture(
         mix,
-        heldout_bytes_per_token(recipe),
+        bytes_per_token(recipe),
         batch=recipe.spec.batch,
         seq_len=recipe.spec.seq_len,
         device=device,
@@ -239,7 +239,7 @@ def _heldout(recipe: RunRecipe, steps: int, device: torch.device) -> HeldOut:
     probes, _ = recipe.probes(steps)
     window = HeldOut(
         recipe.eval_path,
-        heldout_bytes_per_token(recipe),
+        bytes_per_token(recipe),
         batch=recipe.spec.batch,
         seq_len=recipe.spec.seq_len,
         probes=probes,
@@ -288,10 +288,6 @@ def train(
             "different recipe",
         )
     directory = recipe.directory(runs)
-    if resume:
-        refuse_drift(recipe, directory)
-    else:
-        fresh(recipe, directory)
 
     seconds, priced, plan_source = _plan(recipe.spec, smoke=smoke)
     if seconds * steps / max(recipe.steps, 1) > BUDGET_SECONDS and not approve:
@@ -314,6 +310,12 @@ def train(
 
     stream = _mixture(recipe, target)
     window = _heldout(recipe, budget, target)
+    # Every pre-flight refusal has passed. Only now may the run own a directory: a
+    # priced-out or drifting run must not leave config.toml/json to pose as one.
+    if resume:
+        refuse_drift(recipe, directory)
+    else:
+        fresh(recipe, directory)
     journal = Journal.open(directory / "run.jsonl")
     optim, schedule = _optimizer(assembled.model, recipe, cfg)
     if resume:
@@ -527,7 +529,7 @@ def evaluate(checkpoint_path: str | Path, *, echo: Callable[[str], None] = print
     probes, first = recipe.probes(recipe.steps)
     window = HeldOut(
         recipe.eval_path,
-        heldout_bytes_per_token(recipe),
+        bytes_per_token(recipe),
         batch=spec.batch,
         seq_len=spec.seq_len,
         probes=probes,
