@@ -90,7 +90,8 @@ LEVERS: tuple[Lever, ...] = (
         "survived",
         True,
         "bpb_regression",
-        "REPLACE write_std=0.02/sqrt(2L); 2.714696 +/- 0.10; never combine with scaled init",
+        "REPLACE write_std=0.02/sqrt(2L); band in docs/regression-baselines.md; "
+        "never combine with scaled init",
     ),
     Lever(
         "sft_pika_30k",

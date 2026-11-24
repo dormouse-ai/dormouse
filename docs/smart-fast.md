@@ -27,7 +27,7 @@ table and exits 1 if the headline bill exceeds the envelope.
 | `fp16_ns` | survived | yes (engine) | cos>=0.9999 on 8 buckets, 3.06x chain (commit `97630f4`) |
 | `graph_epilogue` | survived | yes (engine) | `torch_compile=true` + `dorm train --graph`; whole-step MFU 39.92% (commit `c553a57`) |
 | `active_68.5m` | survived | yes | 401M stored / 68.5M active; not 400M active / 3.8B stored |
-| `lns_replace_init` | survived | yes (engine) | **replace** `write_std=0.02/sqrt(2L)`, regression 2.714696 +/- 0.10; never combine with scaled init |
+| `lns_replace_init` | survived | yes (engine) | **replace** `write_std=0.02/sqrt(2L)`, regression band in [`regression-baselines.md`](regression-baselines.md); never combine with scaled init |
 | `sft_pika_30k` | survived | yes (stage) | 30k multi-turn PiKa, assistant-only loss, re-init chat embeddings, 0 leaks |
 | `verifier_1rollout` | survived | yes | 1 rollout/prompt, verifier on held-out; k>1 is red |
 | `grpo_outcome_only` | survived | yes (post-train) | outcome-only reward; dense-MC and `sc_k5` are red |
@@ -70,9 +70,9 @@ CPU CI; `tests/test_smart_fast.py` runs those checks plus falsifier tests (an ov
 The **sole quality gate** is the IQ smoke harness: `random=0` (floor) and `oracle=1`
 (ceiling) on the same tasks, with `iq_judge_calls` proving the blind judge ran. An
 enabled gate whose counter stayed zero is a `MissingReport`, never a clean pass.
-BPB regression (2.714696 +/- 0.10) guards the LNS init swap only; it is a safety gate,
-not the quality gate. Nothing claims a measured IQ delta: IQ/FLOP is not measured on
-this stack ([`iq-04-synthesis.md`](../../../.bulba/research/iq-04-synthesis.md) §1).
+The regression band in [`regression-baselines.md`](regression-baselines.md) guards the LNS
+init swap only; it is a safety gate, not the quality gate. Nothing claims a measured
+IQ delta: IQ/FLOP is not measured on this stack ([`iq-04-synthesis.md`](../../../.bulba/research/iq-04-synthesis.md) §1).
 
 Run it:
 

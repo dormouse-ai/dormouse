@@ -11,27 +11,23 @@ The assertion is a BAND, not bit-equality: the gate exists to catch a large chan
 bit. A one-line change to the model still moves the number, so when a change is
 intended, re-record the baseline in the same commit and say why.
 
-Baseline: final loss 2.356925 over 200 steps.
-Measured on the one-architecture stack (3 KDA + 1 DSA per period, GQA + c_lat=512
-projections, a four-expert MoA bank whose three matrices store their rank-32 factors)
-with:
+The current baseline and every superseded one, with its recording date and the
+reason it moved, are in `docs/regression-baselines.md`. That file is the one
+canonical place for those numbers; a second copy in a doc, config or tool is a
+failure of `tests/test_regression_gate.py`. Re-record the baseline only with:
 
     uv run python tools/regression.py --steps 200
 
-It replaced 2.714696 after the tied-head init fix (embedding std 1/sqrt(d_model)
-instead of 1.0): the old std made the init CE ~900 on the 2816-wide demo stack,
-and the smaller stack converges from a lower CE to a lower final loss. It replaced
-2.452850 earlier, recorded while the experts kept a dense `d·f` master and
-ran a per-forward SVD of it. The factors are the parameters now: the bank stores
-`3·(64·32 + 32·128)` per expert instead of `3·64·128`, so the stack is 190,200
-parameters rather than 220,920, and the number moved with the storage. The band is
-+/-0.10 (3.7% of the baseline). Every seed and shape below is part of the measurement,
-not a preference: changing one changes the number.
+Measured on the one-architecture stack (3 KDA + 1 DSA per period, GQA + c_lat=512
+projections, a four-expert MoA bank whose three matrices store their rank-32 factors).
+The band is +/-0.10 (4.2% of the baseline). Every seed and shape below is part of
+the measurement, not a preference: changing one changes the number.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -43,7 +39,8 @@ from torch.nn import functional
 from dormouse.model.assemble import assemble
 from dormouse.model.spec import StackSpec
 
-#: The recorded final loss. Re-record only with the command in the module docstring.
+#: Executable mirror of the current row in docs/regression-baselines.md.
+#: The registry test refuses a drift between the two. Re-record only as documented there.
 BASELINE = 2.356925
 
 #: Half-width of the acceptance band, in loss units.
@@ -117,6 +114,9 @@ def run(steps: int, data: bytes) -> tuple[float, float, int]:
 def check(steps: int, final: float, first: float) -> list[str]:
     """Return the failures; an empty list means the gate passed."""
     failures = []
+    for label, value in (("final", final), ("first", first)):
+        if not math.isfinite(value):
+            failures.append(f"{label} loss {value!r} is not finite: NaN/inf is never a pass")
     if steps == 200:
         if abs(final - BASELINE) > BAND:
             failures.append(

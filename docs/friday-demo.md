@@ -135,5 +135,13 @@ tool records an honest REFUTE and leaves them not run.
 | real `run.jsonl` with step events, finite BPB (not 1030) | PASS: 600 step events, heldout BPB 2.614 |
 | IQ smoke falsifier RANDOM=0 / ORACLE=1 | PASS |
 | demo answers 2–3 RU/EN questions via OpenCode adapter | BLOCKED: CPU generation >300 s/question; GPU lock held by sibling |
-| `make check` green | 651 passed, 28 skipped, coverage 93.85%; 2 pre-existing env failures remain (`test_cubin_gate` needs a free GPU/cubin build; `test_muon_foreach` launch-count 80 vs 75 reproduced on clean `app/` checkout). All new files ruff/mypy clean; `make regression` baseline re-recorded 2.356925 after the init fix |
+| `make check` green | 651 passed, 28 skipped, coverage 93.85%; 2 pre-existing env failures remain (`test_cubin_gate` needs a free GPU/cubin build; `test_muon_foreach` launch-count 80 vs 75 reproduced on clean `app/` checkout). All new files ruff/mypy clean; `make regression` baseline re-recorded after the init fix (see [`regression-baselines.md`](regression-baselines.md)) |
 | F2 loop A/B, latency ≤2×, 0 train FLOP | BLOCKED: GPU lock (tool dry-run REFUTE on tiny stack) |
+
+Clean-checkout verification (2026-11-24, HEAD `d5f4cb1`):
+`tests/test_spec.py::test_the_other_config_files_are_gone` passes with
+`demo_train_long.toml` present — the V11 P0 config is not an allowlist failure.
+`make check` reaches pytest with ruff/format/mypy green; three pytest failures
+(`test_custom_ops.py::test_capture_replays_the_compiled_step_with_fp32_parity` and
+two `test_entry.py` resume/eval assertions) reproduce on unmodified HEAD and are
+environment failures, not the config allowlist.

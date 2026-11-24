@@ -51,9 +51,12 @@ TOKENS = ROWS * SEQ
 #: Relative, not absolute. A cross-process reduction reorders the fp32 sums, so two
 #: mathematically identical runs differ at the fp32 epsilon (~1.2e-7 relative). An
 #: absolute 1e-6 fails at loss ~10 on a different BLAS build; a relative bar of 1e-6
-#: is still 10x tighter than the drift it must tolerate, and it cannot hide a real bug
-#: (the per-micro-batch-mean control below drifts by 7.7e-3, four orders larger).
+#: is still ~1.8x tighter than the honest pair's measured 5.66e-7 drift. The injected
+#: control below drifts 5.01e-6; see NR-2026-11-24-01 in docs/negative-results.md.
 TOL = 1e-6
+#: The injected per-micro-batch bug must exceed this. The old 1e-3 floor stopped
+#: falsifying anything after the tied-head init fix shrank gradients 200x.
+BUG_DRIFT_FLOOR = 2e-6
 
 
 @dataclass(frozen=True)
@@ -307,10 +310,13 @@ def test_per_microbatch_mean_fails_the_equivalence_gate(
     """
     buggy = run_job(tmp_path_factory.mktemp("buggy"), world=2, bug=True)
     worst = _worst(buggy.weights[0], single.weights[0])
-    # The scaled tied-head init makes gradients ~5x smaller than at the old N(0,1)
-    # init, so the same bug drifts ~5e-6 rather than 1e-3. Still 5x the honest
-    # run's 1e-6 ceiling: keep the falsifier above that, not at the old number.
-    assert worst > 2e-6, "the per-micro-batch mean was not caught: the gate proves nothing"
+    # The 1/sqrt(d_model) tied-head init shrank gradients enough that this bug now
+    # drifts 5.01e-6, not 1e-3: the old floor let it pass. 2e-6 is ~3.5x the honest
+    # pair's 5.66e-7 and ~2.5x below the buggy pair. See NR-2026-11-24-01.
+    assert TOL < BUG_DRIFT_FLOOR < worst, (
+        f"the per-micro-batch mean was not caught: honest {TOL:.1e}, floor "
+        f"{BUG_DRIFT_FLOOR:.1e}, buggy {worst:.3e}"
+    )
     assert buggy.losses[0] == pytest.approx(single.losses[0] * ACCUM, rel=1e-5)
 
 

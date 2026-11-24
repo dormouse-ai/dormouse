@@ -70,8 +70,9 @@ PYTHONPATH=src /home/sehaxe/dormouse2/app/.venv/bin/python scripts/stream_check.
 
 Convergence trace: `loss 62.61 → 15.81 → 10.09 → 8.70 → 8.12`;
 `heldout_loss 7.8789`, `bytes_per_token 4.187927`, `heldout_bpb 2.7142`
-(`bpb_in_band=true`, `learned=true`). That number sits on the repo's regression
-baseline `2.714696` without any fixture or assumed byte ratio.
+(`bpb_in_band=true`, `learned=true`). That number sat on the repo's regression
+baseline at the time (now superseded, see [`regression-baselines.md`](regression-baselines.md))
+without any fixture or assumed byte ratio.
 
 The 2-step `--smoke` command is kept as the seam check: it exercises manifest,
 tokenizer gate, mixture, journal and eval-window wiring. Its BPB is not a quality

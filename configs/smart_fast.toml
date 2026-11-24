@@ -14,7 +14,7 @@
 #   synth_static_25  | survived | on  | 25% static corpus, 0 FLOP, never x10; delta-test
 #   fp16_ns          | survived | on  | optimizer-only, cos>=0.9999 (engine commit 97630f4)
 #   graph_epilogue   | survived | on  | torch_compile + --graph, MFU 39.92% (commit c553a57)
-#   lns_replace_init | survived | on  | REPLACE write_std=0.02/sqrt(2L), 2.714696 +/- 0.10
+#   lns_replace_init | survived | on  | REPLACE write_std=0.02/sqrt(2L), band in docs/regression-baselines.md
 #   sft_pika_30k     | survived | on  | assistant-only loss, re-init chat embeddings
 #   verifier_1rollout| survived | on  | 1 rollout/prompt, verifier on held-out
 #   grpo_outcome_only| survived | on  | outcome-only; dense-MC and sc_k5 are RED
