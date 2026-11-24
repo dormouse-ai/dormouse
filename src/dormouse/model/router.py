@@ -136,15 +136,25 @@ class Router(nn.Module):
         nn.init.normal_(self.weight, std=std)
         #: Quantile Balancing's load offset, added to the SCORE before the top-k.
         #: A buffer: nothing optimises it, and `mean(q) - q` keeps it centred.
-        self.register_buffer("bias", torch.zeros(n_experts, device=device))
+        # N2: QB load offset must never be checkpointed — a collapsed bias
+        # (absmax 46 at step 1050) would steer routing in every later resume.
+        self.register_buffer("bias", torch.zeros(n_experts, device=device), persistent=False)
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """Return the projection `x [n, d] @ Wᵀ`, `[n, E]` — one `[n, E]` output."""
         return nn.functional.linear(x, self.weight)
 
     def scores(self, logits: torch.Tensor) -> torch.Tensor:
-        """`sqrt(softplus(logit))` — non-negative, sub-linear, differentiable."""
-        return torch.sqrt(nn.functional.softplus(logits))
+        """`sqrt(softplus(logit))` — non-negative, sub-linear, differentiable.
+
+        N2: compute in fp32 with a floor. Under autocast the bf16 softplus of a
+        logit below ~-95 underflows to 0, and sqrt's backward is `0/0 -> NaN`;
+        select() materialises all E scores before top-k, so one unselected
+        expert poisons router.weight.grad with a finite loss. Clamp keeps the
+        derivative finite; fp32 avoids the bf16 underflow cliff entirely.
+        """
+        soft = nn.functional.softplus(logits.float()).clamp_min(1e-6)
+        return torch.sqrt(soft).to(logits.dtype)
 
     def count(self, index: torch.Tensor) -> torch.Tensor:
         """Return the assignment histogram `[E]` by one device-side `scatter_add_`.
