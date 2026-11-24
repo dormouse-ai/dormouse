@@ -136,9 +136,12 @@ class Router(nn.Module):
         nn.init.normal_(self.weight, std=std)
         #: Quantile Balancing's load offset, added to the SCORE before the top-k.
         #: A buffer: nothing optimises it, and `mean(q) - q` keeps it centred.
-        # N2: QB load offset must never be checkpointed — a collapsed bias
-        # (absmax 46 at step 1050) would steer routing in every later resume.
-        self.register_buffer("bias", torch.zeros(n_experts, device=device), persistent=False)
+        # B1: the QB load offset IS checkpointed. A resume must replay the exact
+        # routing of the run it continues, and an eval of the artifact must use
+        # the load controller that produced those weights. The fp32 softplus+clamp
+        # fix (N2) is what keeps the bias finite; non-persistence broke bit-exact
+        # resume (8/20 losses off by 7.5e-4) and eval parity.
+        self.register_buffer("bias", torch.zeros(n_experts, device=device))
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
         """Return the projection `x [n, d] @ Wᵀ`, `[n, E]` — one `[n, E]` output."""

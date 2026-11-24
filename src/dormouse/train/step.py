@@ -194,7 +194,9 @@ def commit_step(
     for grad in grads:
         grad.mul_(gate)
     ok = host_scalar(finite.to(torch.float32)) > 0.5
-    loss_value = host_scalar(loss.detach()) if read else 0.0
+    # B1/FIX-1: the spike gate and the NaN firewall decide on the REAL loss, even
+    # when the log cadence defers only the norm. A 0.0 sentinel blinded both.
+    loss_value = host_scalar(loss.detach())
     norm_value = host_scalar(norm) if read else 0.0
     if not ok:
         optimizer.zero_grad(set_to_none=True)

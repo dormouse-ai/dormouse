@@ -114,6 +114,10 @@ def test_backward_counter_and_gate_gradients() -> None:
 def test_state_dict_is_bitwise_after_forward_and_backward() -> None:
     """Gates live outside the module tree: no backbone weight moves, ever."""
     model, spec = _demo_model()
+    # QB is a training-mode load controller: its persistent bias buffer moves by
+    # design on a training forward. This gate is about the grafted gates, so hold
+    # the router in eval mode and compare the whole state_dict.
+    model.eval()
     before = {k: v.clone() for k, v in model.state_dict().items()}
     graft(model, window=(3, 5), K=2, gated=True)
     gates = loop_gates(model)
