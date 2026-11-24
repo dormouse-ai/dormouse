@@ -80,7 +80,6 @@ class Trainer:
         self.heartbeat = heartbeat
         self.graph: StepGraph | None = None
         self.log_every = 1
-        self._last_loss = 0.0
         self._last_norm = 0.0
         self.run_id = journal.path.parent.name or "run"
         last = float(schedule(cfg.steps - 1))
@@ -124,7 +123,8 @@ class Trainer:
         `log_every` is the host-read cadence. Every read of a step scalar goes through
         `step.host_scalar`; the step's own arithmetic and its skip decision stay on the
         device. At the default of one the journal is unchanged; a larger value keeps the
-        loss and the norm on the device between log lines.
+        norm on the device between log lines. The loss is read every step: the spike
+        gate and a skipped step's receipt need the real value, not a sentinel.
 
         `steps` is the total, not an increment: a run resumed at step 60 with
         `train(steps=100)` takes 40 more steps, which is what makes the resume gate a
@@ -214,10 +214,10 @@ class Trainer:
         check_batch(batch, stage=stage, stream=self.stream, step=step)
         rate = self._set_rate(step)
         self._capture_graph(step, batch.ids)
-        # Read the journal's loss/norm at the log cadence; the skip decision inside the
-        # step stays on the device either way. ### ponytail: between reads the spike and
-        # nat accountants use the last logged loss — upgrading that to a device-resident
-        # loss window is a follow-up once a deferred-read run is measured on the card.
+        # Defer only the norm's host read: the loss is crossed every step because the
+        # spike gate and the skip receipt decide on it. ### ponytail: the journal's norm
+        # between log lines is the last read one; a device-resident norm window is a
+        # follow-up once a deferred-read run is measured on the card.
         read = self.log_every <= 1 or (step + 1) % self.log_every == 0
 
         # The step's own global clip is off (`clip=inf` leaves the norm unscaled and still
@@ -240,10 +240,10 @@ class Trainer:
                 pre_step=pre_step,
                 read=read,
             )
-        loss = result.loss if read else self._last_loss
+        loss = result.loss
         norm = result.grad_norm if read else self._last_norm
         if read:
-            self._last_loss, self._last_norm = loss, norm
+            self._last_norm = norm
         finished = time.perf_counter()
         elapsed = max(finished - started, 1e-9)
         self.step = step + 1

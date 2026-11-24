@@ -333,6 +333,32 @@ def test_a_spike_is_skipped_with_the_weights_untouched(tmp_path: Path) -> None:
         assert torch.equal(param, before[name]), f"{name} moved on a skipped step"
 
 
+def test_a_spike_on_a_non_log_step_is_still_skipped(tmp_path: Path) -> None:
+    """Deferring the report must not hand the spike gate the 0.0 sentinel."""
+    cfg = config(20)
+    trainer, model = spiky_trainer(cfg, tmp_path / "run.jsonl")
+    trainer.train(steps=12, log_every=10)
+    assert trainer.spike_skips == 0
+    assert (12 + 1) % 10 != 0, "step 12 must be a non-log step for this gate"
+    model.scale = 1e3
+    trainer.train(steps=13, log_every=10)
+    assert trainer.spike_skips == 1
+    assert lines(trainer.journal, "step")[-1]["skipped"] is True
+
+
+def test_a_nan_on_a_non_log_step_has_no_zero_loss_receipt(tmp_path: Path) -> None:
+    """A deferred read must not print a NaN loss as 0.0 (or as the last logged loss)."""
+    cfg = config(20)
+    trainer, model = spiky_trainer(cfg, tmp_path / "run.jsonl")
+    trainer.train(steps=12, log_every=10)
+    model.scale = float("inf")
+    trainer.train(steps=13, log_every=10)
+    assert trainer.skips == 1
+    row = lines(trainer.journal, "step")[-1]
+    assert row["loss"] is None, f"NaN printed as {row['loss']}"
+    assert row["bpb"] is None
+
+
 def test_six_consecutive_spikes_are_a_divergence(tmp_path: Path) -> None:
     """Five skips is a spike; the sixth is a run that is not training, and it raises."""
     cfg = config(20, max_skips=5)

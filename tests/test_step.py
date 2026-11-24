@@ -21,7 +21,7 @@ from stacks import reference_stack
 
 from dormouse.train import MixOptimizer, train_step
 from dormouse.train.optim import MUON_LR
-from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy
+from dormouse.train.step import CHUNK_TOKENS, chunked_cross_entropy, commit_step
 
 SMALL = {"vocab": 16, "d_model": 32, "n_layers": 2, "n_heads": 2, "head_dim": 16, "d_ffn": 64}
 
@@ -153,6 +153,73 @@ def test_a_firewalled_step_leaves_no_gradient_behind() -> None:
         model.norm.weight[0] = float("nan")
     train_step(model, ids, optimizer=optimizer)
     assert all(param.grad is None for param in model.parameters())
+
+
+def test_a_nonfinite_gradient_is_named_before_the_clip_smears_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One bad grad in three becomes three bad grads; the receipt must still name it.
+
+    Finiteness before the clip is [True, False, True]. `clip_grad_norm_(clip=inf)`
+    returns a NaN norm and scales every grad by it, so afterwards it is
+    [False, False, False] and the culprit is unrecoverable. The detector runs before
+    the clip and leaves a named counter plus a named refusal reason.
+    """
+    culprit = "blocks.0.attn.qkv.weight"
+    grad_names = ("embed.weight", culprit, "norm.weight")
+
+    def poisoned() -> tuple[torch.nn.Module, MixOptimizer]:
+        model, optimizer, _ = _build()
+        named = dict(model.named_parameters())
+        with torch.no_grad():
+            for name in grad_names:
+                named[name].grad = torch.full_like(
+                    named[name], float("nan") if name == culprit else 1.0
+                )
+        return model, optimizer
+
+    model, optimizer = poisoned()
+    assert [
+        bool(torch.isfinite(dict(model.named_parameters())[name].grad).all()) for name in grad_names
+    ] == [True, False, True], "the repro's input"
+    twin, _ = poisoned()
+    torch.nn.utils.clip_grad_norm_(twin.parameters(), math.inf)
+    twin_params = dict(twin.named_parameters())
+    assert not any(bool(torch.isfinite(twin_params[name].grad).all()) for name in grad_names), (
+        "the clip is unchanged: one NaN becomes NaN in every gradient"
+    )
+
+    counters = Counters()
+    result = commit_step(model, optimizer, torch.tensor(1.5), counters=counters, clip=math.inf)
+    assert result.skipped
+    assert counters.counts[f"nonfinite_grad:{culprit}"] == 1
+    assert culprit in caplog.text, "the refusal must name the parameter, not just count it"
+
+
+def test_a_deferred_finite_loss_reaches_the_spike_gate() -> None:
+    """`read=False` defers reporting, not the policy's view of the real loss."""
+    model, optimizer, ids = _build()
+    seen: list[float] = []
+
+    def policy(loss: float) -> bool:
+        seen.append(loss)
+        return True
+
+    result = train_step(model, ids, optimizer=optimizer, pre_step=policy, read=False)
+    assert seen and seen[0] > 0.0, f"the policy saw the sentinel: {seen}"
+    assert seen[0] == pytest.approx(result.loss)
+
+
+def test_a_deferred_nan_loss_is_a_nan_receipt() -> None:
+    """A skipped step reports NaN, never the 0.0 a deferred read would leave behind."""
+    model, optimizer, _ = _build()
+    counters = Counters()
+    result = commit_step(
+        model, optimizer, torch.tensor(float("nan")), counters=counters, read=False
+    )
+    assert result.skipped
+    assert math.isnan(result.loss), f"NaN was reported as {result.loss}"
+    assert counters.counts["nan_guard"] == 1
 
 
 # ----------------------------------------------------------------- the accumulation

@@ -94,15 +94,14 @@ class StepResult:
 
     `skipped=True` means the NaN firewall fired and **no parameter changed**. `loss`
     is then the non-finite value that tripped it, and `grad_norm` is NaN because the
-    norm was never computed — a skipped step has no norm to report. The two `*_device`
-    fields are the same numbers before the seam crosses them: a log at a slower cadence
-    reads those instead of re-running the step.
+    norm was never computed — a skipped step has no norm to report. `loss` is always
+    real, even at `read=False`; `norm_device` is the norm before the seam crosses it,
+    for a log at a slower cadence.
     """
 
     loss: float
     grad_norm: float
     skipped: bool
-    loss_device: torch.Tensor | None = None
     norm_device: torch.Tensor | None = None
 
 
@@ -160,12 +159,21 @@ def commit_step(
 
     `loss` is a device scalar that already carries every micro-batch's contribution.
     Nothing here reads it to the host except through `host_scalar`, and the step/no-step
-    decision is a device flag crossed once. With `read=False` the reported numbers stay
-    device-resident on the result and the caller reads them at log cadence — the step
-    itself still crosses the single flag, because a skip must not move a moment.
+    decision is a device flag crossed once. With `read=False` the *norm* stays
+    device-resident on the result and the caller reads it at log cadence; the loss is
+    always crossed, because the spike gate and the skip receipt decide on it and the
+    0.0 sentinel would blind both.
     """
     if counters is not None:
         counters.enable("clip", counter="clip", why="the gradient norm is bounded")
+    # Capture each named gradient's finiteness BEFORE the clip. With clip=inf one NaN
+    # makes the norm NaN and every grad is scaled by it: afterwards no gradient can say
+    # which parameter broke. Device flags only — this adds no host read to a healthy step.
+    pre_clip = [
+        (name, torch.isfinite(param.grad).all())
+        for name, param in model.named_parameters()
+        if param.grad is not None
+    ]
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
     if counters is not None:
         counters.count("clip")
@@ -180,12 +188,20 @@ def commit_step(
     for grad in grads:
         grad.mul_(gate)
     ok = host_scalar(finite.to(torch.float32)) > 0.5
-    loss_value = host_scalar(loss.detach()) if read else 0.0
+    # The spike gate and the firewall decide on the real loss; deferring the *report*
+    # must not hand them the 0.0 sentinel. Only the norm, which nothing decides with,
+    # stays device-resident between log lines.
+    loss_value = host_scalar(loss.detach())
     norm_value = host_scalar(norm) if read else 0.0
     if not ok:
         optimizer.zero_grad(set_to_none=True)
+        culprit = next((name for name, flag in pre_clip if not bool(flag)), None)
+        if culprit is not None and counters is not None:
+            counters.count(f"nonfinite_grad:{culprit}")
         bad_loss = not math.isfinite(loss_value)
         why = "the loss is not finite" if bad_loss else f"the gradient norm is {norm_value}"
+        if culprit is not None:
+            why += f"; first non-finite gradient: {culprit}"
         # A NaN loss has no norm to report (NaN); an inf norm is itself the receipt.
         return _skip(counters, loss_value, why, float("nan") if bad_loss else norm_value)
     if pre_step is not None and not pre_step(loss_value):
@@ -207,7 +223,6 @@ def commit_step(
         loss=loss_value,
         grad_norm=norm_value,
         skipped=False,
-        loss_device=loss.detach() if not read else None,
         norm_device=norm if not read else None,
     )
 

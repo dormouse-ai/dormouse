@@ -2,7 +2,7 @@
 
 The card-side parity (`tests/test_graph.py`) needs a GPU. These gates run on CPU and
 pin the contract the wiring adds around it: the eager sequence is unchanged, a replay
-is actually used, the hot path reads no host scalar, and a refused capture says so.
+is actually used, the deferred path reads no norm scalar, and a refused capture says so.
 """
 
 from __future__ import annotations
@@ -173,14 +173,15 @@ def test_graph_on_replays_after_warmup_and_logs_the_count(
     assert trainer.counters.counts["graph_replays"] == 1
 
 
-def test_the_hot_path_takes_no_host_read_when_reads_are_deferred(
+def test_the_deferred_path_reads_no_norm_when_reads_are_deferred(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No `.item()`/`.tolist()` in five steps, and the loss/norm never cross the seam.
+    """No `.item()`/`.tolist()` in five steps, and the norm never crosses the seam.
 
     `torch.optim` reads its own CPU step counter with `.item()` — exempt, as in the
-    device-firewall gate it mirrors. The step's one declared crossing is the finite
-    flag; at `log_every=10` the loss and the norm stay device-resident for all 5 steps.
+    device-firewall gate it mirrors. The step's two declared crossings are the finite
+    flag and the loss the spike gate and the skip receipt need; at `log_every=10` the
+    norm stays device-resident for all 5 steps.
     """
     real_item, real_tolist = torch.Tensor.item, torch.Tensor.tolist
 
@@ -206,7 +207,7 @@ def test_the_hot_path_takes_no_host_read_when_reads_are_deferred(
     monkeypatch.setattr(step_mod, "host_scalar", counted)
     trainer = build(config(16), tmp_path / "run.jsonl")
     trainer.train(steps=5, log_every=10)
-    assert len(calls) == 5, "one flag read per step; no loss/norm reads at log_every=10"
+    assert len(calls) == 10, "one flag read + one loss read per step; no norm reads"
     torch.Tensor.item, torch.Tensor.tolist = real_item, real_tolist
 
 
