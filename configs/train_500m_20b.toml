@@ -1,0 +1,50 @@
+# train_500m_20b: the demo topology scaled to 500M active / 20B stored.
+#
+# "20B" is STORED parameters, not the token budget. Every number below is priced by
+# src/dormouse/model/spec.py + assemble.plan_lines, not by a hand formula. The hand
+# arithmetic is here so the plan's bill can be checked without allocating:
+#
+#   per expert  = 3·rank·(d_model + d_ffn) + 6·d_model + 12   (MoA, 6 dictionary entries)
+#               = 3·2048·(4096 + 8192) + 6·4096 + 12 = 75,522,060
+#   bank stored = (260 routed + 1 shared)·per + 260·4096 router = 19,712,322,620
+#   bank active = (2 routed + 1 shared)·per + 260·4096 router =    227,631,140
+#   embed       = 32,768·4096                              =    134,217,728
+#   attention   = 16 layers of 3:1 KDA:DSA                  =    138,203,488
+#   norms       = (2·16+1)·4096                            =        135,168
+#   ACTIVE      = embed + attn + norms + bank active        =    500,187,524  (+0.038%)
+#   STORED      = embed + attn + norms + bank stored        = 19,984,879,004  (-0.076%)
+#   both inside the 2% refusal the P0 config fix uses.
+#
+# One bank is SHARED by all 16 layers (assemble.py's contract): stored is not 16 banks.
+# Inactive experts must live off the 16 GB card; only the 500M active set is resident.
+# c_lat stays at the recipe's 512 - a narrower bottleneck than the demo's, and a
+# follow-up to revisit if the attention share (27.6% of active) proves too high.
+
+unit = "bpe"
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 4096
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 8192
+n_experts = 260
+topk = 2
+n_shared = 1
+expert_tsct_rank = 2048
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0
