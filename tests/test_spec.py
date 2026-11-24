@@ -172,6 +172,10 @@ def test_the_other_config_files_are_gone() -> None:
     this same file with two values changed; `test_ab_configs.py` holds that line.
     """
     assert sorted(p.name for p in CONFIGS.glob("*.toml")) == [
+        "demo_200m.toml",
+        "demo_200m_sft.toml",
+        "demo_500m_10b.toml",
+        "demo_extreme_150m.toml",
         "dormouse_1b.toml",
         "dormouse_1b_top1_r192.toml",
         # The two-hour chat recipe is the same stack at b2 s1024, not a second

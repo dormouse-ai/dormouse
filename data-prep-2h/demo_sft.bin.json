@@ -1,0 +1,9 @@
+{
+ "bytes_per_token": 2.758746,
+ "doc_hashes_sha": "658afee44ff5b187c86112fdd4b0c6428e376e43c3fd1e8ae60a5b77c30e1984",
+ "documents": 30000,
+ "dtype": "uint16",
+ "source": "synthetic-chat",
+ "tokenizer_sha": "50235922e0bacb3a",
+ "tokens": 1369594
+}

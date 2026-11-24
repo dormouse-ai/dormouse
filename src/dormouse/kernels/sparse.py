@@ -295,9 +295,10 @@ def _sparse_compute(  # pragma: no cover - the launches are the card's
     bd = _pow2(width)
     #: `[b·h, s, d]` planes: the transposes are 8.4 MiB each at the live shape, and the
     #: kernel reads rows of `d` contiguous — the layout a gather wants.
-    qh = q.transpose(1, 2).contiguous()
-    kh = key.transpose(1, 2).contiguous()
-    vh = value.transpose(1, 2).contiguous()
+    # Clone: contiguous() can be a no-op and custom_op forbids an output aliasing an input.
+    qh = q.transpose(1, 2).contiguous().clone()
+    kh = key.transpose(1, 2).contiguous().clone()
+    vh = value.transpose(1, 2).contiguous().clone()
     flat = (qh, kh, vh)
     # `.clone()` is not redundant: dynamo's higher-order-op capture rejects an
     # intermediate that aliases the Function's input (`RuntimeError: idx ... aliases
@@ -323,7 +324,8 @@ def _sparse_compute(  # pragma: no cover - the launches are the card's
         num_warps=WARPS,
         num_stages=STAGES,
     )
-    return out.to(q.dtype), qh, kh, vh, idx, vis, out, ml
+    # `.to()` is identity when dtypes match; clone so output 0 never aliases output 6.
+    return out.to(q.dtype).clone(), qh, kh, vh, idx, vis, out, ml
 
 
 class _Sparse(torch.autograd.Function):

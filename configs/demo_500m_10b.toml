@@ -1,0 +1,51 @@
+# demo_500m_10b: the requested 500M-active / 10B-stored topology, meta-priced.
+# assemble(..., device="meta").report() at these widths:
+#   stored 10,056,000,000  active 513,200,000  ratio 5.1%
+# The ratio is in the frontier band the brief asks for. The config carries the
+# measured 25%-SYNTH stream, device=auto and fp16 Newton-Schulz like the runnable
+# demo. It is NOT runnable on one 5070 Ti: 10B bf16 weights alone are ~20 GB,
+# before Muon state (fp16 NS still needs moments) or activations. No LUT, RAG or
+# LARE mechanism is implemented here; they are not engine levers at this HEAD.
+# The trained, measured demo is configs/demo_200m.toml (200M active / 270M stored).
+
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+device = "auto"
+muon_ns_dtype = "fp16"
+
+d_model = 7168
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 8192
+n_experts = 808
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 1_228_800
+throughput_tflops = 36.7264
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 150
+ckpt_every = 150
+eval_batches = 4
+eval = "../data-prep-2h/demo_heldout.bin"
+
+[[source]]
+path = "../data-prep-2h/demo_pretrain.bin"
+weight = 1.0
