@@ -30,6 +30,21 @@ def test_rms_norm_matches_numpy() -> None:
     assert np.allclose(norm(x).detach().numpy(), want, atol=1e-6)
 
 
+def test_rms_norm_backward_matches_the_fp64_formula() -> None:
+    """The native kernel saves less for backward, but differentiates the same formula."""
+    torch.manual_seed(7)
+    norm = RMSNorm(32)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(32))
+    x = torch.randn(128, 32, requires_grad=True)
+    x64 = x.detach().double().requires_grad_(True)
+    w64 = norm.weight.detach().double()
+    r = torch.rsqrt(x64.pow(2).mean(-1, keepdim=True) + norm.eps)
+    (x64 * r * w64).square().mean().backward()
+    norm(x).square().mean().backward()
+    assert torch.allclose(x.grad, x64.grad.float(), atol=1e-5, rtol=1e-5)
+
+
 def test_the_gain_starts_at_one_so_the_norm_is_the_statistic_at_step_zero() -> None:
     norm = RMSNorm(16)
     assert torch.equal(norm.weight, torch.ones(16))
