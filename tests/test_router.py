@@ -239,3 +239,24 @@ def test_an_impossible_routing_is_refused_with_an_escape() -> None:
         Router(8, 2, 3)
     assert "Escape:" in str(raised.value)
     assert "n_experts=4" in repr(Router(8, 4, 2))
+
+
+def test_extreme_logit_gate_stays_finite_n1_regression() -> None:
+    """N1/N2: logit -103.22 used to make sqrt-backward -inf and poison all grads.
+
+    The fix computes softplus in fp32 with clamp_min(1e-6); every gradient must
+    stay finite at both bf16 and fp32 input, including a logit of -120.
+    """
+    for dtype in (torch.float32, torch.bfloat16):
+        r = Router(8, 4)
+        logits = torch.tensor(
+            [[-103.22, -120.0, 5.0, -95.0], [0.0, -200.0, 200.0, -1.0]],
+            dtype=dtype,
+            requires_grad=True,
+        )
+        scores = r.scores(logits)
+        scores.sum().backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all(), (dtype, logits.grad)
+        assert torch.isfinite(scores).all()
+        assert torch.count_nonzero(scores) >= 1
