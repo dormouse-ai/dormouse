@@ -72,7 +72,7 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         """Normalise the last axis, returning the input's dtype."""
         xf = x.to(torch.float32)
-        y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        y = torch.nn.functional.rms_norm(xf, (self.d_model,), self.weight, self.eps)
         if counters is not None:
             counters.count("norm_fwd", x.shape[0] * x.shape[1])
         return y.to(x.dtype)
