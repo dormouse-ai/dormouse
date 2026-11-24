@@ -40,7 +40,7 @@ from dormouse_core.errors import LoudError
 
 from ..data.tokenizer import DEFAULT_VOCAB
 from .attn_variants.hybrid import HYBRID_3_TO_1
-from .tsct import TSCT_RANK
+from .tsct import TSCT_RANK, native_tern
 
 #: Every slot's literals, in the order the plan prints them.
 UNITS: tuple[str, ...] = ("bpe", "byte")
@@ -48,7 +48,7 @@ UNITS: tuple[str, ...] = ("bpe", "byte")
 ATTN: tuple[str, ...] = ("hybrid", "kda", "dsa")
 OPTIMIZERS: tuple[str, ...] = ("muon", "adamw")
 OBJECTIVES: tuple[str, ...] = ("ntp", "ntp+tst", "ntp+jepa")
-WEIGHT_QAT: tuple[str, ...] = ("none", "ternary")
+WEIGHT_QAT: tuple[str, ...] = ("none", "ternary", "ternary_native")
 ACT_QUANT: tuple[str, ...] = ("none", "int4")
 #: Where the run's tensors live; `auto` falls back to CPU when no card is present.
 DEVICES: tuple[str, ...] = ("auto", "cpu", "cuda")
@@ -161,6 +161,25 @@ class StackSpec(Config):
         _literal("weight_qat", self.weight_qat, WEIGHT_QAT)
         _literal("act_quant", self.act_quant, ACT_QUANT)
         _literal("device", self.device, DEVICES)
+        if self.weight_qat == "ternary_native" and not native_tern():
+            raise LoudError(
+                "weight_qat='ternary_native' needs DORMOUSE_TSCT_NATIVE_TERN=1",
+                "the native arm is explicit: a config that names ternary without the flag "
+                "would run fp32 factors under a ternary name",
+            )
+        if native_tern() and self.weight_qat != "ternary_native":
+            raise LoudError(
+                f"DORMOUSE_TSCT_NATIVE_TERN=1 with weight_qat={self.weight_qat!r}: the "
+                "forward would read fp32 factors",
+                "set weight_qat='ternary_native' to train ternaries from step 1, or unset "
+                "the flag; a postwar conversion is not this arm",
+            )
+        if self.weight_qat == "ternary_native" and self.torch_compile:
+            raise LoudError(
+                "weight_qat='ternary_native' with torch_compile=true",
+                "the STE is an autograd.Function boundary that dynamo breaks; the compiled "
+                "step would report a graph it cannot keep. Set torch_compile=false",
+            )
         if self.vocab != VOCAB[self.unit]:
             raise LoudError(
                 f"vocab={self.vocab} is not the {self.unit} vocabulary ({VOCAB[self.unit]})",

@@ -41,6 +41,8 @@ short side is refused, because it would store more directions than the matrix ha
 from __future__ import annotations
 
 import math
+import os
+from typing import Any, cast
 
 import torch
 from dormouse_core.errors import LoudError
@@ -48,6 +50,30 @@ from torch import nn
 
 #: The rank the one architecture's experts are factorised at.
 TSCT_RANK = 256
+
+__concepts__ = ("FactorLinear", "NativeFactorLinear")
+
+
+def native_tern() -> bool:
+    """Whether this process must train the factors as ternary from the first step.
+
+    The flag is not a hint: with it on, a forward that reads the fp32 factors is a
+    LoudError, never a silent fallback. The config arm `weight_qat="ternary_native"`
+    and this flag must agree (`spec.validate` refuses a mismatch).
+    """
+    return os.environ.get("DORMOUSE_TSCT_NATIVE_TERN", "") not in ("", "0", "off", "false")
+
+
+#: STE backwards issued by the ternary forward. Read and zeroed once per step.
+_ternary_bwd = 0
+
+
+def take_ternary_bwd() -> int:
+    """Return and reset the STE backwards since the previous read."""
+    global _ternary_bwd
+    seen = _ternary_bwd
+    _ternary_bwd = 0
+    return seen
 
 
 def factor_std(std: float, rank: int) -> float:
@@ -58,6 +84,54 @@ def factor_std(std: float, rank: int) -> float:
     i.e. `σ = √std·r^{-1/4}` — and `Var(y_k) = std²·Σ_j x_j²`, the dense draw's own.
     """
     return float(math.sqrt(std) * rank**-0.25)
+
+
+def _threshold(shadow: torch.Tensor) -> torch.Tensor:
+    """Return the code boundary, from the shadow's magnitude and never from the scale.
+
+    Keeping the boundary detached means the learnable scale controls only the
+    magnitude of `{-1, 0, +1}` — growing it cannot silently change the codes.
+    """
+    return shadow.detach().abs().mean().clamp_min(1e-8)
+
+
+def scale_for_rms(shadow: torch.Tensor) -> torch.Tensor:
+    """Scale whose ternary read has the shadow's fp32 RMS at init.
+
+    A plain `mean|x|` init shrinks a Gaussian factor ~6x after rounding, which moves
+    every activation statistic on step 0; restoring the RMS keeps `factor_std`'s
+    variance contract while the scale stays a learnable parameter.
+    """
+    with torch.no_grad():
+        t = (shadow / _threshold(shadow)).round().clamp(-1, 1)
+        code_rms = t.square().mean().sqrt().clamp_min(1e-8)
+        return (shadow.square().mean().sqrt() / code_rms).reshape(()).clone()
+
+
+class _TernarySTE(torch.autograd.Function):
+    """Forward `scale·{-1,0,+1}`; straight-through gradient to the shadow, real one to scale."""
+
+    @staticmethod
+    def forward(
+        ctx: Any, shadow: torch.Tensor, scale: torch.Tensor, threshold: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the ternary read; no fp32 shadow value reaches the matmul."""
+        t = (shadow / threshold).round().clamp(-1, 1)
+        ctx.save_for_backward(t)
+        return scale * t
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Pass `grad` to the shadow unchanged and `Σ grad·t` to the learnable scale."""
+        global _ternary_bwd
+        _ternary_bwd += 1
+        (t,) = ctx.saved_tensors
+        return grad, (grad * t).sum(), None
+
+
+def ternarized(shadow: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Return the only forward read of a factor: `scale·{-1,0,+1}` with STE."""
+    return cast("torch.Tensor", _TernarySTE.apply(shadow, scale, _threshold(shadow)))
 
 
 class FactorLinear(nn.Module):
@@ -103,11 +177,75 @@ class FactorLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """`x [..., in_features]` → `[..., out_features]` through the two factors."""
+        if native_tern() and type(self) is not NativeFactorLinear:
+            raise LoudError(
+                "DORMOUSE_TSCT_NATIVE_TERN=1 but a TSCT forward read the fp32 factors",
+                "build with weight_qat='ternary_native' (which swaps in NativeFactorLinear), "
+                "or unset the flag; a flag that runs the fp32 read reports a ternary model "
+                "that does not exist",
+            )
         return (x @ self.u) @ self.v
 
     def extra_repr(self) -> str:
         """Show the shapes the bill is quoted for."""
         return f"in_features={self.in_features}, out_features={self.out_features}, rank={self.rank}"
+
+
+class NativeFactorLinear(FactorLinear):
+    """A factorised linear trained as ternary from step 0, not converted afterwards.
+
+    `u`/`v` stay fp32 ONLY as the optimizer's shadow state: every forward reads
+    `scale·round(u/threshold)` and `scale·round(v/threshold)`, so no matmul ever sees
+    the fp32 factor. The scale is a learnable parameter; the straight-through
+    estimator sends the shadow's gradient through unchanged and a real gradient to
+    the scale. Both the eager expert read and the bank's `stack_matrices` go through
+    `u_code()`/`v_code()`, so the GPU kernel's operands are ternarised before launch.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        *,
+        std: float,
+        device: torch.device | str | None = None,
+    ) -> None:
+        """Draw the shadows as before, then size the two learnable scales to restore RMS."""
+        super().__init__(in_features, out_features, rank, std=std, device=device)
+        with torch.no_grad():
+            self.scale_u = nn.Parameter(scale_for_rms(self.u))
+            self.scale_v = nn.Parameter(scale_for_rms(self.v))
+
+    def u_code(self) -> torch.Tensor:
+        """Return `scale_u·{-1,0,+1}` — the only `u` value a forward may read."""
+        return ternarized(self.u, self.scale_u)
+
+    def v_code(self) -> torch.Tensor:
+        """Return `scale_v·{-1,0,+1}` — the only `v` value a forward may read."""
+        return ternarized(self.v, self.scale_v)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Two matmuls on ternary codes, one STE backward to the fp32 shadows."""
+        return (x @ self.u_code()) @ self.v_code()
+
+
+def native_ternarize(model: nn.Module) -> int:
+    """Swap every built `FactorLinear` to the native arm; return matrices swapped.
+
+    A class swap, not a rebuild: the factors keep the draw (and a checkpoint's loaded
+    values), and only the two scale parameters are added. Called after the bank is
+    built, so both the routed experts and the shared one are covered.
+    """
+    swapped = 0
+    for module in model.modules():
+        if type(module) is FactorLinear:
+            module.__class__ = NativeFactorLinear
+            with torch.no_grad():
+                module.scale_u = nn.Parameter(scale_for_rms(module.u))
+                module.scale_v = nn.Parameter(scale_for_rms(module.v))
+            swapped += 1
+    return swapped
 
 
 def project(

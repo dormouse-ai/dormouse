@@ -119,6 +119,17 @@ QAT: dict[str, Piece] = {
     "ternary": Piece(
         "weight_qat", "ternary", "weight_qat", "weight_ternary", Coeffects(), "1.58-bit weights"
     ),
+    #: The native arm counts the ternary READ, not the fp32 shadow it keeps for the
+    #: optimizer. The STE backward has its own counter, enabled at the step level
+    #: because `Transformer.forward` checks counters before the backward has run.
+    "ternary_native": Piece(
+        "weight_qat",
+        "ternary_native",
+        "tsct_ternary",
+        "tsct_ternary_fwd",
+        Coeffects(),
+        "ternary TSCT factors from step 1, fp32 only as optimizer shadow",
+    ),
 }
 
 QUANT: dict[str, Piece] = {

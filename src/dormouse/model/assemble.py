@@ -39,7 +39,7 @@ from ..train import compiled
 from ..train.graph import StepGraph
 from ..train.optim import MixOptimizer
 from ..train.step import StepResult, train_step
-from . import quant, registry
+from . import quant, registry, tsct
 from .attn_variants.dsa import DSA
 from .attn_variants.kda import KDA
 from .blocks import PROJ_STD, Block
@@ -164,6 +164,15 @@ class Assembled:
         if not result.skipped:
             counters.count("ntp_loss")
         counters.enable("ntp", counter="ntp_loss", why="the step computes the NTP loss")
+        if self.spec.weight_qat == "ternary_native":
+            #: Enabled here, after the backward, not in `Transformer.forward`: that
+            #: forward checks the counters before autograd has produced any gradient.
+            counters.enable(
+                "tsct_ternary_bwd",
+                counter="tsct_ternary_bwd",
+                why="the ternary STE backward reached the fp32 shadows",
+            )
+            counters.count("tsct_ternary_bwd", tsct.take_ternary_bwd())
         if compiled.enabled():
             #: Enabled and counted after the step, and zero is a hard error: a compile that
             #: built no graph ran the eager path under a compiled name.
@@ -272,6 +281,11 @@ def _quantize(model: Transformer, spec: StackSpec) -> None:
     """Apply the quantization slots, and wrap each block so both counters can move."""
     if spec.weight_qat == "ternary":
         quant.ternarize(model)
+    if spec.weight_qat == "ternary_native":
+        #: Swap the bank's factors BEFORE wrapping the blocks: the bank's stacked
+        #: operands are built from whatever the experts hold at forward time.
+        tsct.native_ternarize(model)
+        quant.native_ternarize(model)
     if spec.weight_qat == "none" and spec.act_quant == "none":
         return
     wrapped = [
@@ -302,7 +316,7 @@ def plan_lines(
     steps = max(spec.tokens // (spec.batch * spec.seq_len), 1)
     tokens_per_step = spec.batch * spec.seq_len
     seconds = steps * 6 * report["active"] * tokens_per_step / (spec.throughput_tflops * 1e12)
-    bits = 0.25 if spec.weight_qat == "ternary" else 4.0
+    bits = 0.25 if spec.weight_qat in ("ternary", "ternary_native") else 4.0
     attention_share = report["attention"] / report["active"] if report["active"] else 0.0
 
     lines = [

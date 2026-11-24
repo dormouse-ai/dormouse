@@ -35,7 +35,9 @@ from dormouse_core.counters import Counters
 from torch import nn
 from torch.nn import functional
 
-__concepts__ = ("QuantBlock", "QuantLinear")
+from .tsct import scale_for_rms, ternarized
+
+__concepts__ = ("QuantBlock", "QuantLinear", "NativeQuantLinear")
 
 
 def ternary(weight: torch.Tensor) -> torch.Tensor:
@@ -56,6 +58,35 @@ class QuantLinear(nn.Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run `nn.Linear`'s contract, with one `ternary` call on the weight."""
         return functional.linear(x, ternary(self.weight), self.bias)
+
+
+class NativeQuantLinear(nn.Linear):
+    """An `nn.Linear` whose weight is ternary from step 1, with a learnable scale.
+
+    The fp32 weight is the optimizer's shadow state only: `forward` reads the
+    `scale·{-1,0,+1}` code, sized at init to keep the layer's fp32 RMS. The older
+    `QuantLinear` uses a detached `mean|x|` scale that shrinks a Gaussian weight
+    about 6x; training from scratch with that shrink is a different (much worse)
+    model, so the native arm does not use it.
+    """
+
+    scale: torch.Tensor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run `nn.Linear`'s contract on the ternary code, never on the fp32 shadow."""
+        return functional.linear(x, ternarized(self.weight, self.scale), self.bias)
+
+
+def native_ternarize(model: nn.Module) -> int:
+    """Swap every plain `nn.Linear` to the native arm; return how many were swapped."""
+    swapped = 0
+    for module in model.modules():
+        if type(module) is nn.Linear:
+            module.__class__ = NativeQuantLinear
+            with torch.no_grad():
+                module.scale = nn.Parameter(scale_for_rms(module.weight))
+            swapped += 1
+    return swapped
 
 
 def ternarize(model: nn.Module) -> int:

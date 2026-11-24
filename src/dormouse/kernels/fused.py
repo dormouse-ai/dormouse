@@ -97,7 +97,20 @@ MIX_BLOCK = 1024
 SITU_BETA = 4.0
 
 #: The fused path is the shipped path; `DORMOUSE_FUSED=0` is the A/B arm.
+_EXPLICIT_FUSED = "DORMOUSE_FUSED" in os.environ
 _FUSED = os.environ.get("DORMOUSE_FUSED", "1") not in ("0", "off", "false")
+
+
+def require_available() -> None:
+    """Refuse an explicit fused request on a machine that cannot run the kernels."""
+    if _EXPLICIT_FUSED and _FUSED and not available():
+        from dormouse_core.errors import LoudError
+
+        raise LoudError(
+            "DORMOUSE_FUSED=1 was requested but Triton/CUDA is unavailable",
+            "remove the explicit flag to use the eager fallback on this machine",
+        )
+
 
 #: Fused launches since the last `reset_fused_ops()`. Zero while the flag is off, and
 #: zero while the flag is on is a defect, not a state.
@@ -122,8 +135,14 @@ def set_fused(on: bool) -> None:
 
 
 def fused() -> bool:
-    """Return whether the fused path is on."""
-    return _FUSED
+    """Return whether the fused path is on.
+
+    The default is on so the shipped engine uses the fast path. On a machine without
+    Triton/CUDA the default may fall back to eager silently (no fused counter fires,
+    and availability is checked at each kernel seam). An EXPLICIT `DORMOUSE_FUSED=1`
+    is a promise that the kernel runs: the seam refuses when it cannot.
+    """
+    return _FUSED and available()
 
 
 def fused_ops() -> int:

@@ -78,7 +78,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..kernels import fused
 from .activations import DEFAULT_DICTIONARY, activation, resolve
-from .tsct import FactorLinear, project
+from .tsct import FactorLinear, NativeFactorLinear, native_tern, project
 
 __concepts__ = ("GatedFFN", "LaFFN", "MoaFFN", "Stacked")
 
@@ -141,6 +141,19 @@ def stack_matrices(matrices: Sequence[nn.Linear | FactorLinear]) -> Matrix:
     """
     if isinstance(matrices[0], FactorLinear):
         factors = cast("Sequence[FactorLinear]", matrices)
+        if native_tern() and not all(isinstance(m, NativeFactorLinear) for m in factors):
+            raise LoudError(
+                "DORMOUSE_TSCT_NATIVE_TERN=1 but the bank stacked fp32 TSCT factors",
+                "build with weight_qat='ternary_native' so every factor is swapped to "
+                "NativeFactorLinear; the fused kernel must not launch on fp32 operands "
+                "while reporting a ternary run",
+            )
+        if isinstance(factors[0], NativeFactorLinear):
+            native = cast("Sequence[NativeFactorLinear]", factors)
+            return (
+                torch.stack([m.u_code() for m in native]),
+                torch.stack([m.v_code() for m in native]),
+            )
         return torch.stack([m.u for m in factors]), torch.stack([m.v for m in factors])
     dense = cast("Sequence[nn.Linear]", matrices)
     return torch.stack([m.weight for m in dense]).transpose(1, 2), None
@@ -239,7 +252,7 @@ def _accumulate(
     `w` carries the trailing `K`, so `w[..., k:k+1]` is per token, not per channel —
     which is why a chunk of rows is a chunk of both.
     """
-    if fused.fused() and fused.available():
+    if fused.fused():
         if kinds is None:
             raise LoudError(
                 f"a {len(fns)}-entry dictionary is not one the fused mixture computes",
@@ -432,6 +445,8 @@ class _Glu(nn.Module):
         counters.count("ffn_fwd", rows)
         if self._factorised:
             counters.count("tsct_fwd", rows * self._factorised)
+            if isinstance(self.gate, NativeFactorLinear):
+                counters.count("tsct_ternary_fwd", rows * self._factorised)
 
     @staticmethod
     def _read(matrix: nn.Linear | FactorLinear, x: torch.Tensor) -> torch.Tensor:

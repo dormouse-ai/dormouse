@@ -35,6 +35,13 @@ from dormouse.model.moe import MoEFFN, expert_parameters
 from dormouse.model.spec import StackSpec
 from dormouse.model.tsct import FactorLinear, project
 
+
+@pytest.fixture(autouse=True)
+def _cpu_eager_factors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CPU tests exercise the eager factors; fused kernels need a GPU."""
+    monkeypatch.setenv("DORMOUSE_FUSED", "0")
+
+
 D, F = 16, 12
 
 #: The live expert width and the recipe's rank; the gates about the bill quote these.
