@@ -42,8 +42,9 @@ _DORMOUSE_KDA_FLA = "DORMOUSE_KDA_FLA"
 _DEFAULT = "0"
 
 _ESCAPE = (
-    "install flash-linear-attention (MIT): `uv add flash-linear-attention`; "
-    "it is pinned in pyproject/uv.lock. To keep the eager `_chunks` path instead, "
+    "install flash-linear-attention (MIT): `uv add flash-linear-attention`. "
+    "V16: it is NOT currently pinned in pyproject/uv.lock - pin before any "
+    "production use. To keep the eager `_chunks` path instead, "
     "set DORMOUSE_KDA_FLA=0 (that path is slower and will be timed as such)."
 )
 
