@@ -61,8 +61,14 @@ $ echo $?
 | `eval` | working: the five-task harness and BPB with its byte window |
 | `data/bin.py`, `data/mix.py` | working: memory-mapped streams, exact shares, resume by arithmetic |
 | `metrics.py` | working: BPB is a type that cannot exist without its evaluation window |
-| `model/` | the one 348M-stored / 16M-FFN-active stack (rank-256 factorised experts), priced on the meta device and assembled from the spec |
-| `run`, `serve`, `export`, `tokenize` | refuse by design until the layer behind them moves |
+| `model/` | 12 layers (9 KDA : 3 DSA), rank-256 big-GEMM bank, GQA 8/2, c_lat 512, tied head; demo 200.1M active / 269.8M stored, 500M/20B config BLOCKED at 319 GB state |
+| `run`, `serve`, `export`, `tokenize`, `audit` | refuse by design (`Escape:`, exit 2) until the layer behind them moves |
+| IQ harness | `tools/iq_eval.py` + OpenCode adapter: RANDOM=0 / ORACLE=1 falsifier passes, but 17 known bugs — results are NOT IQ (`docs/iq-harness.md`) |
+| target precision | ternary TSCT + A4 activations from step 0 (in progress; bf16 is control only) |
+
+Measured whole-step MFU: 39.92% @92 TF on b2 with graph+epilogue+fp16 NS.
+A single bf16 GEMM reaches 97.7%; the 40% crossing in `mfu40` is ±2.5 pp noise,
+not attributable to individual kernels (`research/verify/V07-mfu.md`).
 
 The old research stack lives in [sehaxe/dormouse](https://github.com/sehaxe/dormouse)
 as an archive; nothing here imports it.
@@ -75,7 +81,10 @@ src/dormouse/
   metrics.py    BPB as a type
   data/bin.py   token stream with a manifest
   train/        the loop, its recipe, its guards — and entry.py, the one command
-  model/        ffn, attn, blocks, model
+  model/        ffn, attn, blocks, tsct, router, model
+  kernels/      Triton bank / sparse / attn / fused / fp8; fp64 anchors in tests
+tools/        iq_eval, opencode_solver, stub_server, plot, manifests
+docs/         ARCHITECTURE, cfg500, cubin-gate, data-prep-2h, iq-harness, ...
 ```
 
 Import boundaries are checked by a linter: `data/` may not import `model/`,
@@ -106,6 +115,11 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 4. **Hot swap with a receipt** — a component can be replaced at a stage boundary,
    and the swap is a journal event carrying its step number. Nothing is replaced
    silently.
+5. **A flag that is on must increment its counter** — zero-increment flags are
+   `MissingReport`, not a green run; fabricated receipts are a bug
+   (`research/verify/V08-counters.md`, `V07-mfu.md`).
+6. **Primary sources for architecture claims** — paper ID, date, code license and
+   a paired A/B on this stack; a vendor blog's multiplier is not a measurement.
 
 ## License
 
@@ -150,8 +164,13 @@ dorm tokenize / eval / serve / export / audit / status
 | `doctor`, `status` | работают, покрыты тестами |
 | `data/bin.py` | поток токенов через memmap, проверка манифеста, resume арифметикой |
 | `metrics.py` | BPB — тип, который не может существовать без окна оценки |
-| `model/` | трансформер, gated FFN, внимание с RoPE — каждый сверен с numpy-референсом, а не со старым кодом |
+| `model/` | 12 слоёв (9 KDA : 3 DSA), bank r256 big-GEMM, GQA 8/2, c_lat 512, tied head; демо 200.1M active / 269.8M stored |
+| `plan`/`train` | работают, но `configs/train_500m_20b.toml` пока BLOCKED: state 319 GB, trainmem неслит (`research/verify/V15-500m.md`) |
+| IQ harness | RANDOM=0 / ORACLE=1 проходит, но 17 известных багов — называть результат IQ запрещено (`docs/iq-harness.md`) |
 | остальное | отказывается по замыслу, пока не перенесён слой |
+
+Целевой режим — тернарные веса TSCT и 4-битные активации A4 **с шага 0**;
+`act_quant="none"` больше не конечная цель, bf16 — только контроль.
 
 Старый исследовательский стек лежит в
 [sehaxe/dormouse](https://github.com/sehaxe/dormouse) как архив; этот репозиторий
