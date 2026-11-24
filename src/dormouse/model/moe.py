@@ -69,8 +69,10 @@ no rows contributes an exact zero (its slots are trash and multiplied by
 `keep=False`). Every row is still owned by one slot, so the fixed loop is
 bit-identical to the data-dependent one for every routing the data-dependent path
 accepts. A routing wider than the fixed slots cannot raise inside the graph; it sets
-`overflow` on device, and the eager half after the replay refuses the step. The
-anchor (dense control, CPU) still reads `counts.max()` once to size its loop — it
+`overflow` on device, and the eager half after the replay refuses the step. An eager
+step (counters supplied, no replay) is the other half: it counts the rows with no slot
+as `moe_dropped` and refuses there, so a partial write never reaches an optimizer step.
+The anchor (dense control, CPU) still reads `counts.max()` once to size its loop — it
 never runs inside a graph. `fixed_passes` forces the static grid onto the anchor as
 well; `moe_static_passes` reports the slots the static grid ran, so a flag without
 the counter is a MissingReport.
@@ -433,11 +435,14 @@ class MoEFFN(nn.Module):
         local = torch.arange(routed, device=x.device) - starts.index_select(0, expert)
         fused = self._fused_ready(x)
         passes, static = self._pass_plan(counts, capacity, routed, fused)
+        missing: torch.Tensor | None = None
         if static:
-            #: The graph cannot raise, so record overflow on device; the eager half after
-            #: the replay reads the flag and refuses. No `.item()` lives inside the capture.
-            over: torch.Tensor = (local >= passes * capacity).any()
-            self._overflow.copy_(over)
+            #: Rows past the fixed slots have no owner and contribute nothing to the write.
+            #: Record the flag on device for the graph's eager half; an eager step that
+            #: passes counters also counts them and refuses below. No device read at all
+            #: lives inside a capture (capture calls the forward with `counters=None`).
+            missing = local >= passes * capacity
+            self._overflow.copy_(missing.any())
         pad = self.n_experts * capacity
         #: One row past the bank: rows this pass does not own are summed there and never
         #: read (`out[trash]` is zeroed). `index_copy_` needs unique slots and the rows of
@@ -495,20 +500,31 @@ class MoEFFN(nn.Module):
             else run(*args)
         )
         if counters is not None:
+            dropped = int(missing.sum()) if missing is not None else 0
             if static:
                 counters.count("moe_static_passes", passes)
-            counters.count("moe_rows_run", routed)
+            counters.count("moe_rows_run", routed - dropped)
             counters.count("moe_experts_used", self.n_experts)
             counters.count("moe_bank_builds", passes * math.ceil(self.n_experts / group))
             counters.count("moe_capacity", capacity)
             counters.count("moe_pad_rows", passes * pad)
             counters.count("moe_dispatch_passes", passes)
-            counters.count("moe_dropped", 0)
+            counters.count("moe_dropped", dropped)
             if fused:
                 counters.count("bank_ops", fused_bank.bank_launches() - launches)
             #: The read belongs to the arm, so it reports the rows the DISPATCH read — the
             #: assignments, not their padding (that is `moe_pad_rows`).
-            self._arms(0, 1)[0].count_read(routed, counters)
+            self._arms(0, 1)[0].count_read(routed - dropped, counters)
+            if dropped:
+                raise LoudError(
+                    f"the eager dispatch dropped {dropped} of {routed} routed rows: the "
+                    f"routing does not fit the fixed {passes} dispatch slots — the router "
+                    "has collapsed",
+                    "a static grid cannot size itself from the routing inside a capture, "
+                    "so an eager step refuses here instead of training on a partial write; "
+                    "check the router's gradient/QB, or raise `capacity_ratio` (now "
+                    f"{self.capacity_ratio:g}) for a wider slot",
+                )
         return y
 
     def _fused_ready(self, x: torch.Tensor) -> bool:

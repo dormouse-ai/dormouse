@@ -33,7 +33,7 @@ from typing import Any
 import pytest
 import torch
 from dormouse_core.counters import Counters
-from dormouse_core.errors import MissingReport
+from dormouse_core.errors import LoudError, MissingReport
 from torch import nn
 
 import dormouse.model.moe as moe_mod
@@ -390,6 +390,31 @@ def test_fixed_passes_set_the_overflow_flag_on_device() -> None:
     balanced = torch.arange(100).reshape(-1, 1) % 16
     bank._dispatch(x, balanced, weight, bank.router.count(balanced))
     assert not bank.overflowed(), "the flag is reset by the next dispatch"
+
+
+def test_eager_dispatch_refuses_and_counts_a_collapsed_router() -> None:
+    """B1: a one-slot grid used to drop 12 of 16 rows and report `moe_dropped=0`.
+
+    All rows on one expert is past the fixed slot: the rows with no slot must make
+    the eager dispatch refuse before the step commits, and the counter must say
+    how many rows were actually run instead of claiming all `routed` were.
+    """
+    torch.manual_seed(31)
+    bank = _bank(qb=False, n_shared=0, topk=1, capacity_ratio=1.0, dispatch_sigma=0.0)
+    bank.fixed_passes = 1
+    x = torch.randn(16, D)
+    index = torch.zeros(16, 1, dtype=torch.long)
+    weight = torch.ones(16, 1)
+    counts = bank.router.count(index)
+    counter = Counters()
+
+    with pytest.raises(LoudError, match=r"dropped|collapsed"):
+        bank._dispatch(x, index, weight, counts, counter)
+
+    snap = counter.snapshot()
+    assert snap["moe_dropped"] == 12, snap  # 16 rows into one 4-row slot
+    assert snap["moe_rows_run"] == 4, snap  # only four rows were executed
+    assert bank.overflowed(), "the device flag records the same refusal"
 
 
 # --- static grid: the fused default, its proof counter, and zero host reads --
