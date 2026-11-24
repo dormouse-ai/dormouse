@@ -15,8 +15,8 @@ def test_cubin_gate():
     # The AOT gate needs Triton + a real CUDA device; on the CPU CI venv
     # neither exists, and an UNMEASURED skip is honest (never a fake PASS).
     try:
-        import triton  # noqa: F401
         import torch
+        import triton  # noqa: F401
     except ImportError:
         pytest.skip("AOT cubin gate needs Triton (CARD, UNMEASURED on CPU)")
     if not torch.cuda.is_available():

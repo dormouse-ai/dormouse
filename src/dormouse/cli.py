@@ -60,7 +60,10 @@ def main(argv: list[str] | None = None) -> int:
         # A required named counter never incremented is a contract failure,
         # not a crash: same exit-2 + Escape: contract as any other refusal.
         print(f"MissingReport: {exc}", file=sys.stderr)
-        print("Escape: a named mechanism counter never incremented; check the flag and its wiring", file=sys.stderr)
+        print(
+            "Escape: a named mechanism counter never incremented; check the flag and its wiring",
+            file=sys.stderr,
+        )
         return 2
 
 
