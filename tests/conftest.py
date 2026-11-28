@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 #: The worktree must import its own sources, not the dirty `app` checkout.
 #: An editable install can win over PYTHONPATH; fail loudly if it did.
-import dormouse  # noqa: E402
+import dormouse
 
 _WT_SRC = Path(__file__).resolve().parents[1] / "src"
 assert Path(dormouse.__file__).resolve().is_relative_to(_WT_SRC), (

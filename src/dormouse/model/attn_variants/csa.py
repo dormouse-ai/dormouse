@@ -150,13 +150,17 @@ class CSA(nn.Module):
 
     # --------------------------------------------------------------- the blocks
     def select(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, q: torch.Tensor, k: torch.Tensor, *, return_aux: bool = False
+    ) -> tuple[torch.Tensor, ...]:
         """Return kept block ids `[b, s, h, keep]` and their selector scores.
 
         Public because the selector is the part worth measuring on its own: a
         query with a needle in one block must keep that block far above the
         `topk / n_blocks` chance rate, and no amount of end-to-end loss shows it.
+
+        `return_aux=True` also returns the coarse bias and its pre-softmax
+        scores, which is how the coarse-learning test observes the gradient of
+        a block the fine selector did not keep.
         """
         batch, seq, heads, width = q.shape
         chunk, group = self.chunk, self.hca_group
@@ -189,10 +193,15 @@ class CSA(nn.Module):
             own_coarse = (position // group).view(1, seq, 1, 1).expand(batch, seq, heads, 1)
             chosen.scatter_(-1, own_coarse, True)
             eligible = eligible & chosen.repeat_interleave(group, dim=-1)
-            #: The coarse score must reach the fine logits, otherwise top-k over
-            #: coarse blocks is a constant mask and that selector never learns.
-            #: The query's own coarse block is zeroed: its mean sees the future.
-            score = score + cscore.masked_fill(~cel, 0.0).repeat_interleave(group, dim=-1)
+            #: Straight-through top-k: forward keeps the hard choice, backward
+            #: flows through a softmax over every eligible coarse block. Without
+            #: it the coarse selector sees only the blocks it already kept and
+            #: can never learn that it should have kept another one.
+            coarse_bias = self._coarse_bias(cscore, cel, picked)
+            score = score + coarse_bias.repeat_interleave(group, dim=-1)
+        else:
+            coarse_bias = None
+            cscore = None
         keep = min(blocks, self.topk + 1)
         own = position.view(1, seq, 1, 1).expand(batch, seq, heads, 1)
         ranked = score.scatter(-1, own, torch.inf).masked_fill(~eligible, -torch.inf)
@@ -203,7 +212,36 @@ class CSA(nn.Module):
         dead = torch.isneginf(ranked.gather(-1, ids))
         ids = torch.where(dead, own.expand_as(ids), ids)
         picked_score = torch.where(dead, torch.zeros_like(picked_score), picked_score)
+        if return_aux:
+            return ids, picked_score, dead, coarse_bias, cscore
         return ids, picked_score, dead
+
+    def _coarse_eligibility(self, seq: int, device: torch.device | str) -> torch.Tensor:
+        """Whether a coarse block is strictly past the query, `[1, seq, 1, n_coarse]`."""
+        chunk, group = self.chunk, self.hca_group
+        blocks = seq // chunk
+        position = torch.arange(seq, device=device) // chunk
+        coarse_index = torch.arange(blocks // group, device=device)
+        return position.view(1, seq, 1, 1) >= ((coarse_index + 1) * group).view(1, 1, 1, -1)
+
+    def _coarse_bias(
+        self, cscore: torch.Tensor, cel: torch.Tensor, picked: torch.Tensor
+    ) -> torch.Tensor:
+        """Straight-through coarse selection, spread to coarse blocks only.
+
+        Forward is the hard top-k: only the picked coarse blocks are nonzero.
+        Backward is a softmax over every eligible coarse block, so an unselected
+        block receives the gradient that says "this one should have been kept".
+        """
+        logits = cscore.masked_fill(~cel, -torch.inf)
+        soft = torch.softmax(logits, dim=-1)
+        #: A query in the first coarse block has no strictly past coarse block;
+        #: `softmax` over all `-inf` is NaN and would poison every fine logit.
+        soft = torch.nan_to_num(soft, nan=0.0)
+        kept = soft.gather(-1, picked.indices)
+        straight = 1.0 + kept - kept.detach()
+        bias = torch.zeros_like(cscore)
+        return bias.scatter(-1, picked.indices, straight)
 
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:

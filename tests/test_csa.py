@@ -198,11 +198,40 @@ def test_select_refuses_a_partial_coarse_block() -> None:
         csa.select(torch.zeros(1, 20, 1, HEAD_DIM), torch.zeros(1, 20, 1, HEAD_DIM))
 
 
+def test_an_unselected_coarse_block_receives_gradient() -> None:
+    """ST top-k: a block the forward did not keep still gets the "should have" gradient."""
+    torch.manual_seed(31)
+    csa = CSA(CHUNK, 1, HEAD_DIM, chunk=CHUNK, topk=TOPK, hca_group=4)
+    q = torch.randn(1, 512, 1, HEAD_DIM, requires_grad=True)
+    k = torch.randn(1, 512, 1, HEAD_DIM)
+    ids, _, _, bias, cscore = csa.select(q, k, return_aux=True)
+    assert bias is not None and cscore is not None
+    cscore.retain_grad()
+    bias.sum().backward()
+    assert cscore.grad is not None
+    eligible = csa._coarse_eligibility(512, q.device)[0, -1, 0]
+    picked_ids = ids[0, -1, 0] // 4
+    picked_coarse = torch.zeros(eligible.numel(), dtype=torch.bool, device=q.device)
+    picked_coarse[picked_ids] = True
+    unselected = eligible & ~picked_coarse
+    assert bool(unselected.any()), "the window has no unselected eligible coarse block"
+    assert cscore.grad[0, -1, 0][unselected].abs().max() > 0
+
+
 def test_the_8_12_and_32_layer_patterns_tile() -> None:
     small = {
-        "d_model": 64, "n_heads": 2, "c_lat": 32, "head_dim": 8,
-        "d_ffn": 128, "attn_k": 64, "attn_window": 32, "seq_len": 128,
-        "ffn": "dense", "n_experts": 0, "topk": 0, "n_shared": 0,
+        "d_model": 64,
+        "n_heads": 2,
+        "c_lat": 32,
+        "head_dim": 8,
+        "d_ffn": 128,
+        "attn_k": 64,
+        "attn_window": 32,
+        "seq_len": 128,
+        "ffn": "dense",
+        "n_experts": 0,
+        "topk": 0,
+        "n_shared": 0,
         "expert_tsct_rank": 0,
     }
     sixteen = StackSpec(**small, n_layers=16, attn_pattern=list(HYBRID_12_KDA_2CSA_2HCA))
