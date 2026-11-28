@@ -197,11 +197,11 @@ class CSA(nn.Module):
             #: flows through a softmax over every eligible coarse block. Without
             #: it the coarse selector sees only the blocks it already kept and
             #: can never learn that it should have kept another one.
-            coarse_bias = self._coarse_bias(cscore, cel, picked)
+            coarse_bias = self._coarse_bias(cscore, cel, picked.indices)
             score = score + coarse_bias.repeat_interleave(group, dim=-1)
         else:
-            coarse_bias = None
-            cscore = None
+            coarse_bias = torch.zeros_like(score)
+            cscore = torch.zeros_like(score)
         keep = min(blocks, self.topk + 1)
         own = position.view(1, seq, 1, 1).expand(batch, seq, heads, 1)
         ranked = score.scatter(-1, own, torch.inf).masked_fill(~eligible, -torch.inf)
@@ -225,7 +225,7 @@ class CSA(nn.Module):
         return position.view(1, seq, 1, 1) >= ((coarse_index + 1) * group).view(1, 1, 1, -1)
 
     def _coarse_bias(
-        self, cscore: torch.Tensor, cel: torch.Tensor, picked: torch.Tensor
+        self, cscore: torch.Tensor, cel: torch.Tensor, picked_indices: torch.Tensor
     ) -> torch.Tensor:
         """Straight-through coarse selection, spread to coarse blocks only.
 
@@ -238,10 +238,10 @@ class CSA(nn.Module):
         #: A query in the first coarse block has no strictly past coarse block;
         #: `softmax` over all `-inf` is NaN and would poison every fine logit.
         soft = torch.nan_to_num(soft, nan=0.0)
-        kept = soft.gather(-1, picked.indices)
+        kept = soft.gather(-1, picked_indices)
         straight = 1.0 + kept - kept.detach()
         bias = torch.zeros_like(cscore)
-        return bias.scatter(-1, picked.indices, straight)
+        return bias.scatter(-1, picked_indices, straight)
 
     # ------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
