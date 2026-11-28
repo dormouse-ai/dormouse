@@ -1,0 +1,45 @@
+# Deterministic A/B gate stack. NOT a quality result: the widths are small so a
+# 200-step paired run fits on one CPU thread. The eval window is the demo held-out
+# shard, priced by its own manifest (4.206775 bytes/token), never by a 42-byte string.
+# `tools/ab_gate.py` reads this file with the same parser as `dorm train`.
+
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+device = "cpu"
+
+d_model = 64
+n_layers = 4
+n_heads = 4
+n_kv_heads = 2
+head_dim = 16
+c_lat = 32
+d_ffn = 128
+n_experts = 2
+topk = 1
+n_shared = 1
+expert_tsct_rank = 16
+attn_k = 32
+attn_window = 32
+seq_len = 128
+batch = 2
+
+tokens = 1_000_000
+throughput_tflops = 1.0
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 0
+eval_batches = 1
+eval = "../data-prep-2h/demo_heldout.bin"
+
+[[source]]
+path = "../data-prep-2h/demo_pretrain.bin"
+weight = 1.0

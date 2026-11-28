@@ -1,0 +1,48 @@
+# dormouse_1b: the model. One architecture, one file.
+#
+# 12 layers, attention in a 3:1 pattern of KDA and DSA, both with GQA (2 KV heads per
+# 8 query heads) and a c_lat=512 bottleneck on q/kv; a bank of 64 routed MoA experts of
+# 5.36M stored plus one shared, top-2, dropless, each matrix stored as its rank-256
+# factors; a tied head, chunked cross-entropy, Muon per head with AdamW on the vectors.
+#
+# There is no second config. The two control arms this model is measured against are
+# the SAME file with one width changed (attn="kda" or "dsa" for a uniform stack), and
+# every menu that used to live next to it (full/CSA/DSA/hybrid, gated/la/moa/moe FFNs)
+# is gone: a config that names one of those is refused by name.
+#
+# width arithmetic, so the numbers in the plan are checkable by hand:
+#   attention  q_lat+q_up   = 832·512 + 512·512 =  688,128  (x9 KDA layers)
+#              kv_lat+kv_up = 832·512 + 512·256 =  557,056  (+ gates, conv, proj)
+#   expert     3·(832·256 + 256·6144) = 5,357,568  stored as the rank-256 factors
+#   bank       65 experts + router × 832  ≈ 348,295,168 stored
+#   active     top-2 + shared = 3 experts =  16,072,704  (ffn active)
+
+unit = "bpe"
+# The one tokenizer its ids were cut with; DEFAULT_VOCAB and every manifest answer to it.
+tokenizer = "tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary_native"
+act_quant = "a4"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 24
+
+tokens = 10_000_000_000
+throughput_tflops = 1.0

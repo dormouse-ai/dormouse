@@ -1,0 +1,115 @@
+name: gpu
+
+# Never on pull_request. A contributor's PR must not block on a card, queue behind
+# someone's training run, or hold the card itself: the GPU gate runs after a merge and
+# on demand, and nothing else (the rule in RUNNER.md).
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Inside this repo, one GPU job at a time, and a queued run is not cancelled by the
+# next push: a half-finished GPU run is a card held by nobody. Across repos the lock
+# is the runner itself — a self-hosted runner takes one job at a time.
+concurrency:
+  group: gpu
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # The CUDA index that carries the locked torch. pyproject.toml points torch at the
+  # CPU index because CI has no card; a `+cpu` wheel on this job would fail check 1
+  # with "no CUDA device", loudly, rather than pass.
+  TORCH_INDEX: https://download.pytorch.org/whl/cu132
+
+jobs:
+  gpu:
+    name: the four checks CPU CI cannot see
+    # A job whose `if` is false is never assigned to a runner, so with no runner
+    # registered this skips in seconds instead of queueing forever. Turn it on once
+    # `RUNNER.md` is done:  gh variable set GPU_RUNNER_ONLINE --body true
+    if: vars.GPU_RUNNER_ONLINE == 'true'
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The second gate: the runner is registered, but this host has not consented to
+      # have CI take the card. A marker file (or GPU_CI=1) is that consent, and its
+      # absence is a skip with a warning on the run page — never a green pass.
+      - name: the card is offered to CI
+        id: consent
+        run: |
+          if [ -f "${GPU_CI_MARKER:-$HOME/.dormouse-gpu-ci}" ] || [ "${GPU_CI:-0}" = "1" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GPU gate SKIPPED: this runner has no consent marker. Create ${GPU_CI_MARKER:-$HOME/.dormouse-gpu-ci} on the runner host (see RUNNER.md)."
+            {
+              echo "### gpu gate skipped"
+              echo ""
+              echo "The runner is registered but this host has not offered the card to CI."
+              echo "Nothing was tested. Create \`${GPU_CI_MARKER:-$HOME/.dormouse-gpu-ci}\` on the"
+              echo "runner host, or set \`GPU_CI=1\` for its service, and re-run."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: say what happened to the card
+        if: steps.consent.outputs.ready != 'true'
+        run: |
+          echo "::notice::no GPU checks ran: the consent marker is absent (not a pass)"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.consent.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: steps.consent.outputs.ready == 'true'
+        with:
+          version: "0.13.6"
+          cache-dependency-glob: uv.lock
+
+      - name: the lockfile's environment
+        if: steps.consent.outputs.ready == 'true'
+        run: uv sync --frozen
+
+      # The lock names a torch build, not a CUDA build: swap the CPU wheel for the
+      # same version off the CUDA index, read from the lock so the two cannot drift.
+      - name: the same torch, built for the card
+        if: steps.consent.outputs.ready == 'true'
+        run: |
+          torch_version="$(sed -n '/^name = "torch"$/{n;s/^version = "\([^"+]*\).*/\1/p;}' uv.lock | head -1)"
+          echo "torch ${torch_version} from ${TORCH_INDEX}"
+          uv pip install --python .venv/bin/python --no-config --reinstall \
+            --index-url "${TORCH_INDEX}" "torch==${torch_version}"
+          uv run --no-sync python -c "
+          import torch
+          assert torch.version.cuda, 'a +cpu wheel is installed: the index did not serve CUDA'
+          assert torch.cuda.is_available(), 'no device visible to torch'
+          print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())
+          "
+
+      - name: the four checks
+        if: steps.consent.outputs.ready == 'true'
+        run: uv run --no-sync python tools/gpu_check.py --max-vram-gb 12
+
+      # A failed card is a failed job, and the summary is where the number is.
+      - name: report on failure
+        if: failure()
+        run: |
+          {
+            echo "### gpu gate failed"
+            echo ""
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- device: $(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader || echo unknown)"
+            echo ""
+            echo "The failed step above names the assertion. Nothing here blocks a PR:"
+            echo "this is the signal that the card, not the diff, moved."
+          } >> "$GITHUB_STEP_SUMMARY"

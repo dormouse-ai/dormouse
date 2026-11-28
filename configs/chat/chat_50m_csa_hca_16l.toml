@@ -1,0 +1,54 @@
+# chat_50m_csa_hca_16l: 16-layer arm, 12 KDA + 2 CSA + 2 HCA, b16 x s512.
+# The 16L pattern is the target rung; 8L stays the smoke/control arm.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+attn_pattern = ["kda", "kda", "kda", "kda", "kda", "kda", "kda", "kda", "kda", "kda", "kda", "kda", "csa", "hca", "csa", "hca"]
+ffn = "dense"
+ffn_tsct_rank = 256
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary_native"
+act_quant = "a4"
+torch_compile = false
+sources = "corpus"
+device = "auto"
+muon_ns_dtype = "fp32"
+
+d_model = 512
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 128
+d_ffn = 2048
+n_experts = 0
+topk = 0
+n_shared = 0
+expert_tsct_rank = 0
+attn_k = 256
+attn_window = 64
+seq_len = 512
+batch = 16
+
+tokens = 61_349_888
+lr_muon = 0.0005
+lr_adamw = 0.0002
+schedule = "cosine"
+# Warmup is budget-relative: 748 steps at 7,489 steps, 2 at a 20-step `--smoke`.
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 500
+eval_batches = 2
+eval = "../../data-prep-2h/demo_heldout.bin"
+
+# The last stage has no `until`: it covers the 7,489-step budget and a 20-step
+# `--smoke` budget alike.
+[[stage]]
+name = "corpus"
+
+[[source]]
+path = "../../data-prep-2h/demo_pretrain.bin"
+weight = 1.0
+stage = "corpus"

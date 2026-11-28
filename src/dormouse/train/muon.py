@@ -1,0 +1,612 @@
+"""Muon: momentum, the polar factor of the momentum, and ColRow, on matrices.
+
+The formulas, as implemented:
+
+    MUON (Jordan 2024, arXiv:2409.16986 §3; Keller Jordan's reference `muon`)
+        m_t = μ·m_{t-1} + (1-μ)·g_t
+        Q_t = polar(m_t)                    # Newton–Schulz, 5 iterations
+        R_t = ColRow(Q_t)                   # columns to unit norm, then rows
+        W_t = W_{t-1}·(1 - η·λ) - η·max(1, m/n)^½·R_t
+
+    POLAR (Higham 1986; the orthogonal factor of the SVD, U V^T)
+        X_0 = m/‖m‖_σ,  X_{k+1} = X_k(15 - 10X_k² + 3X_k⁴)/8
+
+§1. WHY THE 5TH-ORDER POLAR ITERATION AND NOT MUON'S `(3.4445, -4.7750, 2.0315)`.
+The Jordan triple is a *minimax* polynomial for the interval the Muon reference
+normalises into, and it is not the polar factor: `x ↦ 3.4445x - 4.775x³ + 2.0315x⁵`
+has no stable fixed point at 1. Measured here on a seeded `[64, 64]`, Frobenius-
+normalised as the reference does: singular values in `[0.68, 1.13]` and
+`‖QQᵀ - I‖∞ = 3.2e-1` — a direction, not an orthogonalisation, and the anchor this
+module is accepted against is 1e-5. So the chain is the 5th-order Newton–Schulz
+`p(x) = x(15 - 10x² + 3x⁴)/8` (Bernstein & Newhouse; Higham 1986; the triple Muon+'s
+`col_row` arm and `burn-spectral`'s retraction use), whose fixed point at 1 is
+superattracting: an error of ε becomes ≈ε³, so five iterations cross from 0.1 to 1e-9.
+
+§2. WHY A POWER-ITERATION PRESCALE AND NOT `X/‖X‖_F`. The quintic is stable on
+`(0, 1.53)`, and the reference's Frobenius normalisation puts the *mean* singular value
+at `1/√min(m,n)` — 0.125 at 64×64, six iterations from 1 — while at square shapes it
+puts σ_max at 2.0, outside the interval, where the chain diverges. It needs σ_max
+*inside* the basin, so `spectral_bound` estimates it: worst ratio 0.914, so ≤ 1.09.
+
+§3. WHAT FIVE ITERATIONS CANNOT DO, with the number, because the 1e-5 anchor is not a
+promise. The chain lifts singular values up to 1 and cannot rescue a σ_min far below
+it: a random 832×832 gaussian has σ_min/σ_max ≈ 0.006 and ends at `‖QQᵀ - I‖∞ ≈ 0.09`,
+while the live rectangles (`[64, 832]`, `[832, 2048]`, `[2048, 832]`) end at ≈4e-7
+because their spectra are conditioned to 0.2–0.6. The tests pin both facts.
+
+§4. WHY ColRow IS HERE AT ALL. `Q_t` is orthogonal, so `‖Q_t‖_F = √min(m,n)` varies
+with shape; ColRow makes every row unit-norm, so `‖R_t‖_F = √m` exactly and the step's
+magnitude is a function of the parameter's shape, not its spectrum — which is what lets
+one learning rate serve a `[64, 832]` and a `[2048, 832]`. Measured on the old stack at
+−0.0428 BPB against per-slice Frobenius normalisation.
+
+ColRow is the one invariance this stack uses: a step whose magnitude does not depend on
+the spectrum. A per-row second moment would divide out exactly the scale ColRow sets.
+
+§5. THE PER-HEAD ARM, AND ITS ONE HONEST PROPERTY. Kimi K3 §2.5 and DeepSeek V4.1
+apply the preconditioner per head to Q and K. Splitting a `[3d, d]` packed qkv weight
+into `2·n_heads` slices of `[head_dim, d]` and running the chain on each changes the
+*direction* (the Gram is `[head_dim, head_dim]` instead of `[d, d]`) and, because
+ColRow is applied per slice, leaves `‖R_t‖_F = √(3d)` — exactly what the whole-matrix
+path gives. So it is a direction change at fixed step magnitude, which is why it needs
+no learning-rate retune. V and the output projection stay whole: neither reference
+splits them, and a per-head split of `proj` is a column split, a different mechanism.
+
+The compressed layers have no packed matrix: their Q is written by `q_up`
+`[n_heads·head_dim, c_lat]` and their K/V by `kv_up` `[2·n_kv_heads·head_dim, c_lat]`.
+`q_up` splits into `n_heads` slices and `kv_up`'s K half into `n_kv_heads`, with V — the
+remainder — whole, so the arm is the same one applied to the same tensors, and the
+router reads it off the modules rather than off a shape heuristic.
+
+§6. SHAPE-GROUPED SCHEDULING. One `polar` per matrix issues ~22 serialized GEMMs
+    (3 power iterations × 2, 5 NS × 3, one final) and the port is host-dispatch-bound. A
+    bucket of equal-shaped regions runs those same GEMMs as `bmm` on a `[N, m, n]` stack:
+    one launch per bucket, identical arithmetic in fp32, no change to the iteration count,
+    coefficients, dtype or direction. The bucket key carries shape, step count and role
+    (per-head vs whole), so a Q/K head can never join a whole-matrix bucket, and Muon can
+    never see an AdamW parameter. The five fp32 elementwise ops per iteration (`b·gram`,
+    `c·(gram@gram)`, their add, `a·x`, the final add) are the same scalar op on every
+    stacked group, so they run as `_foreach_mul`/`_foreach_add` over ALL groups in one
+    lockstep chain: five launches per iteration, not five per group. The GEMMs stay one
+    `bmm` per group — only the launches move, no iteration, coefficient, dtype or
+    direction changes. A missing `_foreach_*` op refuses loudly, never a silent fallback.
+    A Triton fused chain was NOT ported: the box has no CUDA device and no `triton`
+    module, so it cannot compile or pass parity here.
+
+§7. THE 128 MiB CAP. The chain's five `[s,s]` and `[s,l]` buffers are per matrix; a
+    bucket of 65 `[256,6144]` experts used to allocate a single 390 MiB `projected`
+    and OOM the 16 GB card. The old engine capped a batch at `1<<25` fp32 elements.
+    Here `chunk_bytes` caps ONE intermediate at 128 MiB in the chain dtype: a stacked
+    group is cut into independent matrix slices, each with its own `bmm`, quintic and
+    Gram. No element of one matrix ever combines with another, so the cap changes
+    only launch count and peak bytes, never a bit of the result. The ceiling it cannot
+    cross is the Gram: `[s,s]` is 150.9 MiB fp32 at s=6144 and is mathematically one
+    object — cutting the short side changes the polar factor. `chunk_bytes=None`
+    restores the uncapped chain as the parity control.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any
+
+import torch
+from dormouse_core.counters import Counters
+from dormouse_core.errors import LoudError, MissingReport
+from torch.optim import Optimizer
+
+__all__ = [
+    "COLROW_EPS",
+    "MUON_LR",
+    "NS_CHUNK_BYTES",
+    "NS_COEFFS",
+    "NS_DTYPES",
+    "NS_EPS",
+    "NS_FP16_COUNTER",
+    "NS_GROUPED_COUNTER",
+    "NS_POWER_ITERS",
+    "NS_STEPS",
+    "Muon",
+    "colrow",
+    "muon_direction",
+    "orthogonalise",
+    "polar",
+    "spectral_bound",
+]
+
+#: Newton–Schulz iterations; five is what the architecture decision fixes, and §3
+#: states what five reaches.
+NS_STEPS = 5
+
+#: `p(x) = x(15 - 10x² + 3x⁴)/8`, the 5th-order polar iteration, as `(a, b, c)` in
+#: `p(x) = ax + bx³ + cx⁵`. §1 says why it is not the Jordan triple.
+NS_COEFFS = (1.875, -1.25, 0.375)
+
+#: Power iterations used to place σ_max inside the polynomial's stable interval (§2).
+NS_POWER_ITERS = 3
+
+#: Cap on ONE Newton–Schulz intermediate: 128 MiB in the chain dtype. It is the old
+#: engine's `muon_chunk_elems = 1<<25` fp32 elements, expressed in bytes so fp16 gets
+#: twice as many elements per buffer. A shape group above the cap is split along its
+#: matrix axis into independent `bmm` chunks — the matrices never mix, so the arithmetic
+#: is unchanged bit for bit. `None` is the uncapped parity control (§7).
+NS_CHUNK_BYTES = 1 << 27
+
+#: Floor inside the two ColRow divisions; `norm + eps` never divides by a zero row.
+COLROW_EPS = 1e-7
+
+#: Floor under the spectral prescale. A parameter whose gradient is exactly zero (a
+#: saturated gain, a zero-initialised coefficient) has σ_max = 0, and `x/0` is not a
+#: direction; with the floor the chain returns zero and the step is a no-op.
+NS_EPS = 1e-7
+
+#: Muon's rate for the live 275M recipe. Shipped as a default, not a verdict.
+MUON_LR = 0.02
+
+#: Counter that proves the batched (rather than per-matrix) polar path ran. Enabled by
+#: `Muon.step` when grouping is on and a `Counters` object is supplied, so a declared but
+#: absent mechanism fails `Counters.check()` instead of reporting eager timings.
+NS_GROUPED_COUNTER = "ns_grouped"
+
+#: Chain dtype literal. `fp32` is the shipped default; `fp16` is the opt-in tensor-core
+#: rung (fp32 spectral prescale, fp16 quintic, fp32 output).
+NS_DTYPES: tuple[str, ...] = ("fp32", "fp16")
+
+#: Counter proving the opt-in fp16 rung actually ran (declared-but-absent fails loudly).
+NS_FP16_COUNTER = "ns_fp16"
+
+
+def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """`mm` for one matrix, `bmm` for a `[N, m, n]` batch — the same kernel each."""
+    return torch.bmm(x, y) if x.ndim == 3 else torch.mm(x, y)
+
+
+def spectral_bound(x: torch.Tensor, iters: int = NS_POWER_ITERS) -> torch.Tensor:
+    """Return a lower bound on `σ_max`, by `iters` power iterations on the Gram.
+
+    The floor inside the estimate is the dtype's `tiny`, never `1e-7`: `‖Gv‖` for a real
+    momentum is ~1e-8, and an absolute floor at 1e-7 does not guard the division — it
+    *rescales the iteration*, which measured a 1000× under-estimate on a qkv slice and
+    ran the quintic to `inf`.
+
+    Started from the **row of largest norm**, not a constant vector, which can be
+    nearly orthogonal to the top right-singular vector. On that slice the constant
+    start recovered 0.604 of σ_max after five iterations — enough to leave the quintic's
+    basin — where the max-row start recovered 0.999 after three. Worst ratio over ten
+    tensors of the shapes this model has: 0.914, so `σ_max ≤ 1.09`, inside §2's basin.
+    """
+    rows = x.norm(dim=-1).argmax(dim=-1)
+    index = rows[..., None, None].expand(*rows.shape, 1, x.shape[-1])
+    v = torch.gather(x, -2, index).transpose(-2, -1)
+    floor = torch.finfo(x.dtype).tiny
+    v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
+    for _ in range(iters):
+        v = _matmul(x.transpose(-2, -1), _matmul(x, v))
+        v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
+    bound: torch.Tensor = _matmul(x, v).norm(dim=(-2, -1), keepdim=True)
+    # A max-norm row can still be nearly orthogonal to the top right-singular
+    # vector; three iterations then under-estimate by >1.5x and the quintic
+    # leaves its basin. Refine only when the estimate is still moving fast, so
+    # a well-converged matrix keeps the shipped bound bit-for-bit.
+    for _ in range(iters):
+        v = _matmul(x.transpose(-2, -1), _matmul(x, v))
+        v = v / v.norm(dim=(-2, -1), keepdim=True).clamp_min(floor)
+    refined: torch.Tensor = _matmul(x, v).norm(dim=(-2, -1), keepdim=True)
+    return torch.where(refined > bound * 1.05, refined, bound)
+
+
+def _prescale(
+    x: torch.Tensor,
+    *,
+    work_dtype: torch.dtype = torch.float32,
+    bound: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, bool]:
+    """Cast to fp32, bound the spectrum on the fp32 master, THEN select the chain dtype.
+
+    A caller that has already run `spectral_bound` on the whole group may pass its
+    slice: the power iteration's batch-size-dependent kernel then stays bit-identical
+    while the prescaled copy is made one capped chunk at a time.
+    """
+    work = x.to(torch.float32)
+    if bound is None:
+        bound = spectral_bound(work)
+    work = work / bound.clamp_min(NS_EPS)
+    transposed = work.shape[-2] > work.shape[-1]
+    short = work.transpose(-2, -1) if transposed else work
+    return short.to(work_dtype), transposed
+
+
+def _require_foreach(batch: list[torch.Tensor], *, work_dtype: torch.dtype = torch.float32) -> None:
+    """Refuse loudly when the fused chain cannot run — never fall back per group."""
+    for name in ("_foreach_mul", "_foreach_add", "_foreach_mul_", "_foreach_add_"):
+        if not callable(getattr(torch, name, None)):
+            raise LoudError(
+                f"torch.{name} is missing",
+                "the in-place fused polar chain requires a torch build that ships the _foreach ops",
+            )
+    if not batch:
+        raise LoudError("the fused polar chain was given no matrices", "pass at least one group")
+    for tensor in batch:
+        if tensor.dtype != work_dtype:
+            name = "fp32" if work_dtype == torch.float32 else "fp16"
+            raise LoudError(
+                f"fused polar requires {name} work tensors, got {tensor.dtype}",
+                f"_prescale casts every input to {name} before the chain",
+            )
+        if tensor.ndim not in (2, 3):
+            raise LoudError(
+                f"polar takes a matrix or a batch of matrices, got shape {tuple(tensor.shape)}",
+                "a 3-D optimizer state is a batch: view it as [N, m, n] before the chain",
+            )
+        if tensor.device.type not in ("cpu", "cuda"):
+            raise LoudError(
+                f"fused polar needs cpu or cuda tensors, got {tensor.device.type}",
+                "the _foreach kernels are only available on cpu and cuda",
+            )
+
+
+def _polar_chain(works: list[torch.Tensor], a: float, b: float, c: float, steps: int) -> None:
+    """Run the quintic in place on every piece; `works` holds the result.
+
+    The shipped chain allocated `bg`, `cg`, `scaled` and a fresh `works` every
+    iteration. The `_foreach_*` in-place forms keep the same one-launch-per-op
+    schedule and the same IEEE operations, but reuse those four buffers. `gram`
+    and `gram²` are the only extra matrices alive now.
+    """
+    for _ in range(steps):
+        grams = [_matmul(work, work.transpose(-2, -1)) for work in works]
+        polys = [_matmul(gram, gram) for gram in grams]
+        torch._foreach_mul_(grams, b)
+        torch._foreach_mul_(polys, c)
+        torch._foreach_add_(polys, grams)
+        projected = [_matmul(poly, work) for poly, work in zip(polys, works, strict=True)]
+        torch._foreach_mul_(works, a)
+        torch._foreach_add_(works, projected)
+
+
+def _pieces(work: torch.Tensor, cap_elems: int | None) -> list[torch.Tensor]:
+    """Split one prescaled group along its matrix axis; pieces are views.
+
+    A 2-D matrix is never split: its two sides are the Gram's K and N, and the
+    short side cannot be cut without changing the polar factor (§7).
+    """
+    if cap_elems is None or work.numel() <= cap_elems or work.ndim != 3:
+        return [work]
+    width = max(1, cap_elems // (work.shape[-2] * work.shape[-1]))
+    return [work[i : i + width] for i in range(0, work.shape[0], width)]
+
+
+def _polar_many(
+    batch: list[torch.Tensor],
+    steps: int = NS_STEPS,
+    *,
+    ns_dtype: str = "fp32",
+    chunk_bytes: int | None = NS_CHUNK_BYTES,
+) -> list[torch.Tensor]:
+    """Newton–Schulz for every matrix in `batch`, one lockstep chain (§6).
+
+    The GEMMs stay one `bmm`/`mm` per matrix/piece. The five elementwise ops per
+    iteration run as `_foreach_*` over all pieces at once, so launches no longer
+    scale with the number of shape groups. `fp32` is the shipped path (parity
+    pinned in `tests/test_muon_cap.py`); `fp16` runs the same coefficients and
+    iteration count on tensor cores, with the spectral prescale and fp32 output.
+
+    `chunk_bytes=None` is the uncapped shipped chain. A finite cap splits a shape
+    group into independent matrix chunks (§7): each matrix still sees exactly the
+    same Gram, quintic and ColRow, so the result is bitwise identical.
+    """
+    if ns_dtype not in NS_DTYPES:
+        raise LoudError(
+            f"ns_dtype={ns_dtype!r} is not a chain dtype",
+            f"use one of: {', '.join(NS_DTYPES)}",
+        )
+    work_dtype = torch.float16 if ns_dtype == "fp16" else torch.float32
+    if chunk_bytes is not None and chunk_bytes < work_dtype.itemsize:
+        raise LoudError(
+            f"NS chunk cap {chunk_bytes} B is smaller than one {work_dtype} element",
+            "pass None for the uncapped chain, or at least one element's bytes",
+        )
+    a, b, c = NS_COEFFS
+    _require_foreach(batch)  # momentum is fp32 on both rungs, before the prescale
+    cap_elems = None if chunk_bytes is None else chunk_bytes // work_dtype.itemsize
+    # The bound is computed on the whole group first: the power iteration's GEMM
+    # can pick a different kernel for N=4 than for N=1, which moves its fp32 bound
+    # by an ulp. Keeping the one shipped bound makes the cap bitwise exact; only the
+    # prescaled COPY is then made per capped slice.
+    prepared: list[list[tuple[torch.Tensor, bool]]] = []
+    pieces: list[torch.Tensor] = []
+    for x in batch:
+        bound = spectral_bound(x.to(torch.float32))
+        prescaled: list[tuple[torch.Tensor, bool]] = []
+        offset = 0
+        for part in _pieces(x, cap_elems):
+            count = part.shape[0] if part.ndim == 3 else 1
+            part_bound = bound[offset : offset + count] if bound.ndim == 3 else bound
+            offset += count
+            prescaled.append(_prescale(part, work_dtype=work_dtype, bound=part_bound))
+        prepared.append(prescaled)
+        pieces.extend(work for work, _ in prescaled)
+    # A window bounds the TOTAL bytes the chain's projected/gram lists hold at
+    # once. Running every piece as one lockstep chain would keep one 128 MiB
+    # `projected` per piece alive simultaneously, which is no cap at all.
+    windows: list[list[torch.Tensor]] = []
+    window: list[torch.Tensor] = []
+    used = 0
+    for work in pieces:
+        count = work.numel()
+        if cap_elems is not None and window and used + count > cap_elems:
+            windows.append(window)
+            window, used = [], 0
+        window.append(work)
+        used += count
+    if window:
+        windows.append(window)
+    for window in windows:
+        _polar_chain(window, a, b, c, steps)
+    outputs: list[torch.Tensor] = []
+    for chunks in prepared:
+        transposed = chunks[0][1]
+        if len(chunks) == 1:
+            result = chunks[0][0]
+        else:
+            # Pre-sized write-back: one full group beyond the capped pieces.
+            shape = (sum(work.shape[0] for work, _ in chunks), *chunks[0][0].shape[1:])
+            result = torch.empty(shape, dtype=chunks[0][0].dtype, device=chunks[0][0].device)
+            offset = 0
+            for work, _ in chunks:
+                result[offset : offset + work.shape[0]].copy_(work)
+                offset += work.shape[0]
+        outputs.append(
+            (result.transpose(-2, -1).contiguous() if transposed else result.contiguous()).to(
+                torch.float32
+            )
+        )
+    return outputs
+
+
+def polar(x: torch.Tensor, steps: int = NS_STEPS, *, ns_dtype: str = "fp32") -> torch.Tensor:
+    """Return the orthogonal factor of `x` for `[m, n]` or a batch `[N, m, n]`.
+
+    Runs on the **short side**: a tall matrix is transposed first, so the Gram is
+    `[min, min]` and a `[128, 832]` costs a `128×128` product per iteration. Exact
+    orthogonality holds to the conditioning of `x` — §3 states the ceiling. The single
+    matrix is the public form of the fused chain `_polar_many` runs in the optimizer.
+    """
+    return _polar_many([x], steps=steps, ns_dtype=ns_dtype)[0]
+
+
+def colrow(x: torch.Tensor, eps: float = COLROW_EPS) -> torch.Tensor:
+    """Scale columns to unit norm, then rows — in place, per slice if batched.
+
+    `ColRow` from Muon+ (§4): the output has every row at unit norm, so
+    `‖ColRow(z)‖_F = √rows` whatever the input.
+    """
+    if x.ndim == 3:
+        x.div_(x.norm(dim=-2, keepdim=True) + eps)
+        return x.div_(x.norm(dim=-1, keepdim=True) + eps)
+    x.div_(x.norm(dim=0, keepdim=True) + eps)
+    return x.div_(x.norm(dim=1, keepdim=True) + eps)
+
+
+def _regions(momentum: torch.Tensor, head_split: tuple[int, int] | None) -> list[torch.Tensor]:
+    """Return the views one momentum is preconditioned in: one, or heads-then-rest (§5)."""
+    if head_split is None:
+        return [momentum]
+    groups, rows = head_split
+    if rows % groups or rows > momentum.shape[0] or momentum.ndim != 2:
+        raise LoudError(
+            f"head_split=(groups={groups}, rows={rows}) does not cut a "
+            f"{tuple(momentum.shape)} parameter into equal slices",
+            "pass (2·n_heads, 2·d_model) for a [3d, d] packed qkv weight",
+        )
+    lead = momentum[:rows].view(groups, rows // groups, momentum.shape[1])
+    rest = momentum[rows:]
+    return [lead] if rest.shape[0] == 0 else [lead, rest]
+
+
+def _assemble(parts: list[torch.Tensor]) -> torch.Tensor:
+    """Stack the preconditioned regions back into one `[rows, cols]` matrix."""
+    if len(parts) == 1:
+        single = parts[0]
+        return single.reshape(-1, single.shape[-1])
+    return torch.cat([part.reshape(-1, part.shape[-1]) for part in parts], dim=0)
+
+
+def orthogonalise(
+    momentum: torch.Tensor,
+    *,
+    head_split: tuple[int, int] | None = None,
+    steps: int = NS_STEPS,
+    ns_dtype: str = "fp32",
+) -> torch.Tensor:
+    """`polar(momentum)` per head when the parameter is a packed qkv weight (§5).
+
+    The direction without ColRow: what `sf.py` needs, because its row-wise second
+    moment divides each row by its own scale and ColRow's unit row norm would leave
+    nothing to divide.
+    """
+    return _assemble(
+        [polar(part, steps, ns_dtype=ns_dtype) for part in _regions(momentum, head_split)]
+    )
+
+
+def muon_direction(
+    momentum: torch.Tensor,
+    *,
+    head_split: tuple[int, int] | None = None,
+    steps: int = NS_STEPS,
+    ns_dtype: str = "fp32",
+) -> torch.Tensor:
+    """`ColRow(polar(momentum))`, per head when the parameter is a packed qkv weight.
+
+    `head_split=(groups, rows)` means the first `rows` rows are `groups` equal
+    per-head slices and the rest is one matrix: Q and K of a packed `[3d, d]`
+    projection, with V as the remainder (§5).
+    """
+    return _assemble(
+        [colrow(polar(part, steps, ns_dtype=ns_dtype)) for part in _regions(momentum, head_split)]
+    )
+
+
+class Muon(Optimizer):
+    """Momentum, then the polar factor, then ColRow, then one step of `η·√(m/n)`."""
+
+    def __init__(
+        self,
+        params: Any,
+        *,
+        lr: float = MUON_LR,
+        momentum: float = 0.95,
+        steps: int = NS_STEPS,
+        weight_decay: float = 0.0,
+        grouped: bool = True,
+        ns_dtype: str = "fp32",
+        chunk_bytes: int | None = NS_CHUNK_BYTES,
+    ) -> None:
+        """Bind the four numbers every group inherits unless it overrides them.
+
+        `grouped` schedules equal-shaped regions as one `bmm` chain (§6). It is a
+        schedule switch, not a second algorithm: `grouped=False` is the parity control.
+        `ns_dtype` selects the chain's arithmetic: `fp32` is bitwise-shipped, `fp16`
+        is the opt-in tensor-core rung. `chunk_bytes=None` is the uncapped parity
+        control; the default caps each NS intermediate at 128 MiB (§7).
+        """
+        if not 0.0 <= momentum < 1.0:
+            raise LoudError(
+                f"muon momentum={momentum} is not in [0, 1)",
+                "0.95 is the reference's; 1.0 never forgets the first gradient",
+            )
+        if steps < 1:
+            raise LoudError(
+                f"muon ns steps={steps} runs no iteration",
+                "5 is the recipe's, and §3 of the module docstring prices fewer",
+            )
+        if ns_dtype not in NS_DTYPES:
+            raise LoudError(
+                f"ns_dtype={ns_dtype!r} is not a chain dtype",
+                f"use one of: {', '.join(NS_DTYPES)}",
+            )
+        self.grouped = grouped
+        self.ns_dtype = ns_dtype
+        self.chunk_bytes = chunk_bytes
+        super().__init__(
+            params,
+            {"lr": lr, "momentum": momentum, "steps": steps, "weight_decay": weight_decay},
+        )
+
+    @torch.no_grad()
+    def step(self, closure: Any = None, *, counters: Counters | None = None) -> Any:
+        """Advance every parameter that carries a gradient; return the closure's loss.
+
+        Polar runs once per (shape, steps, role) bucket rather than once per matrix. The
+        bucket key carries the role so a per-head Q/K slice never joins a whole-matrix
+        bucket; AdamW parameters are never in this optimizer's param groups at all.
+        Passing `counters` enables and proves the batched path (§6) and the opt-in
+        fp16 rung.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        if counters is not None and self.grouped:
+            counters.enable(
+                "ns_grouped",
+                counter=NS_GROUPED_COUNTER,
+                why="shape-grouped polar runs as batched bmm",
+            )
+        if counters is not None and self.ns_dtype == "fp16":
+            counters.enable(
+                NS_FP16_COUNTER,
+                counter=NS_FP16_COUNTER,
+                why="fp16 tensor-core NS chain runs the declared rung",
+            )
+        jobs: dict[
+            tuple[torch.Size, int, tuple[int, int] | None],
+            list[tuple[Any, int, int, torch.Tensor]],
+        ] = defaultdict(list)
+        plans: dict[Any, tuple[float, float, float, list[tuple[bool, torch.Size]]]] = {}
+        for group in self.param_groups:
+            rate = group["momentum"]
+            steps = group["steps"]
+            lr = group["lr"]
+            decay = group["weight_decay"]
+            head_split = group.get("head_split")
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                state = self.state[param]
+                if "momentum" not in state:
+                    state["momentum"] = torch.zeros_like(param)
+                buffer = state["momentum"]
+                buffer.mul_(rate).add_(param.grad, alpha=1.0 - rate)
+                regions = _regions(buffer, head_split)
+                plan: list[tuple[bool, torch.Size]] = []
+                for region_index, region in enumerate(regions):
+                    batched = region.ndim == 3
+                    matrices = [region[i] for i in range(region.shape[0])] if batched else [region]
+                    plan.append((batched, region.shape))
+                    for matrix_index, matrix in enumerate(matrices):
+                        jobs[(matrix.shape, steps, head_split)].append(
+                            (param, region_index, matrix_index, matrix)
+                        )
+                rows, cols = param.shape
+                plans[param] = (
+                    lr,
+                    decay,
+                    getattr(param, "muon_scale", max(1.0, rows / cols) ** 0.5),
+                    plan,
+                )
+        # One lockstep NS chain per step count: the five elementwise ops per
+        # iteration become five _foreach launches over every stacked group (§6).
+        inputs_by_steps: dict[int, list[torch.Tensor]] = defaultdict(list)
+        owners_by_steps: dict[int, list[tuple[list[tuple[Any, int, int, torch.Tensor]], bool]]] = (
+            defaultdict(list)
+        )
+        for (_, steps, _), entries in jobs.items():
+            if self.grouped:
+                inputs_by_steps[steps].append(torch.stack([entry[3] for entry in entries]))
+                owners_by_steps[steps].append((entries, True))
+            else:
+                for entry in entries:
+                    inputs_by_steps[steps].append(entry[3])
+                    owners_by_steps[steps].append(([entry], False))
+        results: dict[tuple[Any, int, int], torch.Tensor] = {}
+        for steps, inputs in inputs_by_steps.items():
+            outputs = _polar_many(
+                inputs,
+                steps=steps,
+                ns_dtype=self.ns_dtype,
+                chunk_bytes=self.chunk_bytes,
+            )
+            for out, (entries, is_batch) in zip(outputs, owners_by_steps[steps], strict=True):
+                if counters is not None and self.ns_dtype == "fp16":
+                    counters.count(NS_FP16_COUNTER, len(entries))
+                direction = colrow(out)
+                for index, (param, region_index, matrix_index, _) in enumerate(entries):
+                    value = direction[index] if is_batch else direction
+                    results[(param, region_index, matrix_index)] = value
+                if self.grouped and counters is not None:
+                    counters.count(NS_GROUPED_COUNTER, len(entries))
+        grouped_proof = counters.counts[NS_GROUPED_COUNTER] if counters is not None else 1
+        if self.grouped and jobs and not grouped_proof:
+            raise MissingReport([NS_GROUPED_COUNTER])
+        fp16_proof = (
+            counters.counts.get(NS_FP16_COUNTER, 0)
+            if counters is not None and self.ns_dtype == "fp16"
+            else 1
+        )
+        if self.ns_dtype == "fp16" and jobs and not fp16_proof:
+            raise MissingReport([NS_FP16_COUNTER])
+        for param, (lr, decay, scale, plan) in plans.items():
+            parts: list[torch.Tensor] = []
+            for region_index, (batched, shape) in enumerate(plan):
+                matrices = [
+                    results[(param, region_index, matrix_index)]
+                    for matrix_index in range(shape[0] if batched else 1)
+                ]
+                parts.append(torch.stack(matrices).reshape(shape) if batched else matrices[0])
+            direction = _assemble(parts)
+            if decay:
+                param.mul_(1.0 - lr * decay)
+            param.add_(direction, alpha=-lr * scale)
+        return loss

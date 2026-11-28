@@ -1,0 +1,3 @@
+# The regression fixture is a byte-level corpus slice: an opaque input, not code.
+# Telling git so keeps it out of diffs and out of any line-ending conversion.
+tests/fixtures/*.bin binary

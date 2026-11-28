@@ -1,0 +1,53 @@
+# train_200m_a4_2b: 200M active / 270M stored, ternary_native + A4 on the 1.93B corpus. the measured 200M-active demo topology on the 2B-token corpus.
+#
+# identical stack to configs/demo_train_long.toml; the only changes are the data
+# (doc-deduped DCLM/FW2/SYNTH with END_ID between documents and a 1% disjoint
+# heldout) and the horizon. The corpus lives off the btrfs app disk, so every
+# path is absolute. batch=2, seq_len=1024 -> 2048 tokens/step; the horizon is
+# 1.928B covered tokens, the largest round number the 1.930B-id stream serves
+# (the shift reads seq_len+1 ids per row).
+# `dorm train configs/train_200m_2b.toml --steps 20` is the wired smoke on the
+# real 200M model; --smoke would swap in the 47k-parameter dispatch stack.
+
+unit = "bpe"
+tokenizer = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary_native"
+act_quant = "a4"
+torch_compile = false
+sources = "corpus"
+device = "auto"
+muon_ns_dtype = "fp16"
+
+d_model = 2816
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 12288
+n_experts = 8
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 2
+
+tokens = 1_928_000_000
+throughput_tflops = 36.7264
+warmup = 0
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 1000
+ckpt_every = 10000
+eval_batches = 4
+eval = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/heldout.bin"
+
+[[source]]
+path = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/train.bin"
+weight = 1.0

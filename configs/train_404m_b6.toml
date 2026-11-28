@@ -1,0 +1,50 @@
+# train_404m_safe: measured 404M dense fit, restarted with a stable Muon rate.
+#
+# Same topology as train_500m_dense_2b (16L d1280 f5120, 3:1 KDA:DSA, ternary_native
+# + A4, LNS), but lr_muon=0.008 with a 500-step warmup instead of the 0.02 that drove
+# the earlier run into the alpha floor. 1.93B-token corpus, b2 x s1024.
+unit = "bpe"
+tokenizer = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/tokenizer32k.json"
+attn = "hybrid"
+ffn = "dense"
+ffn_tsct_rank = 256
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary_native"
+act_quant = "a4"
+torch_compile = false
+sources = "corpus"
+muon_ns_dtype = "fp32"
+
+d_model = 1280
+n_layers = 16
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 5120
+n_experts = 0
+topk = 0
+n_shared = 0
+expert_tsct_rank = 0
+attn_k = 512
+attn_window = 128
+seq_len = 1024
+batch = 6
+
+tokens = 1_929_997_803
+throughput_tflops = 36.7264
+lr_muon = 0.002
+lr_adamw = 0.0002
+schedule = "cosine"
+warmup = 1000
+seed = 7
+harness = false
+eval_every = 500
+ckpt_every = 200
+eval_batches = 4
+eval = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/heldout.bin"
+
+[[source]]
+path = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dormouse-data-2b/train.bin"
+weight = 1.0

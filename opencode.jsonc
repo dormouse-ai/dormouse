@@ -1,0 +1,30 @@
+// OpenCode config for the local Dormouse stub. See docs/opencode-harness.md.
+// Run opencode from this file's directory; DORMOUSE_STUB_PORT is set by the solver.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "local/dormouse",
+  "providers": {
+    "local": {
+      "name": "Dormouse local stub",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:{env:DORMOUSE_STUB_PORT}/v1"
+      },
+      "models": {
+        "dormouse": {
+          "modelID": "dormouse",
+          "name": "Dormouse (stub)",
+          "capabilities": {
+            "tools": false,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 32768,
+            "output": 512
+          }
+        }
+      }
+    }
+  }
+}

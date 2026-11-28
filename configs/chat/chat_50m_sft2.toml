@@ -1,0 +1,57 @@
+# chat_50m_sft2: actual chat continuation from the 50M pretrain checkpoint.
+# The old chat_50m_sft started from random weights (step 0), so its 1/7 probe
+# measured a from-scratch SFT model, not a fine-tune. This config imports only the
+# pretrain weights; optimizer, EMA and step start fresh.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+attn_pattern = ["kda", "kda", "kda", "kda", "kda", "kda", "csa", "hca"]
+ffn = "dense"
+ffn_tsct_rank = 256
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "ternary_native"
+act_quant = "a4"
+torch_compile = false
+sources = "chat"
+device = "auto"
+muon_ns_dtype = "fp32"
+init_from = "../../runs/chat_50m_b64/ckpt.pt"
+
+d_model = 512
+n_layers = 8
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 128
+d_ffn = 2048
+n_experts = 0
+topk = 0
+n_shared = 0
+expert_tsct_rank = 0
+attn_k = 256
+attn_window = 64
+seq_len = 512
+batch = 16
+
+# 132 steps at batch 16 x 513 reads this 1.09M-token chat set once.
+tokens = 1_086_414
+lr_muon = 0.00025
+lr_adamw = 0.0001
+schedule = "cosine"
+warmup = 10
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 50
+eval_batches = 2
+eval = "../../data-prep-2h/demo_heldout.bin"
+
+[[stage]]
+name = "chat"
+until = 132
+
+[[source]]
+path = "../../data-prep-2h/demo_sft_chat.bin"
+weight = 1.0
+stage = "chat"

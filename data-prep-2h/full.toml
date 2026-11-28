@@ -1,0 +1,42 @@
+# Real-width 2-step smoke over the validated DCLM stream. Random-init CE at 32768
+# ids is ~ln(32768)=10.4 nats/token, i.e. bpb ~10.4/4.188/ln2 ~ 3.6 -- the band
+# a real model must show; the 47k-param smoke stack's ~32 nats is a stack artifact.
+unit = "bpe"
+tokenizer = "data-prep-2h/tokenizer32k.json"
+attn = "hybrid"
+optimizer = "muon"
+objective = "ntp"
+weight_qat = "none"
+act_quant = "none"
+torch_compile = false
+sources = "corpus"
+
+d_model = 832
+n_layers = 12
+n_heads = 8
+n_kv_heads = 2
+head_dim = 64
+c_lat = 512
+d_ffn = 6144
+n_experts = 64
+topk = 2
+n_shared = 1
+expert_tsct_rank = 256
+attn_k = 64
+attn_window = 32
+seq_len = 128
+batch = 2
+
+tokens = 2048
+throughput_tflops = 36.7264
+schedule = "cosine"
+seed = 7
+harness = false
+eval_every = 0
+ckpt_every = 0
+eval_batches = 1
+eval = "heldout.bin"
+
+[[source]]
+path = "train.bin"
+weight = 1.0
